@@ -119,6 +119,8 @@ if (Test-Path (Join-Path $libDir "legacy-crossing.ps1")) { . (Join-Path $libDir 
 # Core setup tasks: `exakit update` compares the kit's task list with this
 # machine and reruns the installer once when one is pending.
 if (Test-Path (Join-Path $libDir "core-setup.ps1")) { . (Join-Path $libDir "core-setup.ps1") }
+# `exakit connect` and `exakit source`: external sources as virtual schemas.
+if (Test-Path (Join-Path $libDir "virtual-schemas.ps1")) { . (Join-Path $libDir "virtual-schemas.ps1") }
 # Marketplace add-on modules: the CLI is where they are installed (exakit
 # marketplace) and updated (exakit update <addon>). A missing file only makes
 # the marketplace row unavailable - it must not break every other command.
@@ -3369,6 +3371,181 @@ function Invoke-CmdInfoJson {
     exit 0
 }
 
+# Invoke-CmdConnect - `exakit connect [source] [--name N] [--set KEY=VALUE]...
+# [--password-file F] [--dry-run] [--yes] [--json]`. Twin of cmd_connect.
+function Invoke-CmdConnect {
+    param([string[]]$Arguments = @())
+    $source = ""; $name = ""; $pwFile = ""; $dry = $false; $json = $false; $sets = @(); $given = @()
+    $script:ExakitVsAssumeYes = $false
+    for ($i = 0; $i -lt $Arguments.Count; $i++) {
+        $arg = $Arguments[$i]
+        if ($arg -eq "--name") { $i++; $name = "" + $Arguments[$i] }
+        elseif ($arg -like "--name=*") { $name = $arg.Substring(7) }
+        elseif ($arg -eq "--set") {
+            $i++; $pair = "" + $Arguments[$i]
+            if ($pair -notlike "*=*") { Deny-ExakitInput "--set takes KEY=VALUE (exakit help connect)" }
+            $sets += @("--set", $pair); $given += $pair.Split("=")[0]
+        }
+        elseif ($arg -eq "--password-file") { $i++; $pwFile = "" + $Arguments[$i] }
+        elseif ($arg -in @("--dry-run", "-n")) { $dry = $true }
+        elseif ($arg -in @("--yes", "-y")) { $script:ExakitVsAssumeYes = $true }
+        elseif ($arg -in @("--json", "-j")) { $json = $true }
+        elseif ($arg -like "--password*" -or $arg -like "--secret*" -or $arg -like "--token*") {
+            Deny-ExakitInput "A credential is never taken as an argument (other users can read the process list). Use the hidden prompt or --password-file."
+        }
+        elseif ($arg -like "-*") { Deny-ExakitInput "Unknown option '$arg' for connect (exakit help connect)." }
+        elseif ($source) { Deny-ExakitInput "connect takes one source; got '$source' and '$arg'." }
+        else { $source = $arg }
+    }
+    if ($json) { Assert-ExakitInstalled -Json } else { Assert-ExakitInstalled }
+    Initialize-ExakitLogging
+    $interactive = Test-ExakitInteractive
+    if (-not $source) {
+        if (-not $interactive) { Deny-ExakitInput "Name the source to connect, e.g. exakit connect postgresql (see: exakit source catalog)." }
+        $source = Read-ExakitPrompt "Which source? (name or alias, e.g. postgresql, mysql, mssql, oracle, snowflake)" ""
+    }
+    $resolved = Invoke-ExakitVsEngine -Arguments @("resolve", $source)
+    if ($resolved.Code -ne 0) { [void](Show-ExakitVsLines -Lines $resolved.Lines); exit $resolved.Code }
+    $connector = ((@($resolved.Lines) | Where-Object { $_ -like "RESULT *" } | Select-Object -First 1).Substring(7) | ConvertFrom-Json).connector
+    if (-not $name) {
+        if (-not $interactive) { Deny-ExakitInput "Give the connection a name with --name (lower case, e.g. sales)." }
+        $name = Read-ExakitPrompt "Name for this connection (lower case, e.g. sales)" ""
+    }
+    $definition = Get-Content -Raw -LiteralPath (Join-ExakitCorePath (Get-ExakitVsDefs) "connectors" $connector "connector.json") | ConvertFrom-Json
+    if ($interactive) {
+        foreach ($spec in @($definition.inputs)) {
+            if ($spec.kind -in @("secret", "secret-file") -or $given -contains $spec.name) { continue }
+            $label = "" + $spec.label
+            if ($spec.choices) { $label = "$label ($((@($spec.choices)) -join '/'))" }
+            $default = ""
+            if ($null -ne $spec.default) { $default = "" + $spec.default }
+            $value = Read-ExakitPrompt $label $default
+            if ($value) { $sets += @("--set", "$($spec.name)=$value") }
+        }
+    }
+    $base = @($connector, "--name", $name) + $sets
+    $planned = Invoke-ExakitVsEngine -Arguments (@("plan") + $base)
+    $plan = Show-ExakitVsLines -Lines $planned.Lines
+    if ($planned.Code -ne 0) { exit $planned.Code }
+    Show-ExakitVsPlan $plan
+    if ($dry) {
+        if ($json) { Write-Output ($plan | ConvertTo-Json -Depth 6) }
+        exit 0
+    }
+    if ($interactive -and -not (Confirm-ExakitVs "Connect now?")) { Info "Nothing was changed."; exit 0 }
+    $secretSpec = @($definition.inputs) | Where-Object { $_.kind -in @("secret", "secret-file") } | Select-Object -First 1
+    $secret = ""
+    if ($secretSpec) {
+        $secret = Read-ExakitVsSecret -Label $secretSpec.label -PasswordFile $pwFile
+        if (-not $secret) { Deny-ExakitInput "No $($secretSpec.label) was given." }
+        $code = Invoke-ExakitVsRun -Arguments (@("connect") + $base + @("--secret-stdin")) -Secret $secret
+    } else {
+        $code = Invoke-ExakitVsRun -Arguments (@("connect") + $base)
+    }
+    $secret = $null
+    if ($code -eq 0) {
+        Ok "Query it like any schema: SELECT * FROM VS_$($name.ToUpperInvariant()).<table> LIMIT 10"
+        Info "Manage it with: exakit source show $name | check | reauth | refresh | disconnect | remove"
+    }
+    exit $code
+}
+
+# Invoke-CmdSource - `exakit source <action> [name] [options]`. Twin of cmd_source.
+function Invoke-CmdSource {
+    param([string[]]$Arguments = @())
+    $action = "list"
+    $rest = @($Arguments)
+    if ($rest.Count -gt 0) { $action = $rest[0]; $rest = @($rest | Select-Object -Skip 1) }
+    $json = $false; $dry = $false; $all = $false; $name = ""; $status = ""; $pwFile = ""
+    $script:ExakitVsAssumeYes = $false
+    for ($i = 0; $i -lt $rest.Count; $i++) {
+        $arg = $rest[$i]
+        if ($arg -in @("--json", "-j")) { $json = $true }
+        elseif ($arg -in @("--dry-run", "-n")) { $dry = $true }
+        elseif ($arg -in @("--yes", "-y")) { $script:ExakitVsAssumeYes = $true }
+        elseif ($arg -in @("--all", "-a")) { $all = $true }
+        elseif ($arg -eq "--status") { $i++; $status = "" + $rest[$i] }
+        elseif ($arg -eq "--password-file") { $i++; $pwFile = "" + $rest[$i] }
+        elseif ($arg -like "-*") { Deny-ExakitInput "Unknown option '$arg' for source $action (exakit help source)." }
+        elseif ($name) { Deny-ExakitInput "source $action takes one name." }
+        else { $name = $arg }
+    }
+    if ($json) { Assert-ExakitInstalled -Json } else { Assert-ExakitInstalled }
+    Initialize-ExakitLogging
+    if ($action -notin @("list", "issues", "catalog", "show", "check", "reauth", "refresh", "disconnect", "remove")) {
+        Deny-ExakitInput "Unknown source action '$action' (list, issues, show, check, reauth, refresh, disconnect, remove, catalog)."
+    }
+    if ($action -in @("show", "reauth", "refresh", "disconnect", "remove") -and -not $name) {
+        Deny-ExakitInput "exakit source $action needs a source name (see: exakit source list)."
+    }
+    if ($action -eq "check" -and -not $name -and -not $all) { Deny-ExakitInput "exakit source check needs a name or --all." }
+    $argv = @()
+    if ($json) { $argv += "--json" }
+    switch ($action) {
+        "issues" { $argv += "issues"; if ($status) { $argv += @("--status", $status) } }
+        "check" { if ($all) { $argv += @("check", "--all") } else { $argv += @("check", $name) } }
+        { $_ -in @("show", "refresh") } { $argv += @($action, $name) }
+        { $_ -in @("list", "catalog") } { $argv += $action }
+        { $_ -in @("disconnect", "remove") } {
+            $argv += @($action, $name)
+            if ($dry) { $argv += "--dry-run" }
+            elseif (-not $json) {
+                $preview = Invoke-ExakitVsEngine -Arguments @($action, $name, "--dry-run")
+                $p = Show-ExakitVsLines -Lines $preview.Lines
+                if ($null -ne $p) {
+                    Write-Host ("  drops: " + (@($p.drop) -join ", "))
+                    if ($p.keep) { Write-Host ("  keeps: " + (@($p.keep) -join ", ")) }
+                    Write-Host ("  note: " + $p.note)
+                }
+                $verb = "Remove"
+                if ($action -eq "disconnect") { $verb = "Disconnect" }
+                if (-not (Confirm-ExakitVs "$verb $name?")) { Info "Nothing was changed."; exit 0 }
+            }
+        }
+        "reauth" {
+            $secret = Read-ExakitVsSecret -Label "New credential for $name" -PasswordFile $pwFile
+            if (-not $secret) { Deny-ExakitInput "No credential was given." }
+            $code = Invoke-ExakitVsRun -Arguments ($argv + @("reauth", $name, "--secret-stdin")) -Secret $secret
+            $secret = $null
+            exit $code
+        }
+    }
+    if ($json) {
+        $run = Invoke-ExakitVsEngine -Arguments $argv
+        foreach ($line in $run.Lines) { Write-Output $line }
+        exit $run.Code
+    }
+    $code = Invoke-ExakitVsRun -Arguments $argv
+    $r = $script:ExakitVsResult
+    if ($null -ne $r) {
+        $rows = $null
+        if ($r.PSObject.Properties["sources"]) { $rows = @($r.sources) } elseif ($r.PSObject.Properties["issues"]) { $rows = @($r.issues) }
+        if ($null -ne $rows) {
+            if ($rows.Count -eq 0) { Write-Host "  (none)" }
+            foreach ($s in $rows) {
+                $at = "never checked"
+                if ($s.last_check -and $s.last_check.at) { $at = $s.last_check.at }
+                $remedy = ""
+                if ($s.PSObject.Properties["remedy"]) { $remedy = " - " + $s.remedy }
+                Write-Host ("  {0,-16} {1,-11} {2,-14} {3,-14} {4}{5}" -f $s.name, $s.connector, $s.schema, $s.status, $at, $remedy)
+            }
+        } elseif ($r.PSObject.Properties["connectors"]) {
+            foreach ($c in @($r.connectors)) { Write-Host ("  {0,-12} {1,-18} {2,-5} {3,-10} aliases: {4}" -f $c.id, $c.name, $c.tier, $c.status, (@($c.aliases) -join ", ")) }
+        } elseif ($r.PSObject.Properties["checks"]) {
+            foreach ($c in @($r.checks)) { $why = $c.evidence; if (-not $why) { $why = $c.remedy }; Write-Host ("  {0,-16} {1} {2}" -f $c.name, $c.status, $why) }
+        } else {
+            foreach ($k in @("name", "connector", "status", "objects", "inputs", "pins", "tables", "last_check", "evidence", "remedy")) {
+                if ($r.PSObject.Properties[$k] -and $null -ne $r.$k -and "$($r.$k)" -ne "") {
+                    $v = $r.$k
+                    if ($v -is [System.Management.Automation.PSCustomObject]) { $v = $v | ConvertTo-Json -Compress -Depth 4 }
+                    Write-Host ("  {0,-11} {1}" -f $k, $v)
+                }
+            }
+        }
+    }
+    exit $code
+}
+
 # Invoke-CmdSql <statement> [-Write] - run one SQL statement and translate the
 # error. Twin of cmd_sql in setup/exakit; see there for why it exists (the error
 # translator was wired only into the kit's own internal SQL, never the path an
@@ -3711,6 +3888,8 @@ try {
         # setup/exakit; Invoke-CmdStart/Stop validate the id themselves.
         "start"        { Assert-ExakitKnownOptions -CommandName "start" -Allowed @() -Arguments $RestArgs; Invoke-CmdStart -Scope @($RestArgs) }
         "stop"         { Assert-ExakitKnownOptions -CommandName "stop" -Allowed @() -Arguments $RestArgs; Invoke-CmdStop -Scope @($RestArgs) }
+        "connect" { Invoke-CmdConnect -Arguments @($RestArgs) }
+        "source"  { Invoke-CmdSource -Arguments @($RestArgs) }
         "sql" {
             # A lone --help is unambiguous; a statement may contain the text.
             if (@($RestArgs).Count -eq 1 -and ($RestArgs[0] -eq "--help" -or $RestArgs[0] -eq "-h")) { Show-ExakitUsage -Topic "sql"; break }

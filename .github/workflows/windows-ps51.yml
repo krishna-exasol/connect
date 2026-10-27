@@ -118,3 +118,10 @@ jobs:
         if: matrix.shard == 2
         shell: powershell
         run: powershell -NoProfile -ExecutionPolicy Bypass -File tests/preprocessor-lifecycle.ps1
+      # The virtual schema bridge under the engine that pipes to native
+      # programs in ASCII by default: a non-ASCII credential must still reach
+      # the CONNECTION byte for byte.
+      - name: virtual schema bridge under 5.1
+        if: matrix.shard == 2
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests/virtual-schemas.ps1

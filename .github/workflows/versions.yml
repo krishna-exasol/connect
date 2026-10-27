@@ -814,6 +814,8 @@ jobs:
       # disconnect vs remove, and classified failures.
       - run: bash tests/virtual-schemas.sh
         if: matrix.shard == 4
+      - run: pwsh -NoProfile -File tests/virtual-schemas.ps1
+        if: matrix.shard == 4
       - run: bash tests/agent-operability.sh
         if: matrix.shard == 4
       # The MCP subsystem's own tests were never wired in, so nothing in CI
