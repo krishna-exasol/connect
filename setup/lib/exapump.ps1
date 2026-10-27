@@ -3591,6 +3591,15 @@ function Select-ExakitDataLoad {
         -GroupParent $groupParent -GroupFirst $script:ExakitTableGroupFirst `
         -GroupLast $script:ExakitTableGroupLast -GroupMode "all")
     if ($selection -contains $script:ExakitTableRowSkip) { return @("none") }
+    # With nothing pending the local-file row is pre-ticked so Enter does
+    # something, but only a person can answer the question it asks. With no
+    # terminal the default stood and asked for a path nobody could give. Twin
+    # of the same check in exakit_data_load_select.
+    if ((-not $script:ExakitTableConfirmed) -and $script:ExakitTableRowLocal -eq 1 -and
+        $selection.Count -eq 1 -and $selection[0] -eq $script:ExakitTableRowLocal) {
+        Info "Every bundled dataset is already loaded. To load a file of your own without a terminal, name it with EXAKIT_DATA_FILE."
+        return @("none")
+    }
     $chosen = New-Object 'System.Collections.Generic.List[string]'
     foreach ($row in $selection) {
         if ($row -lt 1 -or $row -gt $script:ExakitTableIds.Count) { continue }
