@@ -503,8 +503,9 @@ class Preprocessor(object):
             emit("WARN", "The framework's rule resolution could not be refreshed (%s); as the admin, run:"
                  " EXECUTE SCRIPT PREPROC.REFRESH" % error)
             return
+        last = str(row.get("LAST_REFRESH") or "")[:16]
         emit("OK", "Rule resolution refreshed for users and roles changed since %s"
-             % (row.get("LAST_REFRESH") or "the install"))
+             % ("the last refresh (%s, database time)" % last if last else "the install"))
 
     def version_label(self):
         return self.record().get("version") or "(installed outside the kit)"
