@@ -3432,7 +3432,7 @@ function Invoke-CmdConnect {
         if ($json) { Write-Output ($plan | ConvertTo-Json -Depth 6) }
         exit 0
     }
-    if ($interactive -and -not (Confirm-ExakitVs "Connect now?")) { Info "Nothing was changed."; exit 0 }
+    if ($interactive -and -not (Confirm-ExakitVs "Connect now?")) { Info "Nothing was changed."; exit 5 }
     $secretSpec = @($definition.inputs) | Where-Object { $_.kind -in @("secret", "secret-file") } | Select-Object -First 1
     $secret = ""
     if ($secretSpec) {
@@ -3493,13 +3493,11 @@ function Invoke-CmdSource {
                 $preview = Invoke-ExakitVsEngine -Arguments @($action, $name, "--dry-run")
                 $p = Show-ExakitVsLines -Lines $preview.Lines
                 if ($null -ne $p) {
-                    Write-Host ("  drops: " + (@($p.drop) -join ", "))
-                    if ($p.keep) { Write-Host ("  keeps: " + (@($p.keep) -join ", ")) }
-                    Write-Host ("  note: " + $p.note)
+                    Show-ExakitVsDropPlan $p
                 }
                 $verb = "Remove"
                 if ($action -eq "disconnect") { $verb = "Disconnect" }
-                if (-not (Confirm-ExakitVs "$verb $name?")) { Info "Nothing was changed."; exit 0 }
+                if (-not (Confirm-ExakitVs "$verb $name?")) { Info "Nothing was changed. Confirm it with --yes."; exit 5 }
             }
         }
         "reauth" {
@@ -3513,6 +3511,7 @@ function Invoke-CmdSource {
             if (-not $secret) { Deny-ExakitInput "No credential was given." }
             $code = Invoke-ExakitVsRun -Arguments ($argv + @("reauth", $name, "--secret-stdin")) -Secret $secret
             $secret = $null
+            if ($code -eq 0) { Ok "$name is ready again with the new credential" }
             exit $code
         }
     }
@@ -3522,6 +3521,10 @@ function Invoke-CmdSource {
         exit $run.Code
     }
     $code = Invoke-ExakitVsRun -Arguments $argv
+    if ($code -eq 0 -and -not $dry) {
+        if ($action -eq "disconnect") { Ok ("$name disconnected: VS_" + $name.ToUpper() + " stays, its queries fail until you connect it again with --name $name"); exit 0 }
+        if ($action -eq "remove") { Ok "$name removed"; exit 0 }
+    }
     $r = $script:ExakitVsResult
     if ($null -ne $r) {
         $rows = $null
@@ -3537,6 +3540,8 @@ function Invoke-CmdSource {
             }
         } elseif ($r.PSObject.Properties["connectors"]) {
             foreach ($c in @($r.connectors)) { Write-Host ("  {0,-12} {1,-18} {2,-5} {3,-10} aliases: {4}" -f $c.id, $c.name, $c.tier, $c.status, (@($c.aliases) -join ", ")) }
+        } elseif ($r.PSObject.Properties["drop"]) {
+            Show-ExakitVsDropPlan $r
         } elseif ($r.PSObject.Properties["checks"]) {
             if (@($r.checks).Count -eq 0) { Write-Host "  (none)" }
             foreach ($c in @($r.checks)) { $why = $c.evidence; if (-not $why) { $why = $c.remedy }; Write-Host ("  {0,-16} {1} {2}" -f $c.name, $c.status, $why) }

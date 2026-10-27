@@ -78,8 +78,9 @@ little work — keep remote queries selective.
 |---|---|---|
 | 2 | bad input | fix the named input |
 | 3 | name or object conflict | another name, or `exakit source remove <name>` first |
-| 5 | connector gated | tell the user; nothing to do |
-| `auth-failed` | the source rejected the credential | `exakit source reauth <name>` (new credential on stdin) |
+| 4 | no source by that name | `exakit source list` |
+| 5 | connector gated, or not confirmed | gated: tell the user. Not confirmed (`disconnect`/`remove` without `--yes`): nothing changed - ask the user, then add `--yes` |
+| `auth-failed` | the source rejected the credential | `exakit source reauth <name>` (new credential on stdin; it is tried first, and a refused one leaves the old in place) |
 | `tls-failed` | certificate or host name did not verify | fix the server certificate; do not silently drop to `require` |
 | `unreachable` | the source does not answer from inside the database | host, port, firewall, VPN; `localhost` trap above |
 | "does not resolve" | the host name does not exist | check the spelling |

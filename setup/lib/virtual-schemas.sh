@@ -236,8 +236,9 @@ EOF
         exit 0
     fi
     if [ -n "$_cc_tty" ] && ! _exakit_vs_confirm "Connect now?"; then
+        # 5, as every command a person did not confirm: 0 would read as "done".
         info "Nothing was changed."
-        exit 0
+        exit 5
     fi
     _cc_label="$(run_python_any -c 'import json,sys; c=json.load(open(sys.argv[1])); print(next((s.get("label","password") for s in c["inputs"] if s["kind"] in ("secret","secret-file")), ""))' \
         "$(exakit_vs_defs)/connectors/$_cc_resolved/connector.json" 2>/dev/null)"
@@ -326,7 +327,7 @@ print("  " + "\n  ".join(["drops: " + ", ".join(p["drop"])] + (["keeps: " + ", "
       + ["note: " + p["note"]]))' 2>/dev/null
                 case "$_cs_action" in disconnect) _cs_verb="Disconnect" ;; *) _cs_verb="Remove" ;; esac
                 _exakit_vs_confirm "$_cs_verb $_cs_name?" \
-                    || { info "Nothing was changed."; exit 0; }
+                    || { info "Nothing was changed. Confirm it with --yes."; exit 5; }
             fi ;;
         reauth)
             # The name before the credential: nobody types a password for a
@@ -343,7 +344,9 @@ print("  " + "\n  ".join(["drops: " + ", ".join(p["drop"])] + (["keeps: " + ", "
             [ -n "$_cs_secret" ] || reject "No credential was given."
             set -- "$@" reauth "$_cs_name" --secret-stdin
             if [ "$_cs_json" = 1 ]; then printf '%s' "$_cs_secret" | exakit_vs_engine "$@"; exit $?; fi
-            _exakit_vs_run "$_cs_secret" "$@"; _cs_rc=$?; unset _cs_secret; exit "$_cs_rc" ;;
+            _exakit_vs_run "$_cs_secret" "$@"; _cs_rc=$?; unset _cs_secret
+            [ "$_cs_rc" -eq 0 ] && ok "$_cs_name is ready again with the new credential"
+            exit "$_cs_rc" ;;
     esac
     if [ "$_cs_json" = 1 ]; then
         exakit_vs_engine "$@" < /dev/null 2>>"${EXAKIT_LOG_FILE:-/dev/null}"
@@ -351,6 +354,12 @@ print("  " + "\n  ".join(["drops: " + ", ".join(p["drop"])] + (["keeps: " + ", "
     fi
     _exakit_vs_run "" "$@"
     _cs_rc=$?
+    if [ "$_cs_rc" -eq 0 ] && [ "$_cs_dry" != 1 ]; then
+        case "$_cs_action" in
+            disconnect) ok "$_cs_name disconnected: VS_$(printf '%s' "$_cs_name" | tr 'a-z' 'A-Z') stays, its queries fail until you connect it again with --name $_cs_name"; exit 0 ;;
+            remove) ok "$_cs_name removed"; exit 0 ;;
+        esac
+    fi
     [ -n "$EXAKIT_VS_RESULT" ] && printf '%s' "$EXAKIT_VS_RESULT" | run_python_any -c 'import json, sys
 r = json.load(sys.stdin)
 rows = r["sources"] if "sources" in r else r.get("issues")
@@ -364,6 +373,13 @@ if rows is not None:
 elif "connectors" in r:
     for c in r["connectors"]:
         print("  %-12s %-18s %-5s %-10s aliases: %s" % (c["id"], c["name"], c["tier"], c["status"], ", ".join(c.get("aliases", []))))
+elif "drop" in r:
+    print("  drops: " + ", ".join(r["drop"]))
+    if r.get("keep"):
+        print("  keeps: " + ", ".join(r["keep"]))
+    if "delete_files" in r:
+        print("  deletes %d unused file(s); keeps %d still shared" % (len(r["delete_files"]), len(r.get("keep_files", []))))
+    print("  note: " + r["note"])
 elif "checks" in r:
     if not r["checks"]:
         print("  (none)")

@@ -138,7 +138,14 @@ function Invoke-ExakitVsEngine { param([string[]]$Arguments = @(), [string]$Secr
     return [pscustomobject]@{ Code = [int]$code; Lines = @($result) } }
 function Invoke-ExakitVsRun { param([string[]]$Arguments, [string]$Secret = "")
     $r = Invoke-ExakitVsEngine -Arguments $Arguments; $script:ExakitVsResult = ($r.Lines[0].Substring(7) | ConvertFrom-Json); return $r.Code }
-function Show-ExakitVsLines { param([string[]]$Lines = @()) foreach ($l in $Lines) { Write-Output $l } }
+function Show-ExakitVsLines { param([string[]]$Lines = @()) $r = $null; foreach ($l in $Lines) { if ($l -like "RESULT *") { $r = $l.Substring(7) | ConvertFrom-Json } else { Write-Output $l } }; return $r }
+function Confirm-ExakitVs { param([string]$Question) return [bool]$script:ExakitVsAssumeYes }
+function Ok([string]$M) { Write-Host "OK $M" }
+function Info([string]$M) { Write-Host "INFO $M" }
+$lib = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Split-Path -Parent $cli) "lib/virtual-schemas.ps1"), [ref]$null, [ref]$null)
+foreach ($def in @($lib.FindAll({ param($n) ($n -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and $n.Name -eq "Show-ExakitVsDropPlan" }, $true))) {
+    . ([scriptblock]::Create($def.Extent.Text))
+}
 Invoke-CmdSource -Arguments $args
 '@
 $childFile = Join-Path $work "source-child.ps1"; Set-Content -LiteralPath $childFile -Value $child -Encoding ASCII
@@ -155,6 +162,18 @@ $ErrorActionPreference = "Continue"
 $out = & $pwsh -NoProfile -File $childFile (J @("setup", "exakit.ps1")) $record 0 'RESULT {"checks": []}' check --all 2>&1
 $ErrorActionPreference = "Stop"
 Check "check --all with no sources says (none)" $true ((@($out) -join "`n").Contains("(none)"))
+$drop = 'RESULT {"name": "sales", "drop": ["CONNECTION EXAKIT_SRC_SALES"], "keep": [], "delete_files": ["a.jar"], "keep_files": ["b.jar"], "note": "n"}'
+$ErrorActionPreference = "Continue"
+$out = & $pwsh -NoProfile -File $childFile (J @("setup", "exakit.ps1")) $record 0 $drop disconnect sales 2>&1
+$childCode = $LASTEXITCODE
+$ErrorActionPreference = "Stop"
+Check "disconnect without --yes and no console: exit 5, not 0" 5 $childCode
+Check "...after showing what it would drop" $true ((@($out) -join "`n").Contains("drops: CONNECTION EXAKIT_SRC_SALES"))
+$ErrorActionPreference = "Continue"
+$out = & $pwsh -NoProfile -File $childFile (J @("setup", "exakit.ps1")) $record 0 $drop remove sales --yes 2>&1
+$childCode = $LASTEXITCODE
+$ErrorActionPreference = "Stop"
+Check "remove --yes: exit 0, and says it is done" "0 True" ("$childCode " + (@($out) -join "`n").Contains("sales removed"))
 
 Remove-Item Env:\EXAKIT_VS_FAKE_DB, Env:\FAKE_VS_STATE
 if (-not $env:KEEP_WORK) { Remove-Item -Recurse -Force -LiteralPath $work -ErrorAction SilentlyContinue } else { Write-Host "work: $work" }

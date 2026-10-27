@@ -161,6 +161,18 @@ function Invoke-ExakitVsRun {
     return $run.Code
 }
 
+# Show-ExakitVsDropPlan - what disconnect or remove drops, keeps and deletes.
+# Twin of the "drop" branch of the renderer in cmd_source.
+function Show-ExakitVsDropPlan {
+    param($Plan)
+    Write-Host ("  drops: " + (@($Plan.drop) -join ", "))
+    if ($Plan.keep) { Write-Host ("  keeps: " + (@($Plan.keep) -join ", ")) }
+    if ($Plan.PSObject.Properties["delete_files"]) {
+        Write-Host ("  deletes {0} unused file(s); keeps {1} still shared" -f @($Plan.delete_files).Count, @($Plan.keep_files).Count)
+    }
+    Write-Host ("  note: " + $Plan.note)
+}
+
 function Show-ExakitVsPlan {
     param($Plan)
     if ($null -eq $Plan) { return }

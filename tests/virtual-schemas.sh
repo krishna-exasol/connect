@@ -377,7 +377,7 @@ bridge() {
           _n="$(wc -l < "$B/argv" | tr -d ' ')"
           _code="$(sed -n "${_n}p" "$B/codes" 2>/dev/null)"
           if [ "$1" = resolve ] && [ -f "$B/gated" ]; then echo "FAIL BigQuery is not available yet: gated"; return 5; fi
-          case "$1" in check) echo 'RESULT {"checks": []}' ;; show) echo "FAIL no source named $2 (see: exakit source list)" ;; resolve) echo 'RESULT {"connector": "postgresql"}' ;; plan) echo 'RESULT {"name": "x", "connector": "postgresql", "tier": "GA", "status": "candidate", "downloads": [], "steps": [], "exposure": "e", "warnings": []}' ;; esac
+          case "$1" in check) echo 'RESULT {"checks": []}' ;; remove|disconnect) echo 'RESULT {"name": "sales", "drop": ["virtual schema VS_SALES", "CONNECTION EXAKIT_SRC_SALES"], "keep": [], "delete_files": ["a.jar"], "keep_files": ["b.jar"], "note": "nothing is revoked at the source"}' ;; show) echo "FAIL no source named $2 (see: exakit source list)" ;; resolve) echo 'RESULT {"connector": "postgresql"}' ;; plan) echo 'RESULT {"name": "x", "connector": "postgresql", "tier": "GA", "status": "candidate", "downloads": [], "steps": [], "exposure": "e", "warnings": []}' ;; esac
           return "${_code:-0}"
       }
       personal_slc_dns_repair() { echo "REPAIRED" >> "$B/argv"; return 0; }
@@ -415,6 +415,17 @@ OUT="$(bridge cmd_source remove </dev/null)"; RC=$?
 check "source remove without a name: exit 2" "2" "$RC"
 OUT="$(bridge cmd_source bogus </dev/null)"; RC=$?
 check "an unknown action: exit 2" "2" "$RC"
+reset_bridge 0
+OUT="$(bridge cmd_source remove sales --dry-run </dev/null)"
+has "remove --dry-run shows what it drops" "drops: virtual schema VS_SALES, CONNECTION EXAKIT_SRC_SALES" "$OUT"
+has "...the files it deletes and keeps" "deletes 1 unused file(s); keeps 1 still shared" "$OUT"
+reset_bridge 0
+OUT="$(bridge cmd_source disconnect sales </dev/null)"; RC=$?
+check "disconnect without a terminal or --yes: exit 5, not 0" "5" "$RC"
+check "...only the preview ran" "disconnect sales --dry-run|" "$(tr '\n' '|' < "$B/argv")"
+reset_bridge 0 0
+OUT="$(bridge cmd_source remove sales --yes </dev/null)"; RC=$?
+check "remove --yes: exit 0" "0" "$RC"; has "...and says it is done" "sales removed" "$OUT"
 reset_bridge 4
 OUT="$(bridge cmd_source reauth nosuch --password-file "$B/pw" </dev/null)"; RC=$?
 check "reauth of a source that does not exist: exit 4, before any credential" "4 show nosuch|" "$RC $(tr '\n' '|' < "$B/argv")"

@@ -185,7 +185,7 @@ printf '%s' "$PASSWORD" | exakit connect pg --name sales --set host=db.example.c
 - `localhost` inside the database is the database itself, and is refused. A source on this machine is `192.168.64.1` on macOS (`host.containers.internal` there is the launcher VM) and `host.containers.internal` on Linux/WSL, and must listen beyond 127.0.0.1.
 - TLS verifies certificate and host name by default; lower it (`--set tls=require|disable`) only when the user says so.
 - Show the user the plan's exposure line: the MCP read-only user can read every table of the new virtual schema.
-- Exit codes: 2 bad input, 3 name/object conflict, 5 connector gated (BigQuery), 1 other failure (the message names the class: credentials, TLS, unreachable, host name). A failed first connect leaves nothing behind.
+- Exit codes: 2 bad input, 3 name/object conflict, 4 no such source, 5 connector gated (BigQuery) or not confirmed (`disconnect`/`remove` without `--yes`; nothing changed), 1 other failure (the message names the class: credentials, TLS, unreachable, host name). A failed first connect leaves nothing behind.
 - `exakit source issues` lists failing sources each with its fix; `exakit source reauth <name>` takes a new credential on stdin; `disconnect` drops only the CONNECTION, `remove` drops the owned objects — both preview and ask first (`--yes` for a script that was told to).
 
 ## Marketplace add-ons (optional)
