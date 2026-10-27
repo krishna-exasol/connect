@@ -116,6 +116,9 @@ if (Test-Path (Join-Path $libDir "legacy-crossing.ps1")) { . (Join-Path $libDir 
 # pyexasol is an update target of its own (and its own repair command), so the
 # CLI needs the module even though it takes no part in the runtime commands.
 . (Join-Path $libDir "pyexasol.ps1")
+# Core setup tasks: `exakit update` compares the kit's task list with this
+# machine and reruns the installer once when one is pending.
+if (Test-Path (Join-Path $libDir "core-setup.ps1")) { . (Join-Path $libDir "core-setup.ps1") }
 # Marketplace add-on modules: the CLI is where they are installed (exakit
 # marketplace) and updated (exakit update <addon>). A missing file only makes
 # the marketplace row unavailable - it must not break every other command.
@@ -2650,16 +2653,6 @@ function Invoke-ExakitRuntimeUpdateOffer {
 # EXAKIT_CONFIRM_RUNTIME_UPDATE answer without asking, and an unattended run with
 # neither defers it with the exact command that applies it later.
 # Twin of exakit_update in setup/lib/common.sh.
-# Add-ExakitUpdateNote - one row of the --json result; a no-op on the human
-# screen. Twin of _exakit_update_note.
-function Add-ExakitUpdateNote {
-    param([string]$Component, [string]$Outcome, [string]$From = "", [string]$To = "", [string]$Remedy = "")
-    if (-not $script:ExakitUpdateJson) { return }
-    [void]$script:ExakitUpdateResults.Add([pscustomobject]@{
-        component = $Component; outcome = $Outcome; from = $From; to = $To; remedy = $Remedy
-    })
-}
-
 # Write-ExakitUpdateJsonReport - the one object `exakit update --json` prints:
 # what was updated, deferred, left current, skipped or failed, and the one
 # command that resolves what is left. Twin of _exakit_update_json_report.
@@ -2691,7 +2684,12 @@ function Write-ExakitUpdateJsonReport {
         $status = "failed"; $remedy = $(if ($failed[0].remedy) { $failed[0].remedy } else { "exakit update" })
     } elseif ($deferred.Count -gt 0) {
         $status = "deferred"; $remedy = $(if ($deferred[0].remedy) { $deferred[0].remedy } else { "exakit update --yes" })
-        $hint = "a database change needs the database stopped; --yes (or EXAKIT_CONFIRM_RUNTIME_UPDATE=1) applies it unattended"
+        # The hint explains the database-change deferral only: new kit setup
+        # that waits for a STOPPED database is deferred too, and its remedy
+        # says so. Twin of the same condition in _exakit_update_json_report.
+        if ($deferred[0].component -ne "core-setup") {
+            $hint = "a database change needs the database stopped; --yes (or EXAKIT_CONFIRM_RUNTIME_UPDATE=1) applies it unattended"
+        }
     } elseif ($blocked.Count -gt 0) {
         $status = "blocked"; $remedy = "exakit update"
     } elseif ($updated.Count -gt 0) {
@@ -2780,6 +2778,9 @@ function Invoke-ExakitUpdateRun {
     $deferred = 0
     $acted = 0
     foreach ($component in (Get-ExakitUpdateTargets -Target $Target)) {
+        # A run handed over by the previous kit's updater: that run already
+        # updated the kit, and listing it again would report it twice.
+        if ($component -eq "exakit" -and $env:EXAKIT_UPDATE_HANDOVER -eq "1") { continue }
         $actual = Get-ExakitActualTarget $component
         $current = Get-ExakitComponentCurrent $actual
         $available = Get-ExakitComponentAvailable $actual
@@ -2925,13 +2926,44 @@ function Invoke-ExakitUpdateRun {
             Add-ExakitUpdateNote -Component $actual -Outcome "updated" -From $current -To $available
         }
         $acted += 1
+        # CHECK 1: did this run just download a newer kit? Then the NEW
+        # exakit.ps1 finishes the run - the remaining components and its own
+        # task list. This process is still executing the old library, which
+        # knows neither. Never from a handed-over run, so the two cannot loop.
+        # Twin of the same check in _exakit_update_run.
+        if ($component -eq "exakit" -and -not $componentFailed -and $env:EXAKIT_UPDATE_HANDOVER -ne "1" -and
+            (Get-Command Invoke-ExakitUpdateHandover -ErrorAction SilentlyContinue)) {
+            $kitNow = Get-ExakitManifestValue "kit.version"
+            if ($kitNow -and $kitNow -ne $current) {
+                $handoverCode = Invoke-ExakitUpdateHandover -Target $Target -AssumeYes $AssumeYes
+                if ($null -ne $handoverCode) {
+                    if ($handoverCode -ne 0) {
+                        if ($script:ExakitUpdateJson) { throw "the updated kit's update run did not finish (exit $handoverCode)" }
+                        exit $handoverCode
+                    }
+                    return
+                }
+                Warn2 "The updated exakit command was not found - finishing this update with the previous one"
+            }
+        }
     }
-    if ($acted -eq 0 -and $deferred -eq 0) {
+    # CHECK 2: does this kit ask for setup this machine has not completed?
+    # Only the installer holds that setup, so a pending task reruns it once.
+    # Twin of the same check in _exakit_update_run.
+    $script:ExakitCoreUpdateActed = $false
+    $coreOk = $true
+    if (Get-Command Invoke-ExakitCoreUpdateCheck -ErrorAction SilentlyContinue) {
+        $coreOk = @(Invoke-ExakitCoreUpdateCheck -Target $Target)[-1]
+    }
+    if ($acted -eq 0 -and $deferred -eq 0 -and -not $script:ExakitCoreUpdateActed) {
         Ok "Everything is already current."
     }
     if ($deferred -gt 0) {
         Info "See everything, including the deferred runtime change: exakit version"
     }
+    # The warning above already named what is left and the retry; the exit
+    # code is what a script reads. Under --json the failed row does both.
+    if ($coreOk -ne $true -and -not $script:ExakitUpdateJson) { exit 1 }
 }
 
 # Kit 2 is delivered by the bash upgrade scripts (upgrade/upgrade-kit2.sh), which

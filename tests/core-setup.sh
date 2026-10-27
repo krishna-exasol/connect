@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+# Core setup tasks: the work a kit release adds that only the installer can do,
+# and how an already-installed kit picks it up through `exakit update`.
+#
+#   1. tasks.json vs core_tasks.completed - the bookkeeping, its exit codes,
+#      and that its writes share the manifest lock with the shell's writers.
+#   2. The installer rerun - found in the kit copy (or the checkout it came
+#      from), told it is a rerun, never nested, its exit code passed back.
+#   3. `exakit update`'s two checks - hand the run to a freshly downloaded
+#      kit; then rerun the installer once when a task is pending, but never
+#      for a scoped update, never inside a rerun, and never by starting a
+#      stopped database behind the user's back.
+#   4. The installer's seventh step - where it sits, that it never joins
+#      steps_completed, what an update-started rerun does not ask again, and
+#      that the kit copy carries what `exakit update` reads.
+#
+#   bash tests/core-setup.sh
+set -u
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PASS=0; FAIL=0
+pass() { PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"; }
+fail() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1"; }
+check() {
+    if [ "$2" = "$3" ]; then pass "$1"; else fail "$1"; printf '         expected: %s\n         actual:   %s\n' "$2" "$3"; fi
+}
+has() {
+    case "$3" in *"$2"*) pass "$1" ;; *) fail "$1"; printf '         missing: %s\n         in: %.300s\n' "$2" "$3" ;; esac
+}
+lacks() {
+    case "$3" in *"$2"*) fail "$1"; printf '         unexpected: %s\n' "$2" ;; *) pass "$1" ;; esac
+}
+
+command -v python3 >/dev/null 2>&1 || { echo "python3 is required for this suite"; exit 1; }
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+MANAGE="$ROOT/setup/core/manage.py"
+RERUN="$ROOT/setup/core/rerun-installer.py"
+
+printf '\n== the shipped task list ==\n'
+check "tasks.json lists the preprocessor as a database task" "preprocessor" \
+    "$(python3 "$MANAGE" tasks --tasks "$ROOT/setup/core/tasks.json" --scope database)"
+check "no kit-scope task yet" "" "$(python3 "$MANAGE" tasks --tasks "$ROOT/setup/core/tasks.json" --scope kit)"
+for _t in $(python3 "$MANAGE" tasks --tasks "$ROOT/setup/core/tasks.json"); do
+    if grep -q "^exakit_core_task_${_t}()" "$ROOT/setup/lib/core-setup.sh"; then
+        pass "task $_t has a bash handler (exakit_core_task_$_t)"
+    else
+        fail "task $_t has no bash handler (exakit_core_task_$_t in core-setup.sh)"
+    fi
+    if grep -q "\"$_t\" *= *\"Invoke-ExakitCoreTask" "$ROOT/setup/lib/core-setup.ps1" 2>/dev/null; then
+        pass "task $_t has a PowerShell handler"
+    else
+        fail "task $_t has no PowerShell handler in core-setup.ps1's handler map"
+    fi
+done
+
+printf '\n== pending, complete, status ==\n'
+T="$WORK/tasks.json"
+cat > "$T" <<'EOF'
+{"tasks": [{"name": "preprocessor", "scope": "database"}, {"name": "local_log_rotation", "scope": "kit"}]}
+EOF
+M="$WORK/manifest.json"
+printf '{"components": {}, "steps_completed": ["launcher"]}\n' > "$M"
+check "a manifest with no record: everything pending, in file order" "preprocessor local_log_rotation" \
+    "$(python3 "$MANAGE" pending --tasks "$T" --manifest "$M" | tr '\n' ' ' | sed 's/ $//')"
+check "...filtered by scope" "local_log_rotation" "$(python3 "$MANAGE" pending --tasks "$T" --manifest "$M" --scope kit)"
+python3 "$MANAGE" complete --tasks "$T" --manifest "$M" preprocessor
+python3 "$MANAGE" complete --tasks "$T" --manifest "$M" preprocessor
+check "complete is idempotent" '["preprocessor"]' \
+    "$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["core_tasks"]["completed"]))' "$M")"
+check "...and leaves steps_completed alone" '["launcher"]' \
+    "$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["steps_completed"]))' "$M")"
+check "pending now names only what is left" "local_log_rotation" "$(python3 "$MANAGE" pending --tasks "$T" --manifest "$M")"
+check "status says the same as JSON" '["local_log_rotation"]' \
+    "$(python3 "$MANAGE" status --tasks "$T" --manifest "$M" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["pending"]))')"
+python3 "$MANAGE" complete --tasks "$T" --manifest "$M" not_a_task 2>/dev/null
+check "an unknown name is refused (exit 2) and not recorded" "2 1" \
+    "$? $(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["core_tasks"]["completed"]))' "$M")"
+check "the manifest stays owner-only" "600" "$(stat -f '%Lp' "$M" 2>/dev/null || stat -c '%a' "$M")"
+
+python3 "$MANAGE" pending --tasks "$T" --manifest "$WORK/none.json" 2>/dev/null
+check "no manifest: exit 3" "3" "$?"
+printf '{"broken' > "$WORK/broken.json"
+python3 "$MANAGE" pending --tasks "$T" --manifest "$WORK/broken.json" 2>/dev/null
+check "a manifest that does not parse: exit 4" "4" "$?"
+python3 "$MANAGE" complete --tasks "$T" --manifest "$WORK/broken.json" preprocessor 2>/dev/null
+check "...and nothing is written over it" '{"broken' "$(cat "$WORK/broken.json")"
+for _bad in '{"tasks": [{"name": "a", "scope": "database"}, {"name": "a", "scope": "kit"}]}' \
+            '{"tasks": [{"name": "Bad-Name", "scope": "kit"}]}' \
+            '{"tasks": [{"name": "a", "scope": "elsewhere"}]}' \
+            '{"no_tasks": []}'; do
+    printf '%s\n' "$_bad" > "$WORK/bad-tasks.json"
+    python3 "$MANAGE" tasks --tasks "$WORK/bad-tasks.json" >/dev/null 2>&1
+    check "a malformed task list is refused (exit 2): $_bad" "2" "$?"
+done
+
+printf '\n== core-task writes and the shell writers share one lock ==\n'
+# common.sh derives the manifest path from the home, so the file lives there.
+mkdir -p "$WORK/lock-home"
+L="$WORK/lock-home/manifest.json"
+printf '{"components": {}}\n' > "$L"
+cat > "$WORK/many-tasks.json" <<'EOF'
+{"tasks": [
+EOF
+_i=0; while [ "$_i" -lt 15 ]; do
+    printf '{"name": "t%s", "scope": "kit"}%s\n' "$_i" "$([ "$_i" -lt 14 ] && echo ,)" >> "$WORK/many-tasks.json"
+    _i=$((_i + 1))
+done
+printf ']}\n' >> "$WORK/many-tasks.json"
+_pids=""
+_i=0; while [ "$_i" -lt 15 ]; do
+    python3 "$MANAGE" complete --tasks "$WORK/many-tasks.json" --manifest "$L" "t$_i" & _pids="$_pids $!"
+    ( EXAKIT_HOME="$WORK/lock-home"
+      . "$ROOT/setup/lib/common.sh" >/dev/null 2>&1
+      manifest_set "components.c$_i.version" "1.$_i" >/dev/null 2>&1 ) & _pids="$_pids $!"
+    _i=$((_i + 1))
+done
+for _p in $_pids; do wait "$_p"; done
+check "15 task completions and 15 manifest_set writes in parallel: none lost" "15 15" \
+    "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d["core_tasks"]["completed"]), len([k for k in d["components"] if k.startswith("c")]))' "$L")"
+
+printf '\n== the installer rerun ==\n'
+FK="$WORK/fake-kit"
+mkdir -p "$FK/setup"
+cat > "$FK/setup/setup-macos.sh" <<EOF
+printf 'RERUN=%s BANNER=%s SOURCE=%s EXAPUMP=%s\n' "\${EXAKIT_CORE_RERUN:-}" "\${EXAKIT_BANNER_SHOWN:-}" "\${EXAKIT_KIT_SOURCE:-}" "\${EXAKIT_EXAPUMP_VERSION:-}" > "$WORK/rerun-env"
+if [ -t 0 ]; then echo tty; else read -r _l && echo "stdin:\$_l" || echo no-stdin; fi >> "$WORK/rerun-env"
+exit \${FAKE_INSTALLER_RC:-0}
+EOF
+cp "$FK/setup/setup-macos.sh" "$FK/setup/setup-linux.sh"
+EXAKIT_KIT_SOURCE="exasol-labs/kit@main" python3 "$RERUN" --platform macos --kit-root "$FK" --no-stdin </dev/null
+check "the kit copy's installer runs, exit 0" "0" "$?"
+has "...told it is a rerun" "RERUN=1" "$(cat "$WORK/rerun-env")"
+has "...with the banner already shown" "BANNER=1" "$(cat "$WORK/rerun-env")"
+has "...the kit source passed through" "SOURCE=exasol-labs/kit@main" "$(cat "$WORK/rerun-env")"
+has "...and no stdin under --no-stdin" "no-stdin" "$(cat "$WORK/rerun-env")"
+FAKE_INSTALLER_RC=5 python3 "$RERUN" --platform linux --kit-root "$FK" --no-stdin </dev/null
+check "the installer's exit code comes back" "5" "$?"
+python3 "$RERUN" --platform macos --kit-root "$WORK/empty" --fallback-root "$FK" --no-stdin </dev/null
+check "a kit copy without setup scripts falls back to the checkout" "0" "$?"
+python3 "$RERUN" --platform macos --kit-root "$WORK/empty" --no-stdin 2>/dev/null </dev/null
+check "no installer anywhere: exit 7" "7" "$?"
+EXAKIT_CORE_RERUN=1 python3 "$RERUN" --platform macos --kit-root "$FK" --no-stdin 2>/dev/null </dev/null
+check "never from inside a rerun: exit 6" "6" "$?"
+
+printf '\n== exakit update: the pending-task check ==\n'
+# A sandboxed install whose kit copy carries the real setup/core and a stub
+# installer that records how it was called and completes the task the way the
+# real step does - through manage.py, after "its checks".
+U="$WORK/upd"
+mkdir -p "$U/home/kit/setup" "$U/home/kit/mcp" "$U/home/bin"
+cp -R "$ROOT/setup/core" "$U/home/kit/setup/"
+cat > "$U/home/kit/setup/setup-macos.sh" <<EOF
+echo "ran \${EXAKIT_CORE_RERUN:-0} \${EXAKIT_PERSONAL_VERSION:-unpinned}" >> "$U/installer-calls"
+[ "\${FAKE_TASK_FAILS:-0}" = 1 ] || python3 "$U/home/kit/setup/core/manage.py" complete --tasks "$U/home/kit/setup/core/tasks.json" --manifest "$U/home/manifest.json" preprocessor
+exit 0
+EOF
+cp "$U/home/kit/setup/setup-macos.sh" "$U/home/kit/setup/setup-linux.sh"
+upd() {
+    ( EXAKIT_HOME="$U/home"
+      EXAKIT_MANIFEST="$U/home/manifest.json"
+      EXAKIT_BIN_DIR="$U/home/bin"
+      . "$ROOT/setup/lib/common.sh"
+      . "$ROOT/setup/lib/detect.sh"
+      . "$ROOT/setup/lib/runtime-personal.sh"
+      . "$ROOT/setup/lib/core-setup.sh"
+      detect_os() { printf 'macos\n'; }
+      personal_deployment_running() { [ "${FAKE_DB_UP:-1}" = 1 ]; }
+      exakit_component_current() { case "$1" in personal) printf '2.3.0\n' ;; *) return 1 ;; esac; }
+      EXAKIT_UPDATE_RESULTS="$U/results"; export EXAKIT_UPDATE_RESULTS
+      "$@"
+      printf 'RC=%s ACTED=%s\n' "$?" "${EXAKIT_CORE_UPDATE_ACTED:-unset}" )
+}
+fresh_upd() {
+    printf '{"components": {}, "kit": {"source": "exasol-labs/kit@main"}}\n' > "$U/home/manifest.json"
+    rm -f "$U/installer-calls" "$U/results"
+}
+
+fresh_upd
+_o="$(upd exakit_core_update_check exapump 2>&1)"
+check "a scoped update (exakit update exapump) never reruns the installer" "no" "$([ -f "$U/installer-calls" ] && echo yes || echo no)"
+
+fresh_upd
+_o="$(EXAKIT_CORE_RERUN=1 upd exakit_core_update_check all 2>&1)"
+check "nor does a check inside a rerun" "no" "$([ -f "$U/installer-calls" ] && echo yes || echo no)"
+
+fresh_upd
+_o="$(FAKE_DB_UP=0 upd exakit_core_update_check all 2>&1)"
+check "a database task with the database stopped is deferred, not forced" "no" "$([ -f "$U/installer-calls" ] && echo yes || echo no)"
+has "...with the command that finishes it" "exakit start" "$_o"
+has "...booked as deferred for --json" "core-setup|deferred||preprocessor|exakit start && exakit update" "$(cat "$U/results")"
+
+fresh_upd
+_o="$(upd exakit_core_update_check all 2>&1)"
+check "a pending task reruns the installer exactly once" "ran 1 2.3.0" "$(cat "$U/installer-calls")"
+has "...pinned to the installed versions, as a rerun" "RC=0 ACTED=1" "$_o"
+has "...and says what it finished" "New setup completed: preprocessor" "$_o"
+has "...booked as updated" "core-setup|updated||preprocessor|" "$(cat "$U/results")"
+
+rm -f "$U/installer-calls" "$U/results"
+_o="$(upd exakit_core_update_check all 2>&1)"
+check "with nothing pending, nothing runs" "no" "$([ -f "$U/installer-calls" ] && echo yes || echo no)"
+has "...and the run is not counted as work" "RC=0 ACTED=0" "$_o"
+
+fresh_upd
+_o="$(FAKE_TASK_FAILS=1 upd exakit_core_update_check all 2>&1)"
+has "an installer that did not complete the task: exit 1" "RC=1" "$_o"
+has "...with the retry" "Retry with: exakit update" "$_o"
+has "...booked as failed" "core-setup|failed||preprocessor|exakit update" "$(cat "$U/results")"
+
+printf '\n== exakit update: the handover to a freshly downloaded kit ==\n'
+cat > "$U/home/bin/exakit" <<EOF
+#!/bin/sh
+echo "new-exakit \$* handover=\${EXAKIT_UPDATE_HANDOVER:-0}" >> "$U/handover-calls"
+exit 4
+EOF
+chmod +x "$U/home/bin/exakit"
+# ho_run <kit-version-before> <handover-flag> <targets> — _exakit_update_run
+# with every component's version and updater stubbed. Defined at top level:
+# bash 3.2 cannot parse a case statement inside a command substitution.
+ho_run() {
+    ( EXAKIT_HOME="$U/home"
+      EXAKIT_MANIFEST="$U/home/manifest.json"
+      EXAKIT_BIN_DIR="$U/home/bin"
+      EXAKIT_UPDATE_HANDOVER="$2"
+      . "$ROOT/setup/lib/common.sh"
+      . "$ROOT/setup/lib/core-setup.sh"
+      printf '{"components": {}, "kit": {"version": "%s"}}\n' "$1" > "$EXAKIT_MANIFEST"
+      EXAKIT_VERSION_POLICY=pinned
+      exakit_print_versions_source_line() { :; }
+      exakit_update_actual_target() { printf '%s\n' "$1"; }
+      exakit_component_current() {
+          case "$1" in
+              exakit) manifest_get kit.version ;;
+              *) printf '1.0\n' ;;
+          esac
+      }
+      exakit_component_available() {
+          case "$1" in
+              exakit) printf '0.3.1\n' ;;
+              *) printf '2.0\n' ;;
+          esac
+      }
+      exakit_component_supported() { return 0; }
+      exakit_component_is_ahead() { return 1; }
+      exakit_component_is_heavy() { return 1; }
+      exakit_component_min_kit() { return 1; }
+      exakit_core_update_check() { echo "core-check $1" >> "$U/handover-calls"; }
+      exakit_update_component() {
+          echo "updater $1" >> "$U/handover-calls"
+          if [ "$1" = exakit ]; then manifest_set kit.version 0.3.1 >/dev/null 2>&1; fi
+          return 0
+      }
+      _exakit_update_run all "$3" >/dev/null 2>&1
+      printf 'rc=%s' "$?" )
+}
+rm -f "$U/handover-calls"
+_ho="$(ho_run 0.3.0 0 "exakit exapump mcp")"
+check "the old updater updated the kit, then handed the rest over" \
+    "updater exakit|new-exakit update all handover=1|" "$(tr '\n' '|' < "$U/handover-calls")"
+check "...and its exit code is the new run's" "rc=4" "$_ho"
+
+rm -f "$U/handover-calls"
+_ho="$(ho_run 0.3.1 1 "exakit exapump mcp")"
+check "the handed-over run skips the kit, updates the rest, then checks the tasks" \
+    "updater exapump|updater mcp|core-check all|" "$(tr '\n' '|' < "$U/handover-calls")"
+
+rm -f "$U/handover-calls"
+_ho="$(ho_run 0.3.1 0 "exakit exapump")"
+check "a kit that is already current hands nothing over" "updater exapump|core-check all|" \
+    "$(tr '\n' '|' < "$U/handover-calls")"
+
+printf '\n== the installer: seven steps, the database step fourth ==\n'
+for _s in setup/setup-macos.sh setup/setup-linux.sh; do
+    check "$_s delegates steps 3-7" "1" "$(grep -c 'kit_shared_steps 3 7 ' "$ROOT/$_s")"
+    check "$_s loads core-setup.sh" "1" "$(grep -c 'LIB_DIR/core-setup.sh' "$ROOT/$_s" | awk '{print ($1 > 0)}')"
+    has "$_s keeps the marketplace offer out of an update rerun" "exakit_core_rerun_active" "$(grep -B3 'exakit_marketplace_offer )' "$ROOT/$_s")"
+    lacks "$_s has no step counted out of six" "/6  " "$(cat "$ROOT/$_s")"
+done
+_win="$(cat "$ROOT/setup/setup-windows.ps1")"
+has "Windows has the same fourth step" '"Step 4/7  Configure database features"' "$_win"
+lacks "Windows has no step counted out of six" "/6  " "$_win"
+has "the exakit command loads core-setup.sh" 'core-setup.sh' "$(cat "$ROOT/setup/exakit")"
+
+K="$WORK/kss"
+mkdir -p "$K/kit"
+cp "$ROOT/versions.json" "$K/kit/versions.json"
+_kss() {
+    ( EXAKIT_HOME="$K/home"
+      EXAKIT_MANIFEST="$K/home/manifest.json"
+      EXAKIT_BIN_DIR="$K/home/bin"
+      mkdir -p "$EXAKIT_HOME"
+      . "$ROOT/setup/lib/common.sh"
+      . "$ROOT/setup/lib/core-setup.sh"
+      manifest_init >/dev/null 2>&1
+      exapump_install() { :; }
+      _exakit_install_exapump() { echo "exapump-step" >> "$K/order"; }
+      exakit_core_task_preprocessor() { echo "preprocessor-task" >> "$K/order"; ok_step "fake framework ready"; }
+      exakit_maybe_offer_data_load() { echo "data-load-offer" >> "$K/order"; }
+      exakit_maybe_offer_mcp_setup() { echo "mcp-offer" >> "$K/order"; }
+      exakit_maybe_offer_skills_install() { echo "skills-offer" >> "$K/order"; }
+      mcp_install() { :; }
+      _exakit_install_mcp() { echo "mcp-step" >> "$K/order"; }
+      ensure_path_hint() { :; }
+      kit_shared_steps 3 7 "$ROOT/setup" "$ROOT"
+      printf 'COMPLETED=%s\n' "$(manifest_get core_tasks.completed 2>/dev/null | tr -d ' \n')" )
+}
+rm -rf "$K/home" "$K/order"
+_o="$(_kss 2>&1)"
+check "order: exapump, the database step, the data load, the AI bridge" \
+    "exapump-step|preprocessor-task|data-load-offer|mcp-step|mcp-offer|skills-offer|" "$(tr '\n' '|' < "$K/order")"
+for _lbl in "Step 3/7  exapump" "Step 4/7  Configure database features" "Step 5/7  AI bridge" "Step 7/7  exakit helper"; do
+    has "the screen counts $_lbl" "$_lbl" "$_o"
+done
+has "the task is recorded after its step passed" 'COMPLETED=["preprocessor"]' "$_o"
+check "the kit copy carries setup/core" "yes" "$([ -f "$K/home/kit/setup/core/tasks.json" ] && echo yes || echo no)"
+check "...and setup/preprocessor" "yes" "$([ -f "$K/home/kit/setup/preprocessor/manage.py" ] && echo yes || echo no)"
+
+rm -f "$K/order"
+_o="$(_kss 2>&1)"
+check "the database step runs again on the next pass (it verifies); finished steps skip" \
+    "preprocessor-task|data-load-offer|mcp-offer|skills-offer|" "$(tr '\n' '|' < "$K/order")"
+
+rm -f "$K/order"
+_o="$(EXAKIT_CORE_RERUN=1 _kss 2>&1)"
+check "an update-started rerun asks none of the first install's questions" \
+    "preprocessor-task|" "$(tr '\n' '|' < "$K/order" | sed 's/exapump-step|//')"
+
+printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+[ "$FAIL" -eq 0 ]

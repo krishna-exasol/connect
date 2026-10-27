@@ -2586,6 +2586,27 @@ function Get-ExakitVersionsValue {
     return "" + $value
 }
 
+# Add-ExakitUpdateNote - one row of `exakit update --json`'s answer. Lives in
+# the shared layer rather than the CLI because core-setup.ps1, which the
+# installer loads too, reports the core-setup row through it; during an
+# install neither the --json switch nor a handover is set, so it is a no-op.
+# Twin of _exakit_update_note.
+function Add-ExakitUpdateNote {
+    param([string]$Component, [string]$Outcome, [string]$From = "", [string]$To = "", [string]$Remedy = "")
+    # A run handed over by the previous kit's updater (see
+    # Invoke-ExakitUpdateHandover) writes its rows where that run can merge
+    # them, so `exakit update --json` still answers with ONE object.
+    if ($env:EXAKIT_UPDATE_HANDOVER -eq "1" -and $env:EXAKIT_UPDATE_RESULTS_FILE) {
+        try {
+            Add-Content -LiteralPath $env:EXAKIT_UPDATE_RESULTS_FILE -Value ("{0}|{1}|{2}|{3}|{4}" -f $Component, $Outcome, $From, $To, $Remedy) -Encoding UTF8
+        } catch { }
+    }
+    if (-not $script:ExakitUpdateJson) { return }
+    [void]$script:ExakitUpdateResults.Add([pscustomobject]@{
+        component = $Component; outcome = $Outcome; from = $From; to = $To; remedy = $Remedy
+    })
+}
+
 function Get-ExakitLatestGithubRelease {
     param([Parameter(Mandatory)][string]$Repo)
     try {

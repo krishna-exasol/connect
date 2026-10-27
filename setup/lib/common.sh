@@ -6357,7 +6357,9 @@ print(json.dumps({
     "ahead": ahead,
     "failed": failed,
     "remedy": remedy,
-    "remedy_hint": ("a database change needs the database stopped; --yes (or EXAKIT_CONFIRM_RUNTIME_UPDATE=1) applies it unattended" if status == "deferred" else None),
+    # The hint explains the database-change deferral only. New kit setup that
+    # waits for a STOPPED database is deferred too, and its remedy says so.
+    "remedy_hint": ("a database change needs the database stopped; --yes (or EXAKIT_CONFIRM_RUNTIME_UPDATE=1) applies it unattended" if status == "deferred" and deferred[0].get("component") != "core-setup" else None),
 }, indent=2, ensure_ascii=False))
 sys.exit(0 if not failed else 1)
 EXAKIT_UPDATE_JSON_PY
@@ -6386,6 +6388,12 @@ _exakit_update_run() {
     _deferred=0
     _acted=0
     for _component in $_targets; do
+        # A run handed over by the previous kit's updater: that run already
+        # updated the kit itself, and reporting it again here would list the
+        # kit twice in one --json answer.
+        if [ "$_component" = "exakit" ] && [ "${EXAKIT_UPDATE_HANDOVER:-0}" = "1" ]; then
+            continue
+        fi
         # _upd_ prefix: verify_sha256 (reached through the component updaters)
         # assigns _actual, and bash has no function-local variables here.
         _upd_actual="$(exakit_update_actual_target "$_component" 2>/dev/null || printf '%s\n' "$_component")"
@@ -6485,8 +6493,29 @@ _exakit_update_run() {
             exakit_update_component "$_component" "$@"
         fi
         _acted=$((_acted + 1))
+        # CHECK 1: did this run just download a newer kit? Then the NEW updater
+        # finishes the run - the remaining components, and the comparison of
+        # its own task list below. This process is still executing the old
+        # library, which knows neither. Never from a run that was itself
+        # handed over, so the two can never loop.
+        if [ "$_component" = "exakit" ] && [ "${EXAKIT_UPDATE_HANDOVER:-0}" != "1" ] &&
+           command -v exakit_update_handover >/dev/null 2>&1; then
+            _upd_kit_now="$(manifest_get kit.version 2>/dev/null || true)"
+            if [ -n "$_upd_kit_now" ] && [ "$_upd_kit_now" != "$_cur" ]; then
+                exakit_update_handover "$_target"
+                _upd_handover_rc=$?
+                [ "$_upd_handover_rc" -ne 127 ] && return "$_upd_handover_rc"
+                warn "The updated exakit command was not found - finishing this update with the previous one"
+            fi
+        fi
     done
-    if [ "$_acted" -eq 0 ] && [ "$_deferred" -eq 0 ]; then
+    # CHECK 2: does this kit ask for setup this machine has not completed?
+    # Only the installer holds that setup, so a pending task reruns it once.
+    EXAKIT_CORE_UPDATE_ACTED=0
+    if command -v exakit_core_update_check >/dev/null 2>&1; then
+        exakit_core_update_check "$_target" || _upd_failed=$((${_upd_failed:-0} + 1))
+    fi
+    if [ "$_acted" -eq 0 ] && [ "$_deferred" -eq 0 ] && [ "$EXAKIT_CORE_UPDATE_ACTED" = "0" ]; then
         ok "Everything is already current."
     fi
     if [ "$_deferred" -gt 0 ]; then
@@ -10362,6 +10391,24 @@ kit_shared_steps() {
     fi
     _step_no=$((_step_no + 1))
 
+    # CONFIGURE DATABASE FEATURES, right after exapump: the database is up and
+    # exapump can run the setup SQL, and nothing has loaded data or connected
+    # an AI client yet. The core tasks of scope "database" run here (today the
+    # SQL preprocessor framework) - installed when missing, verified on every
+    # pass. A task that fails is booked in the closing summary and the steps
+    # after it still run; each checks its own prerequisites.
+    _kss_feature_label="Step ${_step_no}/${_total}  Configure database features"
+    if [ "$_kss_nodb" = 1 ]; then
+        :
+    elif ! command -v exakit_core_database_step >/dev/null 2>&1; then
+        info "$_kss_feature_label — not part of this installation, skipping"
+    elif exakit_soft_failed exapump; then
+        info "$_kss_feature_label — skipped: it runs its setup through exapump, which is not installed"
+    else
+        exakit_core_database_step "$_kss_feature_label" "$_kit_root"
+    fi
+    _step_no=$((_step_no + 1))
+
     # Load the sample data before any MCP configuration. exapump is now up
     # (its only dependency), and doing this first means the read-only MCP
     # user is provisioned, granted, and posture-checked against a schema
@@ -10371,6 +10418,10 @@ kit_shared_steps() {
         :
     elif exakit_soft_failed exapump; then
         info "Skipping the sample data — it is loaded with exapump, which is not installed"
+    elif command -v exakit_core_rerun_active >/dev/null 2>&1 && exakit_core_rerun_active; then
+        # An installer an update started to finish new setup: the datasets
+        # were the first install's question, and its answer stands.
+        :
     else
         # `|| true` alone hid a failed load completely: the run carried on (right)
         # and the closing summary said nothing (wrong). Record it so the user
@@ -10421,15 +10472,22 @@ kit_shared_steps() {
     # Both offers are best-effort and neither may end the run — but "best-effort"
     # used to mean "vanishes without trace". Each books itself in the closing
     # summary with the command that retries it.
-    exakit_clear_failure_note
-    if ! ( exakit_maybe_offer_mcp_setup ); then
-        exakit_record_soft_failure mcp_clients "exakit mcp-setup" \
-            "$(exakit_take_failure_note)" "AI client (MCP) setup"
-    fi
-    exakit_clear_failure_note
-    if ! ( exakit_maybe_offer_skills_install ); then
-        exakit_record_soft_failure skills "exakit skills-install" \
-            "$(exakit_take_failure_note)" "AI skills"
+    #
+    # Neither is asked again by an installer an update started to finish new
+    # setup: which clients and skills to wire was the first install's question.
+    if command -v exakit_core_rerun_active >/dev/null 2>&1 && exakit_core_rerun_active; then
+        :
+    else
+        exakit_clear_failure_note
+        if ! ( exakit_maybe_offer_mcp_setup ); then
+            exakit_record_soft_failure mcp_clients "exakit mcp-setup" \
+                "$(exakit_take_failure_note)" "AI client (MCP) setup"
+        fi
+        exakit_clear_failure_note
+        if ! ( exakit_maybe_offer_skills_install ); then
+            exakit_record_soft_failure skills "exakit skills-install" \
+                "$(exakit_take_failure_note)" "AI skills"
+        fi
     fi
     exakit_clear_failure_note
     _step_no=$((_step_no + 1))
@@ -10502,12 +10560,21 @@ kit_shared_steps() {
             # Only the subtrees re-copied below, and only in the branch that
             # already established this is not the kit home itself.
             for _kss_stale in "$EXAKIT_HOME/kit/setup/lib" "$EXAKIT_HOME/kit/setup/help" \
+                              "$EXAKIT_HOME/kit/setup/core" "$EXAKIT_HOME/kit/setup/preprocessor" \
                               "$EXAKIT_HOME/kit/mcp" "$EXAKIT_HOME/kit/sql" \
                               "$EXAKIT_HOME/kit/skills"; do
                 rm -rf "$_kss_stale"
             done
             cp -R "$_script_dir/lib" "$EXAKIT_HOME/kit/setup/" \
                 || die "Could not copy the kit library to $EXAKIT_HOME/kit/setup."
+            # setup/core/ and setup/preprocessor/ are what `exakit update`
+            # reads to decide whether this kit asks for setup this machine has
+            # not finished, and what the database step runs. Without them in
+            # the staged copy, a checkout install's update could never see a
+            # pending task.
+            for _kss_core in core preprocessor; do
+                [ -d "$_script_dir/$_kss_core" ] && cp -R "$_script_dir/$_kss_core" "$EXAKIT_HOME/kit/setup/"
+            done
             # Copy the assets exakit needs after the checkout is gone: the mcp/
             # and sql/ packages, the data/ CSVs, load-data.sh, and the versions
             # manifest (the offline tier of version resolution, and the record of

@@ -161,6 +161,7 @@ fi
 # pyexasol is an update target of its own (and its own repair command), so the
 # CLI needs the module even though it takes no part in the runtime commands.
 [ -f "$_lib_dir/pyexasol.sh" ] && . "$_lib_dir/pyexasol.sh"
+[ -f "$_lib_dir/core-setup.sh" ] && . "$_lib_dir/core-setup.sh"
 # Marketplace add-on modules: the CLI is where they are installed (exakit
 # marketplace) and updated (exakit update <addon>), so it loads every module
 # it ships. A missing file only makes the marketplace row unavailable.

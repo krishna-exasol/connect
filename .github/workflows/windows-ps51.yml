@@ -107,3 +107,14 @@ jobs:
         if: matrix.shard == 2
         shell: powershell
         run: powershell -NoProfile -ExecutionPolicy Bypass -File tests/skills.ps1
+      # Core setup tasks and the preprocessor bridge, executed: the real
+      # Python coordinators behind core-setup.ps1, a .cmd stand-in for
+      # exapump, and the installer rerun through powershell.exe itself.
+      - name: core setup tasks under 5.1
+        if: matrix.shard == 2
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests/core-setup.ps1
+      - name: preprocessor bridge under 5.1
+        if: matrix.shard == 2
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests/preprocessor-lifecycle.ps1
