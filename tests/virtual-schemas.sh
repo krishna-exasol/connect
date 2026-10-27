@@ -181,7 +181,7 @@ check "the loader driver's settings.cfg: documented keys, final blank line" \
 check "the source record says ready" "ready" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$HOME_K/sources/sales/state.json")"
 lacks "the secret is not in the output" "s3cr3t" "$OUT"
 check "...nor anywhere under the kit home" "" "$(grep -rl 's3cr3t' "$HOME_K/sources" 2>/dev/null)"
-check "the source folder is owner-only" "700" "$(stat -f '%Lp' "$HOME_K/sources/sales" 2>/dev/null || stat -c '%a' "$HOME_K/sources/sales")"
+check "the source folder is owner-only" "700" "$(stat -c '%a' "$HOME_K/sources/sales" 2>/dev/null || stat -f '%Lp' "$HOME_K/sources/sales")"
 
 printf '\n== a second source on the same connector shares the files ==\n'
 python3 - "$STATE" <<'PY'
