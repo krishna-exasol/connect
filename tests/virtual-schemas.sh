@@ -134,6 +134,27 @@ PYT
 check "13 connector/TLS combinations build a URL, properties and a probe host" "13 0" \
     "$(printf '%s\n' "$TEMPLATES" | grep -c ' ok$') $(printf '%s\n' "$TEMPLATES" | grep -c ' BAD')"
 
+printf '\n== failure classes, from real driver messages ==\n'
+CLASSES="$(python3 - "$ROOT" <<'PYC'
+import sys; sys.path.insert(0, sys.argv[1] + "/setup/virtual-schemas/engine")
+import sql
+for text in [
+    "E-VSPG-3: Unable to create PostgreSQL remote metadata reader. Caused by: 'The connection attempt failed.'",
+    "E-VSMYSQL-1: Unable to create MySQL remote metadata reader. Caused by: Communications link failure",
+    "E-VSSQLS-2: ... The TCP/IP connection to the host 192.168.64.1, port 55432 has failed. Error: \"The driver received an unexpected pre-login response.",
+    "E-VSORA-1: Unable to create Oracle remote metadata reader. Caused by: ORA-17800: Got minus one from a read call.",
+    'FATAL: password authentication failed for user "reader"',
+    "ORA-01017: invalid username/password; logon denied",
+    "PKIX path building failed: unable to find valid certification path to requested target",
+    "No usable script language container is installed for the requested language.",
+    "java.net.UnknownHostException: db.example.com",
+]:
+    print(sql.classify(text))
+PYC
+)"
+check "each real message lands in its class" "unreachable|unreachable|unreachable|unreachable|auth|auth|tls|nojava|dns|" \
+    "$(printf '%s\n' "$CLASSES" | tr '\n' '|')"
+
 printf '\n== connect: the happy path ==\n'
 db '{"sources": {"pg.example.com": {"tables": ["ORDERS", "CUSTOMERS"]}}}'
 run connect postgresql --name sales $PG_SET --secret-stdin </dev/null

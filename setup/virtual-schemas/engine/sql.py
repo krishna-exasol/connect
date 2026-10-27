@@ -34,7 +34,11 @@ _KINDS = (
              r"JWT token is invalid|Programmatic access token is invalid|token has expired"),
     ("unreachable", r"Connection refused|connect timed out|The connection attempt failed|"
                     r"Communications link failure|No route to host|Network is unreachable|"
-                    r"Connection timed out|ORA-12541|ORA-12170|TCP/IP connection to the host"),
+                    r"Connection timed out|ORA-12541|ORA-12170|TCP/IP connection to the host|"
+                    # The far end answered, but not as this database: a wrong
+                    # port or a proxy that drops the protocol. Measured live.
+                    r"ORA-17800|Got minus one from a read call|ORA-17002|IO Error: The Network Adapter|"
+                    r"unexpected pre-login response|Broken pipe|EOFException"),
 )
 
 
