@@ -94,14 +94,17 @@ for loop in localhost 127.0.0.1 ::1 LOCALHOST; do
     check "host=$loop is refused (it is the database itself)" "2" "$RC"
 done
 has "...with the address to use instead" "on macOS 192.168.64.1, on Linux and WSL host.containers.internal" "$OUT"
-python3 - "$ROOT" <<'PYV6'
+V6="$(python3 - "$ROOT" <<'PYV6'
 import sys; sys.path.insert(0, sys.argv[1] + "/setup/virtual-schemas/engine")
 import plan
 c = plan.Definitions(sys.argv[1] + "/setup/virtual-schemas").connector("postgresql")
 for given in ("2001:db8::1", "[2001:db8::1]"):
     v = plan.validate_inputs(c, {"host": given, "database": "d", "user": "u"})
-    print("%s|%s|%s" % (given, v["host"], plan.jdbc_url(c, v)))
+    print(plan.jdbc_url(c, v).split("?")[0])
 PYV6
+)"
+check "an IPv6 host is bracketed in the URL, written either way" \
+    "jdbc:postgresql://[2001:db8::1]:5432/d|jdbc:postgresql://[2001:db8::1]:5432/d|" "$(printf '%s\n' "$V6" | tr '\n' '|')"
 
 run plan postgresql --name sales --set host=h --set user=u; has "a missing required input is named" "database is required" "$OUT"
 
