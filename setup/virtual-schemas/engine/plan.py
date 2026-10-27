@@ -128,6 +128,10 @@ def validate_inputs(connector, given):
         if kind == "host" and raw.strip("[]").lower() in LOOPBACK:
             problems.append(LOOPBACK_ADVICE)
             continue
+        if kind == "host":
+            # Stored bare; jdbc_url adds the brackets an IPv6 literal needs in
+            # a URL, and the route probe resolves the bare form.
+            raw = raw.strip("[]")
         values[name] = raw.upper() if spec.get("upper") else raw
     if problems:
         raise PlanError("; ".join(problems))
@@ -151,6 +155,8 @@ def source_host(connector, values):
 
 def jdbc_url(connector, values, extra=None):
     fields = dict(values)
+    if ":" in fields.get("host", ""):
+        fields["host"] = "[%s]" % fields["host"]
     fields.update(extra or {})
     if connector.get("tls"):
         fields["tls"] = connector["tls"][values.get("tls", "verify")].format(**fields)
