@@ -180,7 +180,9 @@ function Get-ExakitLoadedDatasets {
     # manifest while the database is down is not mistaken for a verified one.
     $script:ExakitDatasetsSource = "manifest"
     if (Get-Command Get-ExakitVerifiedDatasets -ErrorAction SilentlyContinue) {
-        $verified = Get-ExakitVerifiedDatasets
+        $limit = 20
+        if ($env:EXAKIT_STATUS_SQL_TIMEOUT -match '^[0-9]+$') { $limit = [int]$env:EXAKIT_STATUS_SQL_TIMEOUT }
+        $verified = Get-ExakitVerifiedDatasets -TimeoutSeconds $limit
         if ($null -ne $verified) { $script:ExakitDatasetsSource = "database"; return @($verified) }
     }
     $datasets = Get-ExakitManifestValue "data.datasets"

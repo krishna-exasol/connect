@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+**`exakit status` no longer waits forever on a database that stops
+answering.** Its dataset check asked the database without a time limit, after
+a probe that only proves the TLS handshake. A database that accepted logins
+and then answered nothing (seen live: a deadlocked loader) held status, and
+any agent calling it, for as long as it hung. The check now gives up after
+`EXAKIT_STATUS_SQL_TIMEOUT` seconds (default 20) and reports the manifest's
+answer, as it does for a database that is down. Same on Windows. Other callers
+keep waiting: under load a login alone can take seconds, and the installer must
+not read that as "down".
+
 ## 0.2.2
 
 **The Personal launcher comes from Exasol's S3 bucket first, verified, with

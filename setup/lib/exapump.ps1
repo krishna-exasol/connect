@@ -3021,11 +3021,21 @@ function Test-ExakitDatasetLoaded {
 # reporting it as either one is what let a failed upload pass for a loaded one.
 # Twin of exakit_table_rows_listing.
 function Get-ExakitQualifiedTableRows {
-    $result = Invoke-Exapump @("sql", "-p", $script:ExapumpProfile,
-        "SELECT 'EXAKIT.LISTING_ANSWERED|1' AS QUALIFIED FROM DUAL UNION ALL SELECT TABLE_SCHEMA || '.' || TABLE_NAME || '|' || TABLE_ROW_COUNT FROM SYS.EXA_ALL_TABLES")
-    if (-not $result.Success) { return $null }
+    # -TimeoutSeconds: for a caller that must answer (status) rather than wait
+    # on a database that accepts logins and then never replies. Twin of the
+    # [limit] of exakit_verified_datasets.
+    param([int]$TimeoutSeconds = 0)
+    $query = "SELECT 'EXAKIT.LISTING_ANSWERED|1' AS QUALIFIED FROM DUAL UNION ALL SELECT TABLE_SCHEMA || '.' || TABLE_NAME || '|' || TABLE_ROW_COUNT FROM SYS.EXA_ALL_TABLES"
+    if ($TimeoutSeconds -gt 0) {
+        $output = Invoke-ExakitBounded -FilePath (Get-ExapumpCli) -Arguments @("sql", "-p", $script:ExapumpProfile, $query) -TimeoutSeconds $TimeoutSeconds
+        if ($null -eq $output) { return $null }
+    } else {
+        $result = Invoke-Exapump @("sql", "-p", $script:ExapumpProfile, $query)
+        if (-not $result.Success) { return $null }
+        $output = $result.Output
+    }
     $map = @{}
-    foreach ($line in (("" + $result.Output) -split "`r?`n")) {
+    foreach ($line in (("" + $output) -split "`r?`n")) {
         $t = $line.Trim()
         if ($t -match '^([A-Za-z0-9_$]+\.[A-Za-z0-9_$]+)\|([0-9]+)$') {
             $map[$Matches[1].ToUpper()] = [long]$Matches[2]
@@ -3047,7 +3057,8 @@ function Get-ExakitTableRowCount {
 }
 
 function Get-ExakitQualifiedTables {
-    $map = Get-ExakitQualifiedTableRows
+    param([int]$TimeoutSeconds = 0)
+    $map = Get-ExakitQualifiedTableRows -TimeoutSeconds $TimeoutSeconds
     if ($null -eq $map) { return $null }
     $set = @{}
     foreach ($k in $map.Keys) {
@@ -3063,6 +3074,7 @@ function Get-ExakitQualifiedTables {
 }
 
 function Get-ExakitVerifiedDatasets {
+    param([int]$TimeoutSeconds = 0)
     $datasets = @(Get-ExakitBundledDatasets)
     # THE TABLE LISTING IS THE REACHABILITY PROBE. Asking SELECT 1 first bought
     # no information the listing does not already give, and doubled the cost:
@@ -3070,7 +3082,7 @@ function Get-ExakitVerifiedDatasets {
     # authentication, about 2.5s on a warm machine, so `exakit status` paid ~5s
     # where ~2.5s answers the same question. A listing that comes back proves
     # the database is up, so the cached flag is set from here.
-    $present = Get-ExakitQualifiedTables
+    $present = Get-ExakitQualifiedTables -TimeoutSeconds $TimeoutSeconds
     if ($null -ne $present) { $script:ExakitDbReachable = $true }
     if ($null -eq $present) {
         # Could not list: unreachable, or the query failed. Ask properly before

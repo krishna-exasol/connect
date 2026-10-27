@@ -526,5 +526,29 @@ else
     fail "Write-ExakitError prints into the spinner's line, or with a hardcoded colour"
 fi
 
+printf '\n== a database that completes the handshake and then never answers ==\n'
+# Measured live: a deadlocked loader left the database accepting logins and
+# answering nothing, and `exakit status` (its dataset check) waited on it for as
+# long as it hung - and every agent that asked with it. Status bounds its SQL
+# and falls back to the manifest's word, as it does for a database that is down.
+cat > "$WORK/hang-exapump" <<'EOF'
+#!/bin/sh
+exec sleep 30
+EOF
+chmod +x "$WORK/hang-exapump"
+_t0=$(date +%s)
+( . "$ROOT/setup/lib/common.sh" >/dev/null 2>&1
+  . "$ROOT/setup/lib/exapump.sh" >/dev/null 2>&1
+  exapump_cli() { printf '%s' "$WORK/hang-exapump"; }
+  manifest_get() { [ "$1" = components.exapump.profile ] && printf 'starter-kit\n'; return 0; }
+  EXAKIT_STATUS_SQL_TIMEOUT=2
+  exakit_loaded_datasets >/dev/null 2>&1 ) </dev/null
+_took=$(( $(date +%s) - _t0 ))
+if [ "$_took" -lt 15 ]; then
+    pass "the dataset check gives up on a hung database (${_took}s with a 2s limit)"
+else
+    fail "the dataset check waited ${_took}s on a database that never answers"
+fi
+
 printf '\n%d checks, %d failed\n' "$checks" "$fails"
 [ "$fails" -eq 0 ]
