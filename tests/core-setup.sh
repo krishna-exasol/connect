@@ -77,7 +77,9 @@ check "status says the same as JSON" '["local_log_rotation"]' \
 python3 "$MANAGE" complete --tasks "$T" --manifest "$M" not_a_task 2>/dev/null
 check "an unknown name is refused (exit 2) and not recorded" "2 1" \
     "$? $(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["core_tasks"]["completed"]))' "$M")"
-check "the manifest stays owner-only" "600" "$(stat -f '%Lp' "$M" 2>/dev/null || stat -c '%a' "$M")"
+# GNU first: GNU stat -f is the FILESYSTEM form, succeeds and prints junk,
+# so a BSD-first chain never reached its fallback on Linux.
+check "the manifest stays owner-only" "600" "$(stat -c '%a' "$M" 2>/dev/null || stat -f '%Lp' "$M")"
 
 python3 "$MANAGE" pending --tasks "$T" --manifest "$WORK/none.json" 2>/dev/null
 check "no manifest: exit 3" "3" "$?"
