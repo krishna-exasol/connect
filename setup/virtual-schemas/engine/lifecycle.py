@@ -32,7 +32,7 @@ STATUS_FOR = {"auth": "auth-failed", "tls": "tls-failed", "unreachable": "unreac
 REMEDY_FOR = {
     "auth": "the source rejected the credentials: exakit source reauth {name}",
     "tls": "the source's certificate or host name did not verify; fix the server certificate or trust its CA, then: exakit source check {name}",
-    "unreachable": "the source did not answer from inside the database (localhost there is not this computer): check the host, port and firewall, then: exakit source check {name}",
+    "unreachable": "the source did not answer from inside the database: check the host, port, firewall and VPN (a source on this computer must listen beyond 127.0.0.1), then: exakit source check {name}",
     "dns": "Java in the database could not resolve the host name; restart the database with exakit start (it repairs DNS), then: exakit source check {name}",
     "nojava": "the Java language container is not installed: exakit connect installs it, or run: exasol slc install java",
     "error": "see the log: exakit logs",
@@ -297,7 +297,7 @@ class Engine(object):
                 if not reconnect and kind in ("auth", "tls", "unreachable"):
                     remedy = {"auth": "the source rejected the credentials; nothing was kept - correct them and run the same exakit connect again",
                               "tls": "the source's certificate or host name did not verify; nothing was kept - fix the server certificate or choose tls=require knowingly, then connect again",
-                              "unreachable": "the source did not answer from inside the database (localhost there is not this computer); nothing was kept - check host, port and firewall, then connect again"}[kind]
+                              "unreachable": "the source did not answer from inside the database; nothing was kept - check host, port, firewall and VPN (a source on this computer must listen beyond 127.0.0.1), then connect again"}[kind]
                 raise Failure("%s (%s)" % (error, remedy), code, kind)
             pins = {"adapter": connector["adapter"]["sha256"], "driver": connector["driver"]["sha256"],
                     "adapter_version": connector["adapter"]["version"], "driver_version": connector["driver"]["version"]}

@@ -21,6 +21,16 @@ KINDS = {
 }
 
 
+# Inside the database, loopback is the database's own runtime. Measured on
+# Exasol Personal (macOS): a UDF reaches the internet, the Mac as 192.168.64.1
+# (its resolver's address) and host.containers.internal - which there is the
+# launcher's Linux VM, not the Mac. On Linux Podman it is the host itself.
+LOOPBACK = ("localhost", "127.0.0.1", "::1", "0.0.0.0", "localhost.localdomain")
+LOOPBACK_ADVICE = ("host=localhost would be the database itself, not this computer. For a source running on this "
+                   "computer use the address the database sees it at - on macOS 192.168.64.1, on Linux and WSL "
+                   "host.containers.internal - and make the source listen on that interface, not only on 127.0.0.1")
+
+
 class PlanError(Exception):
     def __init__(self, message, code=2, choices=None):
         super().__init__(message)
@@ -114,6 +124,9 @@ def validate_inputs(connector, given):
                 continue
         elif kind in KINDS and not KINDS[kind].match(raw):
             problems.append("%s=%r is not a valid %s" % (name, raw, kind))
+            continue
+        if kind == "host" and raw.strip("[]").lower() in LOOPBACK:
+            problems.append(LOOPBACK_ADVICE)
             continue
         values[name] = raw.upper() if spec.get("upper") else raw
     if problems:

@@ -41,9 +41,13 @@ Rules that are not negotiable:
   (exit 2): every local user can read another process's arguments. Pipe it on
   stdin or name a file with `--password-file`. Ask the user for it; never
   invent, guess or echo it.
-- **`localhost` / `127.0.0.1` means the database itself**, not this computer.
-  A source on the user's machine is reached as `host.containers.internal`;
-  a remote one by its real host name.
+- **`localhost` / `127.0.0.1` means the database itself**, not this computer,
+  and the kit refuses it. A source on the user's own machine is reached at the
+  address the database sees that machine at - on macOS `192.168.64.1` (the
+  launcher VM's gateway; `host.containers.internal` there is the VM, not the
+  Mac), on Linux and WSL `host.containers.internal` - and must listen on that
+  interface, not only on 127.0.0.1. A VPN client can still drop such traffic.
+  A remote source is reached by its real host name.
 - **TLS verifies the server's certificate and host name by default**
   (`tls=verify`). `tls=require` only encrypts; `tls=disable` sends credentials
   in clear. Only lower it when the user says so, and say what it costs.

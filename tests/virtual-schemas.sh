@@ -89,6 +89,11 @@ for bad in "--set host=pg.example.com;DROP --set database=x --set user=u" "--set
     check "refused with exit 2: $bad" "2" "$RC"
 done
 run plan postgresql --name Bad-Name $PG_SET; check "a source name outside [a-z][a-z0-9_] is refused" "2" "$RC"
+for loop in localhost 127.0.0.1 ::1 LOCALHOST; do
+    run plan postgresql --name sales --set host=$loop --set database=x --set user=u
+    check "host=$loop is refused (it is the database itself)" "2" "$RC"
+done
+has "...with the address to use instead" "on macOS 192.168.64.1, on Linux and WSL host.containers.internal" "$OUT"
 run plan postgresql --name sales --set host=h --set user=u; has "a missing required input is named" "database is required" "$OUT"
 
 printf '\n== connect: the happy path ==\n'

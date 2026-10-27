@@ -182,7 +182,7 @@ printf '%s' "$PASSWORD" | exakit connect pg --name sales --set host=db.example.c
 ```
 
 - **Never pass a credential as an argument** (refused, exit 2): pipe it on stdin or use `--password-file`. Ask the user for it.
-- `localhost` inside the database is the database itself; a source on this machine is `host.containers.internal`.
+- `localhost` inside the database is the database itself, and is refused. A source on this machine is `192.168.64.1` on macOS (`host.containers.internal` there is the launcher VM) and `host.containers.internal` on Linux/WSL, and must listen beyond 127.0.0.1.
 - TLS verifies certificate and host name by default; lower it (`--set tls=require|disable`) only when the user says so.
 - Show the user the plan's exposure line: the MCP read-only user can read every table of the new virtual schema.
 - Exit codes: 2 bad input, 3 name/object conflict, 5 connector gated (BigQuery), 1 other failure (the message names the class: credentials, TLS, unreachable, host name). A failed first connect leaves nothing behind.
