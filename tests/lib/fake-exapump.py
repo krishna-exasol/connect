@@ -186,6 +186,14 @@ def run(doc, sql, out):
     if up.startswith("DROP ROLE"):
         doc["role"] = False
         return
+    if up.startswith("EXECUTE SCRIPT PREPROC.STATUS"):
+        stale = bool(doc.get("stale"))
+        out.append([{"IS_STALE": stale, "VERDICT": "STALE" if stale else "CURRENT", "LAST_REFRESH": "2026-10-27 21:21:09"}])
+        return
+    if up.startswith("EXECUTE SCRIPT PREPROC.REFRESH"):
+        doc["stale"] = False
+        out.append([{"REFRESHED": True}])
+        return
     if up.startswith("EXECUTE SCRIPT"):
         out.append([])
         return

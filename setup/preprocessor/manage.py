@@ -481,10 +481,30 @@ class Preprocessor(object):
                 # interrupted install was still recorded as "installing".
                 self.save({"state": "active", "validated": True, "verified_at": now()})
                 emit("OK", "SQL preprocessor framework %s verified and active" % self.version_label())
+                self.refresh_if_stale()
                 return EXIT_OK
         emit("OK", "SQL preprocessor framework %s installed, tested and activated" % self.version_label())
         emit("OK", "Ordinary SQL verified with the framework active")
         return EXIT_OK
+
+    def refresh_if_stale(self):
+        """Rules reach users through PREPROC.RESOLUTION, a per-user table the
+        framework rebuilds only on REFRESH (and on its own admin scripts). A user
+        or role grant created since then gets none of its ROLE-scoped rules, and
+        the framework expects its operator to refresh - here, every kit run.
+        Never fatal: the framework works, it is only behind."""
+        try:
+            rows = self.db.run("EXECUTE SCRIPT PREPROC.STATUS;")
+            row = rows[0][0] if rows and rows[0] else {}
+            if str(row.get("IS_STALE")).lower() != "true":
+                return
+            self.db.run("EXECUTE SCRIPT PREPROC.REFRESH;")
+        except SqlError as error:
+            emit("WARN", "The framework's rule resolution could not be refreshed (%s); as the admin, run:"
+                 " EXECUTE SCRIPT PREPROC.REFRESH" % error)
+            return
+        emit("OK", "Rule resolution refreshed for users and roles changed since %s"
+             % (row.get("LAST_REFRESH") or "the install"))
 
     def version_label(self):
         return self.record().get("version") or "(installed outside the kit)"

@@ -216,6 +216,15 @@ ensure
 check "an interrupted install someone activated by hand is verified and recorded active" "0 active" "$RC $(rec state)"
 lacks "...without reinstalling" "CREATE ROLE" "$(calls)"
 
+scenario stale-resolution "{\"system_slot\": \"PREPROC_RT.MASTER\", \"schemas\": [\"PREPROC\", \"PREPROC_RT\"], \"role\": true, \"scripts\": [$ALL_SCRIPTS], \"stale\": true}"
+set_rec '{"state": "active", "version": "0.9.1"}'
+ensure
+check "a user created since the last refresh: the run refreshes the rule resolution" "0 1" \
+    "$RC $(printf '%s\n' "$(calls)" | grep -c 'EXECUTE SCRIPT PREPROC.REFRESH')"
+has "...and says so" "Rule resolution refreshed" "$OUT"
+reset_calls; ensure
+lacks "...once: a current resolution is left alone" "PREPROC.REFRESH" "$(calls)"
+
 scenario install-dies
 fault "fail_on:PREPROC.REFRESH_CORE"
 ensure --package "$PKG"
