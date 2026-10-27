@@ -441,5 +441,17 @@ check "a gated connector stops the wizard with the engine's exit 5" "5 resolve b
 has "...and the reason is shown" "not available yet" "$OUT"
 rm -f "$B/gated"
 
+printf '\n== the hidden prompt hides from the first keystroke ==\n'
+# Measured: with the prompt printed first and echo turned off after it, input
+# typed the moment the prompt appeared was echoed in clear (expect, typing at
+# once, printed the password). CI has no terminal, so the order is the test.
+HIDDEN="$(sed -n '/^exakit_read_hidden() {/,/^}/p' "$ROOT/setup/lib/common.sh")"
+check "echo goes off before the prompt is printed" "yes" \
+    "$(printf '%s\n' "$HIDDEN" | awk '/stty -echo/{e=NR} /input hidden/{p=NR} END{print (e && p && e < p) ? "yes" : "no"}')"
+has "...a terminal that cannot hide input is refused, not read in clear" "stty -echo < /dev/tty 2>/dev/null || return 1" "$HIDDEN"
+has "...and the terminal's own state comes back, on Ctrl-C too" 'trap '"'"'stty "${_erh_saved:-echo}"' "$HIDDEN"
+VSREAD="$(sed -n '/^_exakit_vs_read_secret() {/,/^}/p' "$ROOT/setup/lib/virtual-schemas.sh")"
+has "the virtual-schema credential prompt uses it" "exakit_read_hidden" "$VSREAD"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

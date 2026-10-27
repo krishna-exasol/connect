@@ -82,13 +82,7 @@ _exakit_vs_read_secret() {
     fi
     _evs_tty="$(_exakit_prompt_tty)"
     if [ -n "$_evs_tty" ] && [ -r /dev/tty ]; then
-        printf '    %s?%s %s (input hidden): ' "${UI_ASK:-}" "${UI_RESET:-}" "$1" > /dev/tty
-        stty -echo < /dev/tty 2>/dev/null
-        IFS= read -r _evs_value < /dev/tty
-        stty echo < /dev/tty 2>/dev/null
-        printf '\n' > /dev/tty
-        printf '%s' "$_evs_value"
-        unset _evs_value
+        exakit_read_hidden "$1" || { error "The terminal cannot hide input; give the credential with --password-file."; return 1; }
         return 0
     fi
     cat
