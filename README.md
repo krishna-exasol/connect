@@ -15,16 +15,25 @@
 [![Community](https://img.shields.io/badge/community-exasol-green)](https://community.exasol.com)
 [![Quickstart](https://img.shields.io/badge/database%20ready-~5%20min-orange)](QUICKSTART.md)
 
+> **Pre-release test build (PR #2, `feature/vs-java-jdbc`)** — these commands
+> install kit 0.3.0 from this private development repository. Restore the
+> official commands before this branch merges.
+
 **macOS / Linux / WSL**
 
 ```bash
-curl https://www.exasol.com/install/starter-kit.sh | sh
+export GITHUB_TOKEN="$(gh auth token)"   # the repository is private
+curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
+  https://raw.githubusercontent.com/krishna-exasol/vs/feature/vs-java-jdbc/install.sh \
+  | EXAKIT_REPO=krishna-exasol/vs EXAKIT_REF=feature/vs-java-jdbc sh
 ```
 
 **Windows (PowerShell)**
 
 ```powershell
-irm https://www.exasol.com/install/starter-kit.ps1 | iex
+$env:GITHUB_TOKEN = (gh auth token)   # the repository is private
+$env:EXAKIT_REPO = "krishna-exasol/vs"; $env:EXAKIT_REF = "feature/vs-java-jdbc"
+irm -Headers @{ Authorization = "Bearer $env:GITHUB_TOKEN" } https://raw.githubusercontent.com/krishna-exasol/vs/feature/vs-java-jdbc/install.ps1 | iex
 ```
 
 To have an AI agent do the install, paste this into Claude Code, Codex or any other coding agent:

@@ -402,6 +402,12 @@ $urls = @(
 # with the signed-in user's credentials for the 407-challenging proxies
 # corporate networks actually run.
 $webArgs = @{}
+# The token the failure message below tells a private-repository user to set
+# has to be SENT, or setting it changes nothing. Twin of _fetch_kit's
+# Authorization header in install.sh.
+if ($env:GITHUB_TOKEN) {
+    $webArgs["Headers"] = @{ Authorization = "Bearer $env:GITHUB_TOKEN" }
+}
 if ($env:HTTPS_PROXY) {
     $webArgs["Proxy"] = $env:HTTPS_PROXY
     $webArgs["ProxyUseDefaultCredentials"] = $true
