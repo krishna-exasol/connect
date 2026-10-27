@@ -82,8 +82,13 @@ def summarize(text):
     """
     text = str(text)
     coded = re.search(r"(E-[A-Z]+-\d+:[^\n]*)", text)
+    # pyexasol's own wrapper: "(\n message => ...\n dsn => ...\n query => ...)".
+    # The message field is the error; the fields under it describe the session.
+    field = re.search(r"^\s*message\s*=>\s*(.+)$", text, re.M)
     if coded:
         line = coded.group(1)
+    elif field:
+        line = field.group(1)
     else:
         lines = [l.strip() for l in text.splitlines() if l.strip() and l.strip() not in ("(", ")")]
         line = next((l for l in lines if not l.startswith("message")), lines[0] if lines else text)

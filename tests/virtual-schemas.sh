@@ -161,6 +161,18 @@ com.exasol.adapter.jdbc.RemoteMetadataReaderException: E-VSEXA-4: Unable to crea
 	at com.exasol.adapter.dialects.exasol.ExasolSqlDialect.createRemoteMetadataReader(ExasolSqlDialect.java:212)
 	at com.exasol.ssl.TlsHelper.wrap(TlsHelper.java:9)
 Caused by: java.sql.SQLInvalidAuthorizationSpecException: Connection exception - authentication failed.'
+# Measured live: pyexasol's wrapper around a loader error, as a reauth try
+# raises it. The line under "message =>" is the session's dsn, not the error.
+RAW_ETL="$(printf '\n(\n    message     =>  JDBC-Client-Error: Connecting to %s as user=%s failed: Connection exception - authentication failed. (Session: 1880237644681707520)\n    dsn         =>  127.0.0.1:8563\n    user        =>  sys\n    code        =>  ETL-5\n    query       =>  SELECT 1\n)\n' "'jdbc:exa:10.0.0.9:8563'" "'READER'")"
+check "a pyexasol error is summarized by its message field, and classifies" \
+    "JDBC-Client-Error: Connecting to 'jdbc:exa:10.0.0.9:8563' as user='READER' failed: Connection exception - authentication failed. auth" \
+    "$(python3 - "$ROOT" "$RAW_ETL" <<'PYC'
+import sys; sys.path.insert(0, sys.argv[1] + "/setup/virtual-schemas/engine")
+import sql
+line = sql.redact(sys.argv[2], [])
+print(line, sql.classify_raw(line, sys.argv[2]))
+PYC
+)"
 check "a cause on a later line still classifies (auth), not the generic summary" "auth" \
     "$(python3 - "$ROOT" "$RAW_AUTH" <<'PYC'
 import sys; sys.path.insert(0, sys.argv[1] + "/setup/virtual-schemas/engine")
@@ -306,8 +318,16 @@ check "...the record says auth-failed" "auth-failed" "$(python3 -c 'import json,
 run --json issues; has "issues lists it" '"name": "sales"' "$OUT"; has "...with the runnable remedy" "exakit source reauth sales" "$OUT"
 lacks "...and not the healthy one" '"name": "warehouses"' "$OUT"
 run --json check --all; check "check --all: exit 1 while one source is failing" "1" "$RC"
+OLDSECRET="$(dbq 'd["connections"]["EXAKIT_SRC_SALES"]["secret"]')"
+run_secret "typo-$NEWSECRET" reauth sales --secret-stdin
+check "reauth with a credential the source refuses: exit 1" "1" "$RC"
+has "...and says the previous one was kept" "refused the new credential, so the previous one was kept" "$OUT"
+check "...the CONNECTION still holds the previous credential" "$OLDSECRET" "$(dbq 'd["connections"]["EXAKIT_SRC_SALES"]["secret"]')"
+check "...and the pending CONNECTION is gone" "false" "$(dbq '"EXAKIT_SRC_SALES_PENDING" in d["connections"]')"
+lacks "...the refused credential is in none of the output" "typo-$NEWSECRET" "$OUT"
 run_secret "$NEWSECRET" reauth sales --secret-stdin
 check "reauth with the new credential: ready again" "0" "$RC"
+has "...after the source accepted it" "The source accepted the new credential" "$OUT"
 check "...the CONNECTION holds it" "$NEWSECRET" "$(dbq 'd["connections"]["EXAKIT_SRC_SALES"]["secret"]')"
 check "...and it is in no file" "" "$(grep -rl 'n3w-T0ken' "$HOME_K/sources" 2>/dev/null)"
 run refresh warehouses; has "refresh reports the table count" '"tables": 1' "$OUT"

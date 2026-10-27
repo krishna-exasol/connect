@@ -403,12 +403,36 @@ class Engine(object):
         connector = self.defs.connector(config["connector"])
         url = planner.jdbc_url(connector, config["inputs"])
         with self.store.lock():
+            # Tried before it replaces anything: a typo here must not break a
+            # source that still works. The new credential goes into a pending
+            # CONNECTION, one trivial statement runs through the loader with
+            # it, and only an accepted credential replaces the old one.
+            self.try_credential(connector, config["objects"], url, config["inputs"].get("user"), secret)
             try:
                 self.create_connection(config["objects"], url, config["inputs"].get("user"), secret, replace=True)
             except sql.DbError as error:
                 raise Failure("the credential could not be replaced: %s" % error, EXIT["failed"])
         self.emit("OK", "Credential replaced in %s" % config["objects"]["connection"])
         return self.check(name)
+
+    def try_credential(self, connector, names, url, user, secret):
+        if not connector.get("etl"):
+            return      # no loader driver to try it through (a VALUES connector)
+        pending = dict(names, connection=names["connection"] + "_PENDING")
+        try:
+            self.create_connection(pending, url, user, secret, replace=True)
+            self.db().query("SELECT * FROM (IMPORT FROM JDBC AT %s STATEMENT %s)"
+                            % (sql.ident(pending["connection"]), sql.literal(connector.get("probe_sql", "SELECT 1"))),
+                            secrets=[secret])
+        except sql.DbError as error:
+            raise Failure("the source refused the new credential, so the previous one was kept: %s" % error,
+                          EXIT["failed"], error.kind)
+        finally:
+            try:
+                self.db().execute("DROP CONNECTION IF EXISTS %s" % sql.ident(pending["connection"]))
+            except sql.DbError:
+                pass
+        self.emit("OK", "The source accepted the new credential")
 
     def refresh(self, name):
         config = self.store.config(name)
@@ -463,6 +487,8 @@ class Engine(object):
                 db.execute("DROP ADAPTER SCRIPT %s.%s" % (sql.ident(names["script_schema"]), sql.ident(names["script"])))
             if connection_present:
                 db.execute("DROP CONNECTION %s" % sql.ident(names["connection"]))
+            # A reauth killed mid-try can leave its pending credential behind.
+            db.execute("DROP CONNECTION IF EXISTS %s" % sql.ident(names["connection"] + "_PENDING"))
             for path in self.store.release(name):
                 if os.path.isfile(path):
                     os.remove(path)

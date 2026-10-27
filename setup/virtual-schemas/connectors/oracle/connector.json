@@ -85,5 +85,6 @@
   "notes": [
     "The Java-only (thin) driver: no Oracle Client install. IMPORT FROM ORA stays off.",
     "verify uses TCPS and checks the server certificate's name; the listener's TCPS port is often 2484, so set the port to match."
-  ]
+  ],
+  "probe_sql": "SELECT 1 FROM DUAL"
 }

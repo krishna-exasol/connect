@@ -106,6 +106,10 @@ class Fake(object):
         if m:
             vs = doc["virtual"].get(m.group(1))
             return [{"TABLE_NAME": t} for t in (vs["tables"] if vs else [])]
+        m = re.match(r"SELECT \* FROM \(IMPORT FROM JDBC AT \"([^\"]+)\" STATEMENT '", sql)
+        if m:
+            _source_for(doc, m.group(1))
+            return [{"1": 1}]
         m = re.match(r'SELECT \* FROM "([^"]+)"\."([^"]+)" LIMIT 1', sql)
         if m:
             vs = doc["virtual"].get(m.group(1))
@@ -155,7 +159,7 @@ class Fake(object):
         if m:
             doc["scripts"] = [s for s in doc["scripts"] if s != "%s.%s" % m.groups()]
             return
-        m = re.match(r'DROP CONNECTION "([^"]+)"', sql)
+        m = re.match(r'DROP CONNECTION (?:IF EXISTS )?"([^"]+)"', sql)
         if m:
             doc["connections"].pop(m.group(1), None)
             return
