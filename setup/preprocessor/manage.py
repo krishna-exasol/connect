@@ -346,7 +346,9 @@ class Preprocessor(object):
             foreign = []        # no CONFIG table yet: nothing anyone configured
         if foreign:
             raise Outcome(EXIT_FAILED, "an interrupted framework install was found, but PREPROC.CONFIG"
-                          " already has rules for %s; the kit will not drop it" % ", ".join(foreign))
+                          " already has rules for %s; the kit will not drop it. Keep them by activating the framework"
+                          " (ALTER SYSTEM SET sql_preprocessor_script = PREPROC_RT.MASTER), or remove those rules,"
+                          " then run the command below" % ", ".join(foreign))
         statements = [BYPASS]
         statements += ["DROP SCHEMA IF EXISTS %s CASCADE;" % name for name in self.package["schemas"]]
         statements.append("DROP ROLE IF EXISTS %s CASCADE;" % self.package["role"])
@@ -438,7 +440,9 @@ class Preprocessor(object):
 
         if slot and slot != self.dispatcher:
             raise Outcome(EXIT_CONFLICT, "the database's SQL preprocessor slot holds %s, which the kit does"
-                          " not manage; it was left unchanged" % slot)
+                          " not manage; it was left unchanged. To let the kit's framework own the slot, move that"
+                          " script into a framework module or clear the slot (ALTER SYSTEM SET"
+                          " sql_preprocessor_script = NULL), then run the command below" % slot)
 
         if not found["present"]:
             # A slot naming a dispatcher that no longer exists is no setting
@@ -447,7 +451,9 @@ class Preprocessor(object):
             self.activate(previous="")
         elif not ours and slot != self.dispatcher:
             raise Outcome(EXIT_CONFLICT, "a preprocessor framework the kit did not install is already in this"
-                          " database and is not active; it was left unchanged")
+                          " database and is not active; it was left unchanged. To have the kit manage it, activate it"
+                          " (ALTER SYSTEM SET sql_preprocessor_script = PREPROC_RT.MASTER) and run the command below -"
+                          " the kit then verifies and adopts it")
         elif rec.get("state") == "installing" and slot != self.dispatcher:
             self.fresh_install(recover=True)
             self.activate(previous="")
@@ -471,7 +477,9 @@ class Preprocessor(object):
                 problem = self.verify_active()
                 if problem:
                     self.roll_back(rec.get("previous_setting", ""), problem)
-                self.save({"validated": True, "verified_at": now()})
+                # "active" here too: a framework activated by hand after an
+                # interrupted install was still recorded as "installing".
+                self.save({"state": "active", "validated": True, "verified_at": now()})
                 emit("OK", "SQL preprocessor framework %s verified and active" % self.version_label())
                 return EXIT_OK
         emit("OK", "SQL preprocessor framework %s installed, tested and activated" % self.version_label())

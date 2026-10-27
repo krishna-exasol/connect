@@ -175,6 +175,7 @@ check "another script in the slot: conflict, exit 3" "3" "$RC"
 check "...the slot still holds it" "MYSCHEMA.MY_PREPROCESSOR" "$(st system_slot)"
 lacks "...nothing was installed" "CREATE ROLE" "$(calls)"
 has "...and the reason names it" "MYSCHEMA.MY_PREPROCESSOR" "$OUT"
+has "...with the step before the retry" "clear the slot (ALTER SYSTEM SET sql_preprocessor_script = NULL), then run the command below" "$OUT"
 
 scenario foreign '{"schemas": ["PREPROC", "PREPROC_RT"], "role": true, "scripts": ["PREPROC_RT.MASTER"]}'
 ensure --package "$PKG"
@@ -206,7 +207,14 @@ set_rec '{"state": "installing", "version": "0.9.1"}'
 ensure --package "$PKG"
 check "an interrupted install that carries someone's rules is refused" "1" "$RC"
 has "...naming the rule's script" "PREPROC_RT.SOMEONES_MODULE_V1" "$OUT"
+has "...and what a person can do about it" "Keep them by activating the framework" "$OUT"
 lacks "...and nothing is dropped" "DROP SCHEMA" "$(calls)"
+
+scenario activated-by-hand "{\"system_slot\": \"PREPROC_RT.MASTER\", \"schemas\": [\"PREPROC\", \"PREPROC_RT\"], \"role\": true, \"scripts\": [$ALL_SCRIPTS]}"
+set_rec '{"state": "installing", "version": "0.9.1"}'
+ensure
+check "an interrupted install someone activated by hand is verified and recorded active" "0 active" "$RC $(rec state)"
+lacks "...without reinstalling" "CREATE ROLE" "$(calls)"
 
 scenario install-dies
 fault "fail_on:PREPROC.REFRESH_CORE"
