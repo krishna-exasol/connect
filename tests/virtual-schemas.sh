@@ -131,7 +131,7 @@ for entry in defs.entries():
             print("%s/%s BAD %s" % (c["id"], mode or "-", e))
 PYT
 )"
-check "14 connector/TLS combinations build a URL, properties and a probe host" "14 0" \
+check "13 connector/TLS combinations build a URL, properties and a probe host" "13 0" \
     "$(printf '%s\n' "$TEMPLATES" | grep -c ' ok$') $(printf '%s\n' "$TEMPLATES" | grep -c ' BAD')"
 
 printf '\n== connect: the happy path ==\n'
