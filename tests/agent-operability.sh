@@ -2640,5 +2640,17 @@ done
 has "...and says why the name matters" 'file name becomes the table name' \
     "$(cat "$ROOT/setup/exakit")"
 
+echo "a hidden prompt hides from the first keystroke:"
+# Measured: printing the prompt and only then turning echo off echoed whatever
+# arrived the moment the prompt appeared (a paste, a password manager). There
+# is no terminal in CI, so the order is what is pinned.
+HIDDEN="$(sed -n '/^exakit_read_hidden() {/,/^}/p' "$ROOT/setup/lib/common.sh")"
+check "echo goes off before the prompt is printed" "yes" \
+    "$(printf '%s\n' "$HIDDEN" | awk '/stty -echo/{e=NR} /input hidden/{p=NR} END{print (e && p && e < p) ? "yes" : "no"}')"
+has "...and a terminal that cannot hide input is refused" "stty -echo < /dev/tty 2>/dev/null || return 1" "$HIDDEN"
+PROFILE_FN="$(sed -n '/^exapump_create_profile() {/,/^}/p' "$ROOT/setup/lib/exapump.sh")"
+has "the database-password prompt uses it" "exakit_read_hidden" "$PROFILE_FN"
+lacks "...and keeps no prompt-then-stty of its own" "stty -echo" "$PROFILE_FN"
+
 echo "passed: $PASS, failed: $FAIL"
 [ "$FAIL" -eq 0 ]

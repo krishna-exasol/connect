@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+**The database-password prompt hides input from the first keystroke.** It
+printed itself and only then turned terminal echo off, so a password pasted or
+typed by a password manager the moment the prompt appeared was echoed in clear
+(reproduced by typing at once). A shared `exakit_read_hidden` turns echo off
+first, restores the terminal's exact state afterwards and on Ctrl-C, and
+refuses to read where echo cannot be turned off.
+
 ## 0.2.2
 
 **The Personal launcher comes from Exasol's S3 bucket first, verified, with
