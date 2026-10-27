@@ -26,13 +26,14 @@ EXIT = {"ok": 0, "failed": 1, "input": 2, "conflict": 3, "missing": 4, "gated": 
         "dns": 20, "nojava": 21, "unreachable_db": 22}
 
 # Status recorded for a failure kind (sql.classify).
-STATUS_FOR = {"auth": "auth-failed", "tls": "tls-failed", "unreachable": "unreachable",
+STATUS_FOR = {"auth": "auth-failed", "tls": "tls-failed", "unreachable": "unreachable", "nohost": "unreachable",
               "dns": "dns-failed", "nojava": "failed", "error": "failed"}
 
 REMEDY_FOR = {
     "auth": "the source rejected the credentials: exakit source reauth {name}",
     "tls": "the source's certificate or host name did not verify; fix the server certificate or trust its CA, then: exakit source check {name}",
     "unreachable": "the source did not answer from inside the database: check the host, port, firewall and VPN (a source on this computer must listen beyond 127.0.0.1), then: exakit source check {name}",
+    "nohost": "the host name no longer resolves: check it (a private name may need a VPN), then: exakit source check {name}",
     "dns": "Java in the database could not resolve the host name; restart the database with exakit start (it repairs DNS), then: exakit source check {name}",
     "nojava": "the Java language container is not installed: exakit connect installs it, or run: exasol slc install java",
     "error": "see the log: exakit logs",
@@ -126,7 +127,7 @@ class Engine(object):
             # empty /etc/resolv.conf): repairable, so the shell repairs and retries.
             raise Failure("Java in the database has no DNS resolver, so it cannot resolve %s" % host, EXIT["dns"], "dns")
         if answer.startswith("dns"):
-            raise Failure("the host name %s does not resolve (check the spelling)" % host, EXIT["failed"], "unreachable")
+            raise Failure("the host name %s does not resolve" % host, EXIT["failed"], "nohost")
         if answer.startswith("tcp"):
             raise Failure("%s:%d is not reachable from inside the database (%s)" % (host, port, answer[4:]),
                           EXIT["failed"], "unreachable")
@@ -308,10 +309,15 @@ class Engine(object):
                 # commands do not apply: nothing was left behind, and the fix is
                 # the same command with corrected input.
                 remedy = REMEDY_FOR.get(kind, REMEDY_FOR["error"]).format(name=name)
-                if not reconnect and kind in ("auth", "tls", "unreachable"):
+                if not reconnect and kind in ("auth", "tls", "unreachable", "nohost"):
                     remedy = {"auth": "the source rejected the credentials; nothing was kept - correct them and run the same exakit connect again",
                               "tls": "the source's certificate or host name did not verify; nothing was kept - fix the server certificate or choose tls=require knowingly, then connect again",
-                              "unreachable": "the source did not answer from inside the database; nothing was kept - check host, port, firewall and VPN (a source on this computer must listen beyond 127.0.0.1), then connect again"}[kind]
+                              "unreachable": "the source did not answer from inside the database; nothing was kept - check host, port, firewall and VPN (a source on this computer must listen beyond 127.0.0.1), then connect again",
+                              "nohost": "nothing was kept - check the spelling (a private name may need a VPN), then connect again"}[kind]
+                if isinstance(error, Failure):
+                    # The kit's own words already say what happened (the route
+                    # check); only the driver's raw text needs it restated.
+                    raise Failure("%s; %s" % (error, remedy.split("; ", 1)[-1]), code, kind)
                 raise Failure("%s (%s)" % (error, remedy), code, kind)
             pins = {"adapter": connector["adapter"]["sha256"], "driver": connector["driver"]["sha256"],
                     "adapter_version": connector["adapter"]["version"], "driver_version": connector["driver"]["version"]}

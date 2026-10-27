@@ -219,12 +219,14 @@ python3 - "$STATE" <<'PYDNS'
 import json, sys; d = json.load(open(sys.argv[1])); d["dns"] = True; json.dump(d, open(sys.argv[1], "w"))
 PYDNS
 run_secret "$SECRET" connect mysql --name crm --set host=no-such-db.invalid --set database=crm --set user=reader --secret-stdin
-check "a name that does not exist is not a DNS repair: exit 1" "1" "$RC"; has "...said as a spelling problem" "does not resolve (check the spelling)" "$OUT"
+check "a name that does not exist is not a DNS repair: exit 1" "1" "$RC"; has "...said as a spelling problem" "does not resolve; nothing was kept - check the spelling" "$OUT"
+lacks "...without the firewall advice meant for a host that answers nothing" "firewall" "$OUT"
 python3 - "$STATE" <<'PY'
 import json, sys; d = json.load(open(sys.argv[1])); d["dns"] = True; d["unreachable"] = ["slow.example.com"]; json.dump(d, open(sys.argv[1], "w"))
 PY
 run_secret "$SECRET" connect mysql --name crm --set host=slow.example.com --set database=crm --set user=reader --secret-stdin
 check "a host that resolves but does not answer: exit 1" "1" "$RC"; has "...named as unreachable from inside the database" "is not reachable from inside the database" "$OUT"
+lacks "...said once, not restated in a second parenthesis" "did not answer from inside the database" "$OUT"
 db '{"java": false}'
 run_secret "$SECRET" connect oracle --name erp --set host=ora.example.com --set service=ORCL --set schema=APP --set user=reader --secret-stdin
 check "no Java in the database: exit 21, for the shell to offer the install" "21" "$RC"
