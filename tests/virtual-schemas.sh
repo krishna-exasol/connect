@@ -154,6 +154,21 @@ PYC
 )"
 check "each real message lands in its class" "unreachable|unreachable|unreachable|unreachable|auth|auth|tls|nojava|dns|" \
     "$(printf '%s\n' "$CLASSES" | tr '\n' '|')"
+# Measured live: a rotated source password. The summary line is the
+# adapter's generic "Unable to create ... reader"; the cause is lines below.
+RAW_AUTH='Query execution failed: Protocol error: VM error: F-UDF-CL-LIB-1126: F-UDF-CL-SL-JAVA-1006:
+com.exasol.adapter.jdbc.RemoteMetadataReaderException: E-VSEXA-4: Unable to create Exasol remote metadata reader.
+	at com.exasol.adapter.dialects.exasol.ExasolSqlDialect.createRemoteMetadataReader(ExasolSqlDialect.java:212)
+	at com.exasol.ssl.TlsHelper.wrap(TlsHelper.java:9)
+Caused by: java.sql.SQLInvalidAuthorizationSpecException: Connection exception - authentication failed.'
+check "a cause on a later line still classifies (auth), not the generic summary" "auth" \
+    "$(python3 - "$ROOT" "$RAW_AUTH" <<'PYC'
+import sys; sys.path.insert(0, sys.argv[1] + "/setup/virtual-schemas/engine")
+import sql
+raw = sys.argv[2]
+print(sql.classify_raw(sql.summarize(raw), raw))
+PYC
+)"
 
 printf '\n== connect: the happy path ==\n'
 db '{"sources": {"pg.example.com": {"tables": ["ORDERS", "CUSTOMERS"]}}}'
@@ -285,6 +300,8 @@ python3 - "$STATE" <<'PY'
 import json, sys; d = json.load(open(sys.argv[1])); d["sources"]["pg.example.com"]["secret"] = "n3w-T0ken-value"; json.dump(d, open(sys.argv[1], "w"))
 PY
 run check sales; check "a rotated credential at the source: check exits 1" "1" "$RC"
+has "...and says why, though no RESULT line follows a failure" "FAIL sales is auth-failed:" "$OUT"
+has "...with the fix" "INFO Fix: the source rejected the credentials: exakit source reauth sales" "$OUT"
 check "...the record says auth-failed" "auth-failed" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$HOME_K/sources/sales/state.json")"
 run --json issues; has "issues lists it" '"name": "sales"' "$OUT"; has "...with the runnable remedy" "exakit source reauth sales" "$OUT"
 lacks "...and not the healthy one" '"name": "warehouses"' "$OUT"

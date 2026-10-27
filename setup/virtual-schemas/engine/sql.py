@@ -49,6 +49,20 @@ def classify(message):
     return "error"
 
 
+def classify_raw(summary, raw):
+    """The kind of a database error: from its one-line summary, else from its
+    causes. An adapter can wrap the cause on a later line ("E-VSEXA-4: Unable
+    to create ... reader" over "Caused by: ...authentication failed"), and
+    the summary alone then reads as a generic failure. Only the cause lines
+    are read - a whole stack names classes (SSL..., TLS...) that would
+    misfile it."""
+    kind = classify(summary)
+    if kind != "error":
+        return kind
+    causes = [l for l in str(raw).splitlines() if "Caused by" in l or re.search(r"Exception: ", l)]
+    return classify("\n".join(causes))
+
+
 def ident(name):
     """A quoted identifier; the name is already validated, quotes doubled anyway."""
     return '"%s"' % str(name).replace('"', '""')
@@ -97,14 +111,14 @@ class Database(object):
             return self.backend.query(sql_text)
         except Exception as error:     # the driver's own exception types vary by backend
             message = redact(error, secrets)
-            raise DbError(message, classify(message))
+            raise DbError(message, classify_raw(message, error))
 
     def execute(self, sql_text, secrets=()):
         try:
             self.backend.execute(sql_text)
         except Exception as error:
             message = redact(error, secrets)
-            raise DbError(message, classify(message))
+            raise DbError(message, classify_raw(message, error))
 
     def close(self):
         try:

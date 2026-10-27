@@ -383,8 +383,12 @@ class Engine(object):
         except (Failure, sql.DbError) as error:
             kind = getattr(error, "kind", "error")
             status = self.record_check(name, "failed", str(error), kind)
-            return {"name": name, "status": status, "kind": kind, "error": str(error),
-                    "remedy": REMEDY_FOR.get(kind, REMEDY_FOR["error"]).format(name=name)}
+            remedy = REMEDY_FOR.get(kind, REMEDY_FOR["error"]).format(name=name)
+            # Said here, not only in the result: a failed check exits 1, and
+            # the reason has to reach a reader who gets no RESULT line.
+            self.emit("FAIL", "%s is %s: %s" % (name, status, error))
+            self.emit("INFO", "Fix: %s" % remedy)
+            return {"name": name, "status": status, "kind": kind, "error": str(error), "remedy": remedy}
         evidence = "metadata and a bounded read (%d tables)" % len(tables) if read else "metadata only (no tables in scope)"
         self.record_check(name, "ok", evidence)
         return {"name": name, "status": "ready", "evidence": evidence}
