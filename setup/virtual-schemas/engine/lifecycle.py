@@ -146,6 +146,7 @@ class Engine(object):
         self.store.add_consumer(dest, adapter_pin["sha256"], name, made)
         if made:
             created["files"].append(dest)
+            self.store.save_journal(name, dict(self.store.journal(name) or {}, created=created))
         jars.append(self.runtime.bucket_sql(cid, adapter_pin["version"], adapter_pin["asset"]))
         driver_src = self.cache.fetch(driver_pin)
         if driver_pin.get("bundle") == "zip":
@@ -249,9 +250,21 @@ class Engine(object):
             raise Failure("%s needs %s on standard input (it is never taken as an argument)"
                           % (connector_id, spec["label"].lower()), EXIT["input"])
         created = {"files": [], "connection": False, "script": False, "schema": False}
+        journal = {"operation": "reconnect" if reconnect else "connect", "connector": connector_id,
+                   "started": sources.now(), "created": created}
         with self.store.lock():
-            self.store.save_journal(name, {"operation": "reconnect" if reconnect else "connect",
-                                           "connector": connector_id, "started": sources.now(), "steps": []})
+            # An earlier attempt that was killed part way (Ctrl-C, a closed
+            # lid) left its journal - and its objects, which carry the kit's
+            # names and would otherwise read as someone else's. The journal
+            # says exactly what that attempt made; that is undone first.
+            if not reconnect:
+                self.recover_interrupted(name, names)
+            self.store.save_journal(name, journal)
+
+            def made(flag):
+                created[flag] = True
+                self.store.save_journal(name, journal)
+
             try:
                 if not reconnect:
                     for kind, label in (("connection", names["connection"]), ("schema", names["schema"])):
@@ -262,13 +275,14 @@ class Engine(object):
                 jars = self.stage(connector, name, created)
                 url = planner.jdbc_url(connector, values)
                 self.create_connection(names, url, values.get("user"), secret, replace=reconnect)
-                created["connection"] = not reconnect
+                if not reconnect:
+                    made("connection")
                 self.emit("OK", "Connection %s created (the credential lives only in the database)" % names["connection"])
                 if not reconnect:
                     self.db().execute(self.adapter_sql(names, jars))
-                    created["script"] = True
+                    made("script")
                     self.db().execute(self.vs_sql(connector, names, values))
-                    created["schema"] = True
+                    made("schema")
                 tables = self.tables(names["schema"])
                 read = self.bounded_read(names["schema"], tables)
                 if read:
@@ -309,6 +323,21 @@ class Engine(object):
                                                          "evidence": "metadata and a bounded read" if read else "metadata"}})
             self.store.clear_journal(name)
         return {"name": name, "connector": connector_id, "objects": names, "tables": len(tables), "status": "ready"}
+
+    def recover_interrupted(self, name, names):
+        """Undo what an interrupted first connect recorded in its journal."""
+        journal = self.store.journal(name)
+        if not journal or self.store.exists(name):
+            return
+        created = journal.get("created") or {}
+        if not any(created.get(flag) for flag in ("connection", "script", "schema")) and not created.get("files"):
+            self.store.clear_journal(name)
+            return
+        self.emit("INFO", "An earlier connect of %s was interrupted; removing what it created first" % name)
+        created.setdefault("files", [])
+        self.db()
+        self.undo(names, created, name)
+        self.store.clear_journal(name)
 
     def undo(self, names, created, name):
         """Compensate exactly what this attempt created, newest first."""

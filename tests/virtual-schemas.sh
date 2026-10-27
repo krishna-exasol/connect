@@ -170,6 +170,23 @@ db '{"java": false}'
 run_secret "$SECRET" connect oracle --name erp --set host=ora.example.com --set service=ORCL --set schema=APP --set user=reader --secret-stdin
 check "no Java in the database: exit 21, for the shell to offer the install" "21" "$RC"
 
+printf '\n== an interrupted connect is recovered, not mistaken for a stranger ==\n'
+# The state an attempt killed right after CREATE CONNECTION leaves behind: its
+# journal (naming what it made) and the connection in the database.
+db '{"sources": {"pg.example.com": {"tables": ["ORDERS"]}}, "connections": {"EXAKIT_SRC_LATE": {"url": "x", "user": "reader", "secret": "half-done"}}}'
+mkdir -p "$HOME_K/sources/late"
+printf '{"operation": "connect", "connector": "postgresql", "created": {"files": [], "connection": true, "script": false, "schema": false}}\n' > "$HOME_K/sources/late/journal.json"
+run_secret "$SECRET" connect postgresql --name late $PG_SET --secret-stdin
+check "a retry after an interrupted connect succeeds" "0" "$RC"
+has "...and says what it cleaned up first" "was interrupted; removing what it created first" "$OUT"
+check "...the connection now holds the new attempt's credential" "$SECRET" "$(dbq 'd["connections"]["EXAKIT_SRC_LATE"]["secret"]')"
+run remove late >/dev/null
+# A journal with nothing recorded is simply cleared.
+mkdir -p "$HOME_K/sources/late2"; printf '{"operation": "connect", "created": {"files": []}}\n' > "$HOME_K/sources/late2/journal.json"
+run_secret "$SECRET" connect postgresql --name late2 $PG_SET --secret-stdin
+check "an empty journal does not block a connect" "0" "$RC"
+run remove late2 >/dev/null
+
 printf '\n== what the kit does not own ==\n'
 db '{"sources": {"pg.example.com": {"tables": ["ORDERS"]}}, "connections": {"EXAKIT_SRC_HR": {"url": "x", "user": "u", "secret": "theirs"}}}'
 run_secret "$SECRET" connect postgresql --name hr $PG_SET --secret-stdin
