@@ -3437,7 +3437,7 @@ function Invoke-CmdConnect {
     $secret = ""
     if ($secretSpec) {
         $secret = Read-ExakitVsSecret -Label $secretSpec.label -PasswordFile $pwFile
-        if (-not $secret) { Deny-ExakitInput "No $($secretSpec.label) was given." }
+        if (-not $secret) { Deny-ExakitInput "No $("$($secretSpec.label)".ToLower()) was given (pipe it on standard input or use --password-file)." }
         $code = Invoke-ExakitVsRun -Arguments (@("connect") + $base + @("--secret-stdin")) -Secret $secret
     } else {
         $code = Invoke-ExakitVsRun -Arguments (@("connect") + $base)
@@ -3503,6 +3503,12 @@ function Invoke-CmdSource {
             }
         }
         "reauth" {
+            # The name before the credential. Twin of the check in cmd_source.
+            $shown = Invoke-ExakitVsEngine -Arguments ($argv + @("show", $name))
+            if ($shown.Code -ne 0) {
+                if ($json) { foreach ($line in $shown.Lines) { Write-Output $line } } else { [void](Show-ExakitVsLines -Lines $shown.Lines) }
+                exit $shown.Code
+            }
             $secret = Read-ExakitVsSecret -Label "New credential for $name" -PasswordFile $pwFile
             if (-not $secret) { Deny-ExakitInput "No credential was given." }
             $code = Invoke-ExakitVsRun -Arguments ($argv + @("reauth", $name, "--secret-stdin")) -Secret $secret
@@ -3532,6 +3538,7 @@ function Invoke-CmdSource {
         } elseif ($r.PSObject.Properties["connectors"]) {
             foreach ($c in @($r.connectors)) { Write-Host ("  {0,-12} {1,-18} {2,-5} {3,-10} aliases: {4}" -f $c.id, $c.name, $c.tier, $c.status, (@($c.aliases) -join ", ")) }
         } elseif ($r.PSObject.Properties["checks"]) {
+            if (@($r.checks).Count -eq 0) { Write-Host "  (none)" }
             foreach ($c in @($r.checks)) { $why = $c.evidence; if (-not $why) { $why = $c.remedy }; Write-Host ("  {0,-16} {1} {2}" -f $c.name, $c.status, $why) }
         } else {
             foreach ($k in @("name", "connector", "status", "objects", "inputs", "pins", "tables", "last_check", "evidence", "remedy")) {

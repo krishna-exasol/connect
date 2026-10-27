@@ -106,7 +106,14 @@ def main(argv=None):
         if args.command in ("catalog", "resolve"):
             defs = planner.Definitions(args.defs)
             if args.command == "resolve":
-                result = {"connector": defs.resolve(args.query)}
+                # The gate comes before any question: asking for a project and
+                # a dataset only to then say "not available" wastes the answers.
+                connector = defs.resolve(args.query)
+                entry = defs.entry(connector)
+                if entry["status"] == "gated":
+                    raise planner.PlanError("%s is not available yet: %s" % (entry["name"], entry["gate"]),
+                                            code=lifecycle.EXIT["gated"])
+                result = {"connector": connector}
             else:
                 q = args.query.lower()
                 result = {"connectors": [dict(e, profile=e["profile"]) for e in defs.entries()

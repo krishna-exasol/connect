@@ -206,8 +206,10 @@ $2"; EXAKIT_VS_GIVEN="$EXAKIT_VS_GIVEN ${2%%=*}"; shift ;;
     _cc_resolved="$(exakit_vs_engine resolve "$_cc_source" 2>/dev/null | sed -n 's/^RESULT {"connector": "\(.*\)"}$/\1/p')"
     if [ -z "$_cc_resolved" ]; then
         exakit_vs_engine resolve "$_cc_source" > "${TMPDIR:-/tmp}/exakit-vs-resolve.$$" 2>&1
+        _cc_rc=$?
         _exakit_vs_render "${TMPDIR:-/tmp}/exakit-vs-resolve.$$"; rm -f "${TMPDIR:-/tmp}/exakit-vs-resolve.$$"
-        exit 2
+        [ "$_cc_rc" -ne 0 ] || _cc_rc=2
+        exit "$_cc_rc"
     fi
     if [ -z "$_cc_name" ]; then
         [ -n "$_cc_tty" ] || reject "Give the connection a name with --name (lower case, e.g. sales)."
@@ -242,7 +244,7 @@ EOF
     _cc_secret=""
     if [ -n "$_cc_label" ]; then
         _cc_secret="$(_exakit_vs_read_secret "$_cc_label" "$_cc_pwfile")" || exit 2
-        [ -n "$_cc_secret" ] || reject "No $_cc_label was given."
+        [ -n "$_cc_secret" ] || reject "No $(printf '%s' "$_cc_label" | tr 'A-Z' 'a-z') was given (pipe it on standard input or use --password-file)."
     fi
     if [ -n "$_cc_secret" ]; then
         _exakit_vs_run "$_cc_secret" connect "$@" --secret-stdin
@@ -327,6 +329,16 @@ print("  " + "\n  ".join(["drops: " + ", ".join(p["drop"])] + (["keeps: " + ", "
                     || { info "Nothing was changed."; exit 0; }
             fi ;;
         reauth)
+            # The name before the credential: nobody types a password for a
+            # source that does not exist.
+            _cs_out="$(mktemp "${TMPDIR:-/tmp}/exakit-vs.XXXXXX")" || die "Could not create a temporary file."
+            exakit_vs_engine "$@" show "$_cs_name" < /dev/null > "$_cs_out" 2>>"${EXAKIT_LOG_FILE:-/dev/null}"
+            _cs_rc=$?
+            if [ "$_cs_rc" -ne 0 ]; then
+                if [ "$_cs_json" = 1 ]; then cat "$_cs_out"; else _exakit_vs_render "$_cs_out"; fi
+                rm -f "$_cs_out"; exit "$_cs_rc"
+            fi
+            rm -f "$_cs_out"
             _cs_secret="$(_exakit_vs_read_secret "New credential for $_cs_name" "$_cs_pwfile")" || exit 2
             [ -n "$_cs_secret" ] || reject "No credential was given."
             set -- "$@" reauth "$_cs_name" --secret-stdin
@@ -353,6 +365,8 @@ elif "connectors" in r:
     for c in r["connectors"]:
         print("  %-12s %-18s %-5s %-10s aliases: %s" % (c["id"], c["name"], c["tier"], c["status"], ", ".join(c.get("aliases", []))))
 elif "checks" in r:
+    if not r["checks"]:
+        print("  (none)")
     for c in r["checks"]:
         print("  %-16s %s %s" % (c["name"], c["status"], c.get("evidence") or c.get("remedy") or ""))
 else:

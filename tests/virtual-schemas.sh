@@ -259,6 +259,10 @@ check "...its settings.cfg untouched" "JAR=theirs.jar" "$(sed -n 2p "$EXA/jdbc/S
 rm -rf "$EXA/jdbc/SQLSERVER"
 run_secret "{}" connect bigquery --name bq --set project=p --set dataset=d --secret-stdin
 check "a gated connector explains its gate, exit 5" "5" "$RC"; has "...naming it" "not qualified on Exasol Personal yet" "$OUT"
+run connect bigquery --name bq --dry-run
+check "...before any input is asked for, dry run included" "5" "$RC"; lacks "...no input complaint" "is required" "$OUT"
+run resolve bq
+check "resolving a gated connector says so, exit 5 (the wizard asks nothing)" "5" "$RC"; has "...with the reason" "not available yet" "$OUT"
 
 printf '\n== check, issues, reauth ==\n'
 # Back to the two healthy sources from the happy path.
@@ -333,7 +337,8 @@ bridge() {
           [ -t 0 ] || cat >> "$B/stdin"
           _n="$(wc -l < "$B/argv" | tr -d ' ')"
           _code="$(sed -n "${_n}p" "$B/codes" 2>/dev/null)"
-          case "$1" in resolve) echo 'RESULT {"connector": "postgresql"}' ;; plan) echo 'RESULT {"name": "x", "connector": "postgresql", "tier": "GA", "status": "candidate", "downloads": [], "steps": [], "exposure": "e", "warnings": []}' ;; esac
+          if [ "$1" = resolve ] && [ -f "$B/gated" ]; then echo "FAIL BigQuery is not available yet: gated"; return 5; fi
+          case "$1" in check) echo 'RESULT {"checks": []}' ;; show) echo "FAIL no source named $2 (see: exakit source list)" ;; resolve) echo 'RESULT {"connector": "postgresql"}' ;; plan) echo 'RESULT {"name": "x", "connector": "postgresql", "tier": "GA", "status": "candidate", "downloads": [], "steps": [], "exposure": "e", "warnings": []}' ;; esac
           return "${_code:-0}"
       }
       personal_slc_dns_repair() { echo "REPAIRED" >> "$B/argv"; return 0; }
@@ -371,6 +376,19 @@ OUT="$(bridge cmd_source remove </dev/null)"; RC=$?
 check "source remove without a name: exit 2" "2" "$RC"
 OUT="$(bridge cmd_source bogus </dev/null)"; RC=$?
 check "an unknown action: exit 2" "2" "$RC"
+reset_bridge 4
+OUT="$(bridge cmd_source reauth nosuch --password-file "$B/pw" </dev/null)"; RC=$?
+check "reauth of a source that does not exist: exit 4, before any credential" "4 show nosuch|" "$RC $(tr '\n' '|' < "$B/argv")"
+check "...nothing reached the engine's stdin" "no" "$([ -s "$B/stdin" ] && echo yes || echo no)"
+has "...and says which name" "no source named nosuch" "$OUT"
+reset_bridge 0
+OUT="$(bridge cmd_source check --all </dev/null)"
+has "check --all with no sources says so" "(none)" "$OUT"
+reset_bridge; : > "$B/gated"
+OUT="$(bridge cmd_connect bq --name b </dev/null)"; RC=$?
+check "a gated connector stops the wizard with the engine's exit 5" "5 resolve bq|resolve bq|" "$RC $(tr '\n' '|' < "$B/argv")"
+has "...and the reason is shown" "not available yet" "$OUT"
+rm -f "$B/gated"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

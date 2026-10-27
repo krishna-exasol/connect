@@ -75,12 +75,14 @@ Write-Host ""
 Write-Host "== the engine through the PowerShell bridge =="
 $r = Invoke-ExakitVsEngine -Arguments @("resolve", "mssql")
 Check "resolve runs and answers" "RESULT {`"connector`": `"sqlserver`"}" ($r.Lines -join "")
-$secret = "pässwörd-€-日本"
+# a-umlaut, o-umlaut, the euro sign and two CJK characters, built from code points: test files stay ASCII so 5.1
+# reads them the same under every code page.
+$secret = "p" + [char]0xE4 + "ssw" + [char]0xF6 + "rd-" + [char]0x20AC + "-" + [char]0x65E5 + [char]0x672C
 $r = Invoke-ExakitVsEngine -Arguments @("connect", "postgresql", "--name", "sales", "--set", "host=pg.example.com", "--set", "database=sales", "--set", "user=reader", "--secret-stdin") -Secret $secret
 Check "connect through the bridge: exit 0" 0 $r.Code
 $db = Get-Content -Raw -LiteralPath $state -Encoding UTF8 | ConvertFrom-Json
 Check "a non-ASCII credential reaches the CONNECTION byte for byte" $secret $db.connections.EXAKIT_SRC_SALES.secret
-Check "...and is in none of the output" $false (($r.Lines -join "`n").Contains("pässw"))
+Check "...and is in none of the output" $false (($r.Lines -join "`n").Contains($secret.Substring(0, 5)))
 $result = Show-ExakitVsLines -Lines (Invoke-ExakitVsEngine -Arguments @("list")).Lines
 Check "list comes back parsed" "sales" (@($result.sources)[0].name)
 
@@ -116,6 +118,43 @@ $denied = ""
 try { Invoke-CmdConnect -Arguments @("pg", "--name", "sales", "--password=hunter2") } catch { $denied = "$_" }
 Check "a password argument is refused" $true ($denied -like "DENY A credential is never taken as an argument*")
 Check "...before anything ran" "" ($script:calls -join "|")
+
+Write-Host ""
+Write-Host "== exakit source: the name before the credential, (none) for no checks =="
+# Invoke-CmdSource ends with `exit`, so it runs in a child PowerShell with
+# the engine and the secret prompt replaced by recorders.
+$child = @'
+param($cli, $record, $code, $result)
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($cli, [ref]$null, [ref]$null)
+foreach ($def in @($ast.FindAll({ param($n) ($n -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and $n.Name -eq "Invoke-CmdSource" }, $true))) {
+    . ([scriptblock]::Create($def.Extent.Text))
+}
+function Assert-ExakitInstalled { param([switch]$Json) }
+function Initialize-ExakitLogging { }
+function Deny-ExakitInput { param([string]$Message, $Remedy = $null) Write-Output "DENY $Message"; exit 2 }
+function Read-ExakitVsSecret { param($Label, $PasswordFile) Add-Content -LiteralPath $record -Value "SECRET-READ"; return "pw" }
+function Invoke-ExakitVsEngine { param([string[]]$Arguments = @(), [string]$Secret = "")
+    Add-Content -LiteralPath $record -Value ($Arguments -join " ")
+    return [pscustomobject]@{ Code = [int]$code; Lines = @($result) } }
+function Invoke-ExakitVsRun { param([string[]]$Arguments, [string]$Secret = "")
+    $r = Invoke-ExakitVsEngine -Arguments $Arguments; $script:ExakitVsResult = ($r.Lines[0].Substring(7) | ConvertFrom-Json); return $r.Code }
+function Show-ExakitVsLines { param([string[]]$Lines = @()) foreach ($l in $Lines) { Write-Output $l } }
+Invoke-CmdSource -Arguments $args
+'@
+$childFile = Join-Path $work "source-child.ps1"; Set-Content -LiteralPath $childFile -Value $child -Encoding ASCII
+$pwsh = (Get-Process -Id $PID).Path
+$record = Join-Path $work "source-calls.txt"
+$ErrorActionPreference = "Continue"
+$out = & $pwsh -NoProfile -File $childFile (J @("setup", "exakit.ps1")) $record 4 "FAIL no source named nosuch (see: exakit source list)" reauth nosuch 2>&1
+$childCode = $LASTEXITCODE
+$ErrorActionPreference = "Stop"
+Check "reauth of a missing source: exit 4" 4 $childCode
+Check "...asked the engine for the name and never for the credential" "show nosuch" ((Get-Content -LiteralPath $record) -join "|")
+Remove-Item -LiteralPath $record
+$ErrorActionPreference = "Continue"
+$out = & $pwsh -NoProfile -File $childFile (J @("setup", "exakit.ps1")) $record 0 'RESULT {"checks": []}' check --all 2>&1
+$ErrorActionPreference = "Stop"
+Check "check --all with no sources says (none)" $true ((@($out) -join "`n").Contains("(none)"))
 
 Remove-Item Env:\EXAKIT_VS_FAKE_DB, Env:\FAKE_VS_STATE
 if (-not $env:KEEP_WORK) { Remove-Item -Recurse -Force -LiteralPath $work -ErrorAction SilentlyContinue } else { Write-Host "work: $work" }

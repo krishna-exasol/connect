@@ -231,13 +231,13 @@ class Engine(object):
                           "e.g. sales", EXIT["input"])
         connector = self.defs.connector(connector_id)
         entry = self.defs.entry(connector_id)
+        if entry["status"] == "gated":
+            raise Failure("%s is not available yet: %s" % (entry["name"], entry["gate"]), EXIT["gated"])
         values = planner.validate_inputs(connector, given)
         names = planner.objects(name)
         description = planner.describe(self.defs, connector_id, name, values, self.runtime, self.cache, self.store)
         if plan_only or dry_run:
             return description
-        if entry["status"] == "gated":
-            raise Failure("%s is not available yet: %s" % (entry["name"], entry["gate"]), EXIT["gated"])
         reconnect = False
         if self.store.exists(name):
             current = self.store.config(name)
