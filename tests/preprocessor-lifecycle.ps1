@@ -126,6 +126,12 @@ function Test-ExakitSha256 {
     if ((Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant() -ne $Expected) { throw "checksum mismatch" }
 }
 
+# Invoke-ExakitPythonFile lives in the shared layer; lifted out of it here so
+# the rest of exakit-common.ps1 (logging, paths, the manifest) stays stubbed.
+$commonAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $repo (Join-Path "setup" (Join-Path "lib" "exakit-common.ps1"))), [ref]$null, [ref]$null)
+foreach ($def in @($commonAst.FindAll({ param($n) ($n -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and $n.Name -eq "Invoke-ExakitPythonFile" }, $true))) {
+    . ([scriptblock]::Create($def.Extent.Text))
+}
 . (Join-Path $repo (Join-Path "setup" (Join-Path "lib" "core-setup.ps1")))
 
 $state = Join-Path $work "state.json"

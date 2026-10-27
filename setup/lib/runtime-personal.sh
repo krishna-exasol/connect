@@ -2106,10 +2106,107 @@ personal_start() {
             die "Failed to start the database. Check the log above, then retry with 'exakit start'; if it fails the same way, repair with: $(personal_repair_command)"
         fi
         ok "Database started"
+        # Every start rebuilds the language containers from their images, and
+        # with them their empty DNS files - see personal_slc_dns_repair.
+        personal_slc_dns_repair || true
     else
         info "This launcher version has no explicit start command."
         info "Check the database with: $(personal_cli) info"
     fi
+}
+
+# Where this module and its helpers live, captured while it is being sourced.
+EXAKIT_PERSONAL_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# personal_slc_dns_script <flavor...> — the POSIX sh that repairs DNS inside
+# the database container from the launcher VM's shell on macOS. Linux, WSL and
+# Windows run the same logic through setup/lib/personal-slc-dns.py, against the
+# host's own Podman.
+#
+# A language container (SLC) is its own filesystem, and the official ones ship
+# etc/resolv.conf and etc/hosts EMPTY. The database mounts the deployment's real
+# files into every UDF sandbox at /conf, but a UDF reads /etc - so Java code in
+# the database could reach any IP address and resolve no name at all, and a
+# virtual schema adapter could never connect to a remote source by hostname.
+# Pointing the two files at /conf gives every UDF the deployment's DNS. Only a
+# file that is still the shipped EMPTY one is replaced, so a Personal release
+# that fixes this upstream turns the whole step into a no-op.
+#
+# Prints one "EXAKIT_SLC_DNS <flavor> repaired|ok|absent|failed" line per
+# flavor. ⇄ twin: Get-PersonalSlcDnsScript.
+personal_slc_dns_script() {
+    printf '%s\n' 'CTR=$(podman ps --filter name=exasol-db- --format "{{.Names}}" | head -n 1)' \
+        '[ -n "$CTR" ] || { echo "EXAKIT_SLC_DNS - nocontainer"; exit 0; }'
+    for _psds_flavor in "$@"; do
+        cat <<EOF
+F='$_psds_flavor'
+D=\$(mktemp -d)
+# Extracted and tested, not read off a listing: tar -tv columns differ between
+# GNU and BSD tar, and the size column is the one that moves.
+podman cp "\$CTR":/exa/slc/\$F/etc - 2>/dev/null | tar -C "\$D" -xf - etc/resolv.conf 2>/dev/null
+if [ -L "\$D/etc/resolv.conf" ] || [ -s "\$D/etc/resolv.conf" ]; then echo "EXAKIT_SLC_DNS \$F ok"
+elif [ ! -e "\$D/etc/resolv.conf" ]; then echo "EXAKIT_SLC_DNS \$F absent"
+else
+  ln -s /conf/resolv.conf "\$D/resolv.conf"; ln -s /conf/hosts "\$D/hosts"
+  if tar -C "\$D" -cf - resolv.conf hosts | podman cp - "\$CTR":/exa/slc/\$F/etc/; then echo "EXAKIT_SLC_DNS \$F repaired"; else echo "EXAKIT_SLC_DNS \$F failed"; fi
+fi
+rm -rf "\$D"
+EOF
+    done
+    printf '%s\n' 'exit 0'
+}
+
+# personal_slc_installed_flavors — the official language containers the
+# launcher reports installed, space-separated (java-17 python-3.12 ...).
+personal_slc_installed_flavors() {
+    exakit_run_bounded "$EXAKIT_PERSONAL_PROBE_TIMEOUT" "$(personal_cli)" slc list --json 2>/dev/null \
+        | run_python_any -c 'import json, sys
+text = sys.stdin.read()
+try:
+    rows = json.loads(text[text.find("["):]) if "[" in text else []
+except ValueError:
+    rows = []
+print(" ".join(r["flavor"] for r in rows if isinstance(r, dict) and r.get("installed")
+               and r.get("type") == "official" and r.get("flavor")))' 2>/dev/null
+}
+
+# personal_slc_dns_repair — run personal_slc_dns_script for every official
+# language container the launcher reports installed. Best effort and bounded:
+# no container, a launcher without `slc` or a VM shell that does not answer is
+# logged and returns 1, and never fails the caller - the virtual schema check
+# reports a database without DNS on its own. ⇄ twin: Repair-PersonalSlcDns.
+personal_slc_dns_repair() {
+    _psdr_flavors="$(personal_slc_installed_flavors)"
+    [ -n "$_psdr_flavors" ] || return 0
+    _psdr_script="$(mktemp "${TMPDIR:-/tmp}/exakit-slc-dns.XXXXXX")" || return 1
+    # shellcheck disable=SC2086 -- one argument per flavor
+    personal_slc_dns_script $_psdr_flavors > "$_psdr_script"
+    if [ "$(detect_os 2>/dev/null)" = "macos" ]; then
+        # The database runs in the launcher's Linux VM; its shell is the one
+        # with the Podman that owns the container. It takes the script on stdin
+        # - redirected INSIDE the bounded command: without timeout(1) that
+        # command runs as a background job, and a background job's stdin is
+        # /dev/null, so a redirect on the outside never reached it.
+        _psdr_out="$(exakit_run_bounded 90 sh -c 'exec "$0" shell container < "$1"' "$(personal_cli)" "$_psdr_script" 2>&1)"
+    elif command -v podman >/dev/null 2>&1; then
+        # The host's own Podman owns the container (Linux, WSL): the shared
+        # helper the Windows twin runs too.
+        # shellcheck disable=SC2086 -- one argument per flavor
+        _psdr_out="$(exakit_run_bounded 90 run_python_any "$EXAKIT_PERSONAL_LIB_DIR/personal-slc-dns.py" $_psdr_flavors 2>&1)"
+    else
+        _psdr_out="EXAKIT_SLC_DNS - nopodman"
+    fi
+    rm -f "$_psdr_script"
+    _psdr_rc=0
+    for _psdr_line in $(printf '%s\n' "$_psdr_out" | sed -n 's/^EXAKIT_SLC_DNS \([^ ]*\) \([a-z]*\)$/\1:\2/p'); do
+        _exakit_log_file "INFO  language container DNS: $_psdr_line"
+        case "$_psdr_line" in
+            *:repaired) info "Gave the ${_psdr_line%%:*} language container the deployment's DNS" ;;
+            *:failed|*:nocontainer|*:nopodman) _psdr_rc=1 ;;
+        esac
+    done
+    printf '%s\n' "$_psdr_out" | grep -q '^EXAKIT_SLC_DNS ' || _psdr_rc=1
+    return "$_psdr_rc"
 }
 
 personal_stop() {

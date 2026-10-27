@@ -1083,6 +1083,58 @@ function Start-Personal {
         Fail "Failed to start the database. Check the log, then retry with 'exakit start'; if it fails the same way, repair with: exakit repair-runtime"
     }
     Ok "Database started"
+    # Every start rebuilds the language containers from their images, and with
+    # them their empty DNS files - see Repair-PersonalSlcDns.
+    try { [void](Repair-PersonalSlcDns) } catch { Write-ExakitLog "WARN" "language container DNS repair: $_" }
+}
+
+# Get-PersonalSlcInstalledFlavors - the official language containers the
+# launcher reports installed (java-17, python-3.12, ...). Twin of
+# personal_slc_installed_flavors.
+function Get-PersonalSlcInstalledFlavors {
+    $previous = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $text = (& (Get-PersonalCli) slc list --json 2>$null) -join "`n"
+    } catch { return @() } finally { $ErrorActionPreference = $previous }
+    $at = $text.IndexOf("[")
+    if ($at -lt 0) { return @() }
+    try { $rows = @($text.Substring($at) | ConvertFrom-Json) } catch { return @() }
+    $flavors = @()
+    foreach ($row in $rows) {
+        foreach ($item in @($row)) {
+            if ($item.installed -and $item.type -eq "official" -and $item.flavor) { $flavors += "$($item.flavor)" }
+        }
+    }
+    return $flavors
+}
+
+# Repair-PersonalSlcDns - give every installed official language container the
+# deployment's DNS. The official containers ship etc/resolv.conf and etc/hosts
+# empty, so Java code in the database - every virtual schema adapter - can
+# reach an IP address and resolve no name; the database mounts the real files
+# at /conf, and setup/lib/personal-slc-dns.py points the container's at them
+# through the host's Podman. Every start rebuilds the containers, so this runs
+# after every start. Best effort: returns $false and logs when it cannot.
+# Twin of personal_slc_dns_repair.
+function Repair-PersonalSlcDns {
+    $flavors = @(Get-PersonalSlcInstalledFlavors)
+    if ($flavors.Count -eq 0) { return $true }
+    if (-not (Get-Command podman -ErrorAction SilentlyContinue)) {
+        Write-ExakitLog "WARN" "language container DNS: no podman on PATH"
+        return $false
+    }
+    $helper = Join-Path $PSScriptRoot "personal-slc-dns.py"
+    $result = Invoke-ExakitPythonFile -Path $helper -Arguments $flavors
+    $ok = ($result.Code -eq 0)
+    foreach ($line in @($result.Lines)) {
+        if ($line -match '^EXAKIT_SLC_DNS (\S+) (\S+)$') {
+            Write-ExakitLog "INFO" "language container DNS: $($Matches[1]):$($Matches[2])"
+            if ($Matches[2] -eq "repaired") { Info "Gave the $($Matches[1]) language container the deployment's DNS" }
+            if ($Matches[2] -eq "nocontainer") { $ok = $false }
+        }
+    }
+    return $ok
 }
 
 function Stop-Personal {
