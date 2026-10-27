@@ -1,0 +1,56 @@
+{
+  "id": "bigquery",
+  "name": "Google BigQuery",
+  "profile": "java-jdbc",
+  "upstream": "exasol/bigquery-virtual-schema",
+  "adapter": {
+    "version": "4.0.1",
+    "asset": "virtual-schema-dist-14.0.4-bigquery-4.0.1.jar",
+    "url": "https://github.com/exasol/bigquery-virtual-schema/releases/download/4.0.1/virtual-schema-dist-14.0.4-bigquery-4.0.1.jar",
+    "size": 581209,
+    "sha256": "c71f01ba837a0e236f8f40e283aeb1ed86646c67fe8dc802a2f3750ed74725e3",
+    "license": "MIT"
+  },
+  "driver": {
+    "version": "1.7.0.1001",
+    "asset": "SimbaJDBCDriverforGoogleBigQuery42_1.7.0.1001.zip",
+    "url": "https://storage.googleapis.com/simba-bq-release/jdbc/SimbaJDBCDriverforGoogleBigQuery42_1.7.0.1001.zip",
+    "size": 40852027,
+    "sha256": "71e142373cbe1e7b746bf20eba212587852f7fccb58418dd1f38e920125b676f",
+    "license": "Google Cloud terms (download on this machine; never redistributed)",
+    "bundle": "zip",
+    "entry": "GoogleBigQueryJDBC42.jar"
+  },
+  "etl": null,
+  "inputs": [
+    {
+      "name": "project",
+      "label": "Project ID",
+      "kind": "name",
+      "required": true
+    },
+    {
+      "name": "dataset",
+      "label": "Dataset",
+      "kind": "name",
+      "required": true
+    },
+    {
+      "name": "key_file",
+      "label": "Service-account key file (JSON)",
+      "kind": "secret-file",
+      "required": true
+    }
+  ],
+  "auth": "service-account-key",
+  "url": "jdbc:bigquery://https://www.googleapis.com/bigquery/v2:443;ProjectId={project};OAuthType=0;OAuthPvtKeyPath={key_path}",
+  "tls": null,
+  "vs_properties": {
+    "CATALOG_NAME": "{project}",
+    "SCHEMA_NAME": "{dataset}"
+  },
+  "notes": [
+    "Rows come back as VALUES from the adapter itself - meant for small results (upstream warns at a few thousand rows). BIGQUERY_ENABLE_IMPORT stays off.",
+    "Gated: the key file must be readable by this connection's adapter only. Until that isolation is qualified, `exakit connect bigquery` explains the gate and stops."
+  ]
+}

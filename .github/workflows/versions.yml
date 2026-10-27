@@ -809,6 +809,11 @@ jobs:
       # WSL, Windows) and the sh script for the macOS launcher VM.
       - run: bash tests/personal-slc-dns.sh
         if: matrix.shard == 4
+      # The virtual schema engine against a simulated Exasol: secrets only in
+      # CONNECTION DDL, failed connects leave nothing, shared files counted,
+      # disconnect vs remove, and classified failures.
+      - run: bash tests/virtual-schemas.sh
+        if: matrix.shard == 4
       - run: bash tests/agent-operability.sh
         if: matrix.shard == 4
       # The MCP subsystem's own tests were never wired in, so nothing in CI

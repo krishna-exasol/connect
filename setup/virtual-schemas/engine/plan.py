@@ -1,0 +1,184 @@
+"""Definitions, input validation and the plan shown before anything changes.
+
+A connector's definition (connectors/<id>/connector.json) is data: its
+inputs, pinned artifacts, loader registration, JDBC URL template, TLS modes
+and virtual schema properties. Everything a user types is validated here by
+kind before it reaches a template, and the templates only ever see validated
+values - nothing a user types is interpolated into SQL unchecked.
+"""
+
+import difflib
+import json
+import os
+import re
+
+KINDS = {
+    "host": re.compile(r"^(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"
+                       r"|^\d{1,3}(\.\d{1,3}){3}$|^\[?[0-9A-Fa-f:]+\]?$"),
+    "name": re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_$.-]{0,127}$"),
+    "account": re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"),
+    "text": re.compile(r"^[^\x00-\x1f'\"\\]{1,128}$"),
+}
+
+
+class PlanError(Exception):
+    def __init__(self, message, code=2, choices=None):
+        super().__init__(message)
+        self.code = code
+        self.choices = choices or []
+
+
+class Definitions(object):
+    def __init__(self, root):
+        self.root = root
+        self.catalog = self._load("catalog.json")
+
+    def _load(self, *parts):
+        with open(os.path.join(self.root, *parts), encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def entries(self):
+        return list(self.catalog["connectors"])
+
+    def entry(self, connector_id):
+        for item in self.entries():
+            if item["id"] == connector_id:
+                return item
+        raise PlanError("unknown connector %s" % connector_id)
+
+    def connector(self, connector_id):
+        return self._load("connectors", connector_id, "connector.json")
+
+    def profile(self, profile_id):
+        return self._load("profiles", profile_id, "profile.json")
+
+    def resolve(self, query):
+        """A connector id from a name, an id or an alias; ambiguity is refused with the choices."""
+        q = re.sub(r"[\s_]+", "-", (query or "").strip().lower())
+        if not q:
+            raise PlanError("name a source to connect, for example: exakit connect postgresql",
+                            choices=[e["id"] for e in self.entries()])
+        exact = [e for e in self.entries()
+                 if q in [e["id"], e["name"].lower().replace(" ", "-")] + [a.lower() for a in e.get("aliases", [])]]
+        if len(exact) == 1:
+            return exact[0]["id"]
+        partial = [e for e in self.entries()
+                   if any(q in key for key in [e["id"], e["name"].lower()] + e.get("aliases", []))]
+        if len(partial) == 1:
+            return partial[0]["id"]
+        if len(partial) > 1:
+            raise PlanError("%s matches more than one source" % query, choices=[e["id"] for e in partial])
+        keys = {}
+        for e in self.entries():
+            for key in [e["id"], e["name"].lower()] + e.get("aliases", []):
+                keys[key] = e["id"]
+        close = difflib.get_close_matches(q, list(keys), n=3, cutoff=0.6)
+        raise PlanError("no source matches %s" % query, choices=sorted(set(keys[c] for c in close))
+                        or [e["id"] for e in self.entries()])
+
+
+def objects(name):
+    upper = name.upper()
+    return {"connection": "EXAKIT_SRC_%s" % upper, "schema": "VS_%s" % upper,
+            "script_schema": "EXAKIT_VS", "script": "ADAPTER_%s" % upper}
+
+
+def validate_inputs(connector, given):
+    """Defaults applied, every value checked by kind; secrets are not taken here."""
+    values, problems = {}, []
+    known = {spec["name"] for spec in connector["inputs"]}
+    for key in given:
+        if key not in known:
+            problems.append("%s is not an input of %s (inputs: %s)" % (key, connector["id"], ", ".join(sorted(known))))
+    for spec in connector["inputs"]:
+        name, kind = spec["name"], spec["kind"]
+        if kind in ("secret", "secret-file"):
+            continue
+        raw = given.get(name)
+        if raw is None or raw == "":
+            if "default" in spec:
+                raw = spec["default"]
+            elif spec.get("required"):
+                problems.append("%s is required (%s)" % (name, spec.get("label", name)))
+                continue
+            else:
+                continue
+        raw = str(raw).strip()
+        if kind == "port":
+            if not raw.isdigit() or not 0 < int(raw) < 65536:
+                problems.append("%s must be a port number, not %r" % (name, raw))
+                continue
+        elif kind == "choice":
+            if raw not in spec["choices"]:
+                problems.append("%s must be one of %s, not %r" % (name, ", ".join(spec["choices"]), raw))
+                continue
+        elif kind in KINDS and not KINDS[kind].match(raw):
+            problems.append("%s=%r is not a valid %s" % (name, raw, kind))
+            continue
+        values[name] = raw.upper() if spec.get("upper") else raw
+    if problems:
+        raise PlanError("; ".join(problems))
+    return values
+
+
+def secret_input(connector):
+    for spec in connector["inputs"]:
+        if spec["kind"] in ("secret", "secret-file"):
+            return spec
+    return None
+
+
+def source_host(connector, values):
+    template = connector.get("host") or "{host}"
+    try:
+        return template.format(**values)
+    except KeyError:
+        return ""
+
+
+def jdbc_url(connector, values, extra=None):
+    fields = dict(values)
+    fields.update(extra or {})
+    if connector.get("tls"):
+        fields["tls"] = connector["tls"][values.get("tls", "verify")].format(**fields)
+    return connector["url"].format(**fields)
+
+
+def tls_warning(connector, values):
+    mode = values.get("tls")
+    if mode == "require":
+        return "TLS encrypts the connection but does NOT check the server's identity"
+    if mode == "disable":
+        return "TLS is off: credentials and rows cross the network unencrypted"
+    return None
+
+
+def describe(defs, connector_id, name, values, runtime, cache, store):
+    """The plan, as data: what is downloaded, staged, created - before any of it happens."""
+    connector = defs.connector(connector_id)
+    entry = defs.entry(connector_id)
+    names = objects(name)
+    downloads = []
+    for role in ("adapter", "driver"):
+        pin = connector[role]
+        downloads.append({"role": role, "asset": pin["asset"], "version": pin["version"], "bytes": pin["size"],
+                          "cached": cache.has(pin), "license": pin["license"]})
+    steps = ["verify Java and its DNS in the database (resolve %s)" % (source_host(connector, values) or "the source")]
+    if connector.get("etl"):
+        steps.append("register loader driver %s" % connector["etl"]["drivername"])
+    steps += ["create CONNECTION %s" % names["connection"],
+              "create adapter script %s.%s" % (names["script_schema"], names["script"]),
+              "create virtual schema %s" % names["schema"],
+              "verify metadata and one bounded read"]
+    plan = {
+        "connector": connector_id, "name": name, "tier": entry["tier"], "status": entry["status"],
+        "objects": names, "downloads": downloads, "steps": steps,
+        "download_bytes": sum(d["bytes"] for d in downloads if not d["cached"]),
+        "exposure": "the kit's MCP read-only user can read every table of %s (SELECT ANY TABLE)" % names["schema"],
+        "restart": False,
+        "warnings": [w for w in [tls_warning(connector, values)] if w],
+        "gate": entry.get("gate") if entry["status"] == "gated" else None,
+    }
+    if store.exists(name):
+        plan["existing"] = store.status(name).get("status", "unknown")
+    return plan

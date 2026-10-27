@@ -1,0 +1,92 @@
+{
+  "id": "postgresql",
+  "name": "PostgreSQL",
+  "profile": "java-jdbc",
+  "upstream": "exasol/postgresql-virtual-schema",
+  "adapter": {
+    "version": "4.1.0",
+    "asset": "virtual-schema-dist-14.1.0-postgresql-4.1.0.jar",
+    "url": "https://github.com/exasol/postgresql-virtual-schema/releases/download/4.1.0/virtual-schema-dist-14.1.0-postgresql-4.1.0.jar",
+    "size": 1981203,
+    "sha256": "046f5d2c09a5d89998d2cd8e11436dd86405ea2517dc6b32ba452c699e2e9eb8",
+    "license": "MIT"
+  },
+  "driver": {
+    "version": "42.7.14",
+    "asset": "postgresql-42.7.14.jar",
+    "url": "https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.14/postgresql-42.7.14.jar",
+    "size": 1221004,
+    "sha256": "73914527305a40cce504b0d3d90b23caf565136912d607ae8ae7c5895512332c",
+    "license": "BSD-2-Clause"
+  },
+  "etl": {
+    "drivername": "POSTGRES_JDBC_DRIVER",
+    "prefix": "jdbc:postgresql:",
+    "main": "org.postgresql.Driver",
+    "nosecurity": false
+  },
+  "inputs": [
+    {
+      "name": "host",
+      "label": "Host name or address",
+      "kind": "host",
+      "required": true
+    },
+    {
+      "name": "port",
+      "label": "Port",
+      "kind": "port",
+      "default": 5432
+    },
+    {
+      "name": "database",
+      "label": "Database",
+      "kind": "name",
+      "required": true
+    },
+    {
+      "name": "schema",
+      "label": "Schema",
+      "kind": "name",
+      "default": "public"
+    },
+    {
+      "name": "user",
+      "label": "Reader account",
+      "kind": "text",
+      "required": true
+    },
+    {
+      "name": "password",
+      "label": "Password",
+      "kind": "secret",
+      "required": true
+    },
+    {
+      "name": "tls",
+      "label": "TLS",
+      "kind": "choice",
+      "default": "verify",
+      "choices": [
+        "verify",
+        "require",
+        "disable"
+      ]
+    }
+  ],
+  "auth": "password",
+  "url": "jdbc:postgresql://{host}:{port}/{database}?{tls}",
+  "tls": {
+    "verify": "sslmode=verify-full&sslfactory=org.postgresql.ssl.DefaultJavaSSLFactory",
+    "require": "sslmode=require",
+    "disable": "sslmode=disable"
+  },
+  "vs_properties": {
+    "CATALOG_NAME": "{database}",
+    "SCHEMA_NAME": "{schema}"
+  },
+  "notes": [
+    "The adapter JAR already contains pgJDBC 42.7.14; the driver pin is the same version so the two copies never disagree.",
+    "verify checks the server certificate AND its host name against the JVM's public CAs. A server with a private CA needs that CA trusted; require only encrypts."
+  ]
+}

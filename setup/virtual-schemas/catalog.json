@@ -1,0 +1,88 @@
+{
+  "_comment": [
+    "The connector catalog: what `exakit connect` can search and offer.",
+    "",
+    "  tier    GA = the selected Phase 1 scope, Beta = everything else. Rollout",
+    "          labels, not upstream certifications.",
+    "  status  candidate = defined and unit-tested, not yet qualified end to end",
+    "          against a real source; kit-tested = qualified; gated = defined but",
+    "          blocked by a named release gate (see `gate`).",
+    "  aliases what a search also matches; ambiguous input lists the choices.",
+    "",
+    "A connector's inputs, artifacts and SQL live in connectors/<id>/; the",
+    "deployment recipe it shares with others in profiles/<profile>/."
+  ],
+  "schema_version": 1,
+  "connectors": [
+    {
+      "id": "postgresql",
+      "name": "PostgreSQL",
+      "aliases": [
+        "pg",
+        "postgres",
+        "pgsql"
+      ],
+      "profile": "java-jdbc",
+      "tier": "GA",
+      "status": "candidate"
+    },
+    {
+      "id": "mysql",
+      "name": "MySQL",
+      "aliases": [
+        "mysql8",
+        "mysql-server"
+      ],
+      "profile": "java-jdbc",
+      "tier": "GA",
+      "status": "candidate"
+    },
+    {
+      "id": "sqlserver",
+      "name": "SQL Server",
+      "aliases": [
+        "mssql",
+        "sql-server",
+        "microsoft-sql-server"
+      ],
+      "profile": "java-jdbc",
+      "tier": "GA",
+      "status": "candidate"
+    },
+    {
+      "id": "oracle",
+      "name": "Oracle",
+      "aliases": [
+        "oracle-db",
+        "ora"
+      ],
+      "profile": "java-jdbc",
+      "tier": "GA",
+      "status": "candidate"
+    },
+    {
+      "id": "snowflake",
+      "name": "Snowflake",
+      "aliases": [
+        "sf",
+        "snow"
+      ],
+      "profile": "java-jdbc",
+      "tier": "GA",
+      "status": "candidate"
+    },
+    {
+      "id": "bigquery",
+      "name": "Google BigQuery",
+      "aliases": [
+        "bq",
+        "gbq",
+        "google-bigquery"
+      ],
+      "profile": "java-jdbc",
+      "tier": "GA",
+      "status": "gated",
+      "gate": "The service-account key file must live in storage only this connection can read; that isolation is not qualified on Exasol Personal yet."
+    }
+  ]
+}

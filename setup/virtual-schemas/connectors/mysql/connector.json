@@ -1,0 +1,85 @@
+{
+  "id": "mysql",
+  "name": "MySQL",
+  "profile": "java-jdbc",
+  "upstream": "exasol/mysql-virtual-schema",
+  "adapter": {
+    "version": "6.1.0",
+    "asset": "virtual-schema-dist-14.1.0-mysql-6.1.0.jar",
+    "url": "https://github.com/exasol/mysql-virtual-schema/releases/download/6.1.0/virtual-schema-dist-14.1.0-mysql-6.1.0.jar",
+    "size": 528180,
+    "sha256": "97005ff4b161c7294c9ddb722df4b1f9aae4df524eac5fc50abbd6adbf546e58",
+    "license": "MIT"
+  },
+  "driver": {
+    "version": "26.7.0",
+    "asset": "mysql-connector-j-26.7.0.jar",
+    "url": "https://repo1.maven.org/maven2/com/mysql/mysql-connector-j/26.7.0/mysql-connector-j-26.7.0.jar",
+    "size": 2613206,
+    "sha256": "69084713593a4aa8d07c383619b9639276f08bccf8faf1c562178147d389b1e1",
+    "license": "GPL-2.0 with Universal FOSS Exception"
+  },
+  "etl": {
+    "drivername": "MYSQL",
+    "prefix": "jdbc:mysql:",
+    "main": "com.mysql.cj.jdbc.Driver",
+    "nosecurity": true
+  },
+  "inputs": [
+    {
+      "name": "host",
+      "label": "Host name or address",
+      "kind": "host",
+      "required": true
+    },
+    {
+      "name": "port",
+      "label": "Port",
+      "kind": "port",
+      "default": 3306
+    },
+    {
+      "name": "database",
+      "label": "Database",
+      "kind": "name",
+      "required": true
+    },
+    {
+      "name": "user",
+      "label": "Reader account",
+      "kind": "text",
+      "required": true
+    },
+    {
+      "name": "password",
+      "label": "Password",
+      "kind": "secret",
+      "required": true
+    },
+    {
+      "name": "tls",
+      "label": "TLS",
+      "kind": "choice",
+      "default": "verify",
+      "choices": [
+        "verify",
+        "require",
+        "disable"
+      ]
+    }
+  ],
+  "auth": "password",
+  "url": "jdbc:mysql://{host}:{port}/?{tls}",
+  "tls": {
+    "verify": "sslMode=VERIFY_IDENTITY",
+    "require": "sslMode=REQUIRED",
+    "disable": "sslMode=DISABLED"
+  },
+  "vs_properties": {
+    "CATALOG_NAME": "{database}"
+  },
+  "notes": [
+    "MySQL has no schemas below a database: the dialect takes CATALOG_NAME only.",
+    "Connector/J is downloaded from Maven Central on this machine and never redistributed (GPL with the FOSS exception)."
+  ]
+}
