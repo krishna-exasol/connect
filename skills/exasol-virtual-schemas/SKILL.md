@@ -106,7 +106,7 @@ exakit source refresh sales        # after tables were added or changed at the s
 
 ```bash
 exakit source disconnect sales --dry-run   # drops ONLY the CONNECTION; VS_SALES stays, queries fail
-exakit connect pg --name sales ...         # reconnects a disconnected source
+exakit connect pg --name sales --password-file F   # reconnects it; the recorded inputs are reused
 exakit source remove sales --dry-run       # drops VS_SALES, its adapter and CONNECTION; deletes
                                            # downloaded files no other source still uses
 ```

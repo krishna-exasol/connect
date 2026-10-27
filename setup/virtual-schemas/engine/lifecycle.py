@@ -234,6 +234,13 @@ class Engine(object):
         entry = self.defs.entry(connector_id)
         if entry["status"] == "gated":
             raise Failure("%s is not available yet: %s" % (entry["name"], entry["gate"]), EXIT["gated"])
+        if self.store.exists(name):
+            current = self.store.config(name)
+            if self.store.status(name).get("status") == "disconnected" and current["connector"] == connector_id:
+                # Reconnecting: the recorded inputs stand unless one is given
+                # again, so "exakit connect <connector> --name N" plus the
+                # credential is the whole command - the one disconnect names.
+                given = dict(current.get("inputs") or {}, **given)
         values = planner.validate_inputs(connector, given)
         names = planner.objects(name)
         description = planner.describe(self.defs, connector_id, name, values, self.runtime, self.cache, self.store)

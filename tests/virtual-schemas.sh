@@ -339,8 +339,9 @@ run disconnect sales
 check "disconnect drops only the CONNECTION" "false true true" \
     "$(dbq '"EXAKIT_SRC_SALES" in d["connections"]' | tr A-Z a-z) $(dbq '"VS_SALES" in d["virtual"]' | tr A-Z a-z) $(dbq '"EXAKIT_VS.ADAPTER_SALES" in d["scripts"]' | tr A-Z a-z)"
 run check sales; has "a disconnected source is skipped by check" '"skipped": true' "$OUT"
-run_secret "$NEWSECRET" connect postgresql --name sales $PG_SET --secret-stdin
-check "connect on a disconnected source reconnects it" "0" "$RC"
+run_secret "$NEWSECRET" connect postgresql --name sales --secret-stdin
+check "connect on a disconnected source reconnects it, from the name and the credential alone" "0" "$RC"
+has "...to the recorded host" "pg.example.com resolves and answers on port 5432" "$OUT"
 check "...recreating the CONNECTION" "true" "$(dbq '"EXAKIT_SRC_SALES" in d["connections"]' | tr A-Z a-z)"
 
 printf '\n== remove: owned objects, shared files kept until the last consumer ==\n'
