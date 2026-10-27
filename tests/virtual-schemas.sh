@@ -108,6 +108,32 @@ check "an IPv6 host is bracketed in the URL, written either way" \
 
 run plan postgresql --name sales --set host=h --set user=u; has "a missing required input is named" "database is required" "$OUT"
 
+printf '\n== every connector, every TLS mode: the templates build ==\n'
+TEMPLATES="$(python3 - "$ROOT" <<'PYT'
+import sys; sys.path.insert(0, sys.argv[1] + "/setup/virtual-schemas/engine")
+import plan
+defs = plan.Definitions(sys.argv[1] + "/setup/virtual-schemas")
+samples = {"host": "db.example.com", "database": "sales", "schema": "public", "user": "reader", "service": "ORCLPDB1",
+           "account": "myorg-acct1", "warehouse": "COMPUTE_WH", "project": "my-proj", "dataset": "analytics"}
+for entry in defs.entries():
+    c = defs.connector(entry["id"])
+    given = {s["name"]: samples[s["name"]] for s in c["inputs"] if s["name"] in samples}
+    tls = next((s for s in c["inputs"] if s["name"] == "tls"), None)
+    for mode in (tls["choices"] if tls else [None]):
+        g = dict(given, **({"tls": mode} if mode else {}))
+        try:
+            v = plan.validate_inputs(c, g)
+            url = plan.jdbc_url(c, v, {"key_path": "/buckets/x/key.json"})
+            [t.format(**v) for t in c["vs_properties"].values()]
+            ok = url.startswith("jdbc:") and "{" not in url and plan.source_host(c, v)
+            print("%s/%s %s" % (c["id"], mode or "-", "ok" if ok else "BAD " + url))
+        except Exception as e:
+            print("%s/%s BAD %s" % (c["id"], mode or "-", e))
+PYT
+)"
+check "14 connector/TLS combinations build a URL, properties and a probe host" "14 0" \
+    "$(printf '%s\n' "$TEMPLATES" | grep -c ' ok$') $(printf '%s\n' "$TEMPLATES" | grep -c ' BAD')"
+
 printf '\n== connect: the happy path ==\n'
 db '{"sources": {"pg.example.com": {"tables": ["ORDERS", "CUSTOMERS"]}}}'
 run connect postgresql --name sales $PG_SET --secret-stdin </dev/null

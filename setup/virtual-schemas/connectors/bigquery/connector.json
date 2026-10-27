@@ -43,6 +43,7 @@
     }
   ],
   "auth": "service-account-key",
+  "host": "www.googleapis.com",
   "url": "jdbc:bigquery://https://www.googleapis.com/bigquery/v2:443;ProjectId={project};OAuthType=0;OAuthPvtKeyPath={key_path}",
   "tls": null,
   "vs_properties": {
