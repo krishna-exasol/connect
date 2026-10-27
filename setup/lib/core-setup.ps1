@@ -194,11 +194,14 @@ function Invoke-ExakitCoreTaskPreprocessor {
         # 10: a fresh install needs the package, and only then is it fetched,
         # so a rerun over an installed framework never needs the network.
         if ($result.Code -ne 10 -or $attempt -ne 1) { break }
-        $partial = "$package.part"
+        # Downloaded under its own name in a staging folder: the checksum line
+        # names the file it checked. Twin of the bash side.
+        $partial = Join-ExakitCorePath (Split-Path -Parent $package) ".incoming" $pin.Asset
         $script:ExakitActiveLabel = "Downloading the SQL preprocessor framework $($pin.Version)"
         [void](Get-ExakitFile -Url ("https://github.com/" + $pin.Repo + "/releases/download/" + $pin.Ref + "/" + $pin.Asset) -Dest $partial)
         Test-ExakitSha256 -Path $partial -Expected $pin.Sha256
         Move-Item -Force -LiteralPath $partial -Destination $package
+        Remove-Item -LiteralPath (Split-Path -Parent $partial) -ErrorAction SilentlyContinue
     }
     if ($result.Code -eq 0) { return $true }
     if ($result.Code -eq 10) {

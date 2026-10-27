@@ -248,8 +248,6 @@ class Engine(object):
         if spec and not secret:
             raise Failure("%s needs %s on standard input (it is never taken as an argument)"
                           % (connector_id, spec["label"].lower()), EXIT["input"])
-        for warning in description["warnings"]:
-            self.emit("WARN", warning)
         created = {"files": [], "connection": False, "script": False, "schema": False}
         with self.store.lock():
             self.store.save_journal(name, {"operation": "reconnect" if reconnect else "connect",
