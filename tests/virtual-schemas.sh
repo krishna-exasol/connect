@@ -238,5 +238,58 @@ check "...but never the bucket or what the kit did not make" "yes yes" \
 run --json list; has "nothing is listed" '"sources": []' "$OUT"
 run show sales; check "show on a removed source: exit 4" "4" "$RC"
 
+printf '\n== the shell bridge (setup/lib/virtual-schemas.sh) ==\n'
+# A stand-in engine records its arguments and its stdin, and answers with the
+# exit code a test arranges - so what the bridge does with each is observable.
+B="$WORK/bridge"; mkdir -p "$B"
+bridge() {
+    ( EXAKIT_HOME="$B/home"; mkdir -p "$EXAKIT_HOME"
+      . "$ROOT/setup/lib/common.sh"; . "$ROOT/setup/lib/detect.sh"; . "$ROOT/setup/lib/runtime-personal.sh"
+      . "$ROOT/setup/lib/virtual-schemas.sh"
+      _require_install() { :; }; exakit_init_logging() { :; }
+      exakit_vs_engine() {
+          printf '%s\n' "$*" >> "$B/argv"
+          [ -t 0 ] || cat >> "$B/stdin"
+          _n="$(wc -l < "$B/argv" | tr -d ' ')"
+          _code="$(sed -n "${_n}p" "$B/codes" 2>/dev/null)"
+          case "$1" in resolve) echo 'RESULT {"connector": "postgresql"}' ;; plan) echo 'RESULT {"name": "x", "connector": "postgresql", "tier": "GA", "status": "candidate", "downloads": [], "steps": [], "exposure": "e", "warnings": []}' ;; esac
+          return "${_code:-0}"
+      }
+      personal_slc_dns_repair() { echo "REPAIRED" >> "$B/argv"; return 0; }
+      _exakit_vs_install_java() { echo "JAVA-ASKED" >> "$B/argv"; return 1; }
+      "$@" ) 2>&1
+}
+reset_bridge() { rm -f "$B/argv" "$B/stdin" "$B/codes"; printf '%s\n' "$@" > "$B/codes"; }
+
+reset_bridge
+OUT="$(bridge cmd_connect pg --name sales --password=hunter2 </dev/null)"; RC=$?
+check "a password argument is refused before anything runs, exit 2" "2 no" "$RC $([ -f "$B/argv" ] && echo yes || echo no)"
+OUT="$(bridge cmd_connect pg --set host=h </dev/null)"; RC=$?
+check "unattended, the name is required" "2" "$RC"
+reset_bridge 0 0 0
+printf 'pw-from-stdin' > "$B/pw"
+OUT="$(bridge cmd_connect pg --name sales --set host=db.example.com --set user=reader --password-file "$B/pw" </dev/null)"; RC=$?
+check "connect with a password file: exit 0" "0" "$RC"
+check "...the engine ran resolve, plan, connect - the last with --secret-stdin" \
+    "resolve pg|plan postgresql --name sales --set host=db.example.com --set user=reader|connect postgresql --name sales --set host=db.example.com --set user=reader --secret-stdin|" \
+    "$(tr '\n' '|' < "$B/argv")"
+check "...the credential reached it on stdin" "pw-from-stdin" "$(cat "$B/stdin")"
+lacks "...and never as an argument" "pw-from-stdin" "$(cat "$B/argv")"
+reset_bridge 0 0 20 0
+OUT="$(bridge cmd_connect pg --name sales --set host=h --password-file "$B/pw" </dev/null)"; RC=$?
+check "exit 20 from the engine: DNS repaired, connect retried once, exit 0" \
+    "0 connect|REPAIRED|connect|" "$RC $(grep -E '^(connect|REPAIRED)' "$B/argv" | cut -d' ' -f1 | tr '\n' '|')"
+reset_bridge 0 0 21
+OUT="$(bridge cmd_connect pg --name sales --set host=h --password-file "$B/pw" </dev/null)"; RC=$?
+check "exit 21: the Java install is offered; declined, nothing retried" "21 1" "$RC $(grep -c '^connect' "$B/argv")"
+has "...the offer was made" "JAVA-ASKED" "$(cat "$B/argv")"
+reset_bridge 0
+OUT="$(bridge cmd_source remove sales --dry-run </dev/null)"
+check "source remove --dry-run passes the preview through" "remove sales --dry-run" "$(cat "$B/argv")"
+OUT="$(bridge cmd_source remove </dev/null)"; RC=$?
+check "source remove without a name: exit 2" "2" "$RC"
+OUT="$(bridge cmd_source bogus </dev/null)"; RC=$?
+check "an unknown action: exit 2" "2" "$RC"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

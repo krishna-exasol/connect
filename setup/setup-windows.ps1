@@ -409,6 +409,7 @@ try {
             foreach ($stale in @(
                 (Join-Path $kitSetupDir "lib"), (Join-Path $kitSetupDir "help"),
                 (Join-Path $kitSetupDir "core"), (Join-Path $kitSetupDir "preprocessor"),
+                (Join-Path $kitSetupDir "virtual-schemas"),
                 (Join-Path $script:ExakitHome "kit\mcp"), (Join-Path $script:ExakitHome "kit\sql"),
                 (Join-Path $script:ExakitHome "kit\skills"))) {
                 Remove-Item -Recurse -Force $stale -ErrorAction SilentlyContinue
@@ -419,7 +420,7 @@ try {
         # setup\core and setup\preprocessor are what `exakit update` reads to decide
         # whether this kit asks for setup this machine has not finished. Twin of
         # the same copy in kit_shared_steps.
-        foreach ($coreDir in @("core", "preprocessor")) {
+        foreach ($coreDir in @("core", "preprocessor", "virtual-schemas")) {
             Copy-ExakitAsset -Source (Join-Path $ScriptDir $coreDir) -Destination (Join-Path $kitSetupDir $coreDir)
         }
         # skills/ is not optional decoration: exakit skills, exakit

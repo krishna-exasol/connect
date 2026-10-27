@@ -3557,6 +3557,16 @@ exakit_data_table_build() {
 "
     _dtb_n=$(( _dtb_n + 1 ))
     EXAKIT_TABLE_ROW_LOCAL="$_dtb_n"
+    # An external source stays where it is and is queried through a virtual
+    # schema - the same wizard as `exakit connect`. Offered only where it can
+    # work: the module is loaded and the kit's pyexasol, which runs it, is
+    # installed (during a first install it is not yet, two steps later).
+    if command -v exakit_vs_available >/dev/null 2>&1 && exakit_vs_available; then
+        printf 'plain|Connect an external source (PostgreSQL, MySQL, SQL Server, Oracle, Snowflake)|0|idle|||||| \n' >> "$_dtb_f"
+        EXAKIT_TABLE_IDS="${EXAKIT_TABLE_IDS}external
+"
+        _dtb_n=$(( _dtb_n + 1 ))
+    fi
     printf 'plain|Skip|0|idle|||||| \n' >> "$_dtb_f"
     EXAKIT_TABLE_IDS="$EXAKIT_TABLE_IDS
 "
@@ -3609,6 +3619,7 @@ exakit_data_load_menu() {
     # taking this shell's animation with it.
     _menu_notes=""
     _menu_has_local=0
+    _menu_has_external=0
     EXAKIT_DEFER_ERRORS=""
     if [ "$EXAKIT_TABLE_LIVE" = 1 ]; then
         EXAKIT_DEFER_ERRORS="$EXAKIT_TABLE_STATE.fatal"
@@ -3621,6 +3632,10 @@ exakit_data_load_menu() {
                 # this row does is a QUESTION, and a question cannot be asked
                 # under a frame that is still repainting itself.
                 _menu_has_local=1
+                ;;
+            external)
+                # Questions too, so after the table closes - see below.
+                _menu_has_external=1
                 ;;
             *)
                 _kit_root="$(exakit_repo_root)" || _kit_root=""
@@ -3669,6 +3684,11 @@ exakit_data_load_menu() {
     # Nothing is lost by closing first. This row has no per-file progress to
     # show in that table anyway: the folder load draws its own one-line bar, and
     # the datasets above have already finished and been drawn.
+    if [ "$_menu_has_external" = 1 ]; then
+        printf '\n'
+        ( exakit_vs_connect_wizard ) || _menu_notes="${_menu_notes}info|Connect an external source any time with: exakit connect
+"
+    fi
     if [ "$_menu_has_local" = 1 ]; then
         printf '\n'
         ( exakit_load_local_file )
