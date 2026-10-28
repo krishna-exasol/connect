@@ -110,6 +110,15 @@ def jks(certs):
     return body + hashlib.sha1(b"Mighty Aphrodite" + body).digest()
 
 
+def class_arg(host, pem_text):
+    """The kit's TLS helper's constructor argument: "<host>|<cert>.<cert>",
+    each certificate as unpadded base64url DER - only [A-Za-z0-9_.|-] and the
+    host's own characters, so it survives the driver's ;-separated URL."""
+    ders = [base64.urlsafe_b64encode(ssl.PEM_cert_to_DER_cert(pem.strip() + "\n")).decode("ascii").rstrip("=")
+            for pem in certificates_from_text(pem_text)]
+    return "%s|%s" % (host.lower(), ".".join(ders))
+
+
 def url_value(pem):
     """The certificate as one URL parameter value: every byte percent-encoded
     except letters and digits, so '+', '/', '=' and the line breaks survive the

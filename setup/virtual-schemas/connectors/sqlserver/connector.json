@@ -72,6 +72,11 @@
         "require",
         "disable"
       ]
+    },
+    {
+      "name": "ca",
+      "label": "CA certificate file (PEM) - only for a private CA such as AWS RDS or Azure; Enter to skip",
+      "kind": "ca-file"
     }
   ],
   "auth": "password",
@@ -81,6 +86,7 @@
     "require": "encrypt=true;trustServerCertificate=true",
     "disable": "encrypt=false"
   },
+  "tls_class": "encrypt=true;trustServerCertificate=false;trustManagerClass=exakit.tls.PemTrustManager;trustManagerConstructorArg={tls_arg}",
   "vs_properties": {
     "CATALOG_NAME": "{database}",
     "SCHEMA_NAME": "{schema}"
@@ -88,6 +94,7 @@
   "notes": [
     "SQL Server login only; Windows authentication and Entra ID are not part of this connector.",
     "Exasol tested the jre8 build of mssql-jdbc 13.4.0; it runs on the Java 17 container.",
-    "No ca input (yet): mssql-jdbc reads trust only from a file, and on Exasol Personal no path reaches both readers - the adapter starts in / with the bucket at /buckets, the loader starts in / of the database container with the bucket at /exa/bucketfs (measured). And the loader's own CA store is empty (its Java's cacerts is an absolute symlink outside its root), so verify fails there for any CA until Exasol Personal fixes it."
+    "A CA (--set ca=<PEM file or bundle>) is checked by the kit's TLS helper class, named in the URL (trustManagerClass): mssql-jdbc reads trust only from a file, and on Exasol Personal no path reaches both the adapter (sandbox, /buckets) and the loader (/ of the database container, /exa/bucketfs). The helper trusts exactly the given certificates and checks the host name; it is compiled from setup/virtual-schemas/java/ by the database's own Java and staged beside the driver (a second JAR= for the loader). Verified against RDS SQL Server 2019.",
+    "Without ca, verify relies on the loader's own CA store, which is empty on Exasol Personal 2.3.0 (an absolute cacerts symlink outside its root): give a public CA's root with --set ca too."
   ]
 }

@@ -22,6 +22,7 @@ import plan as planner
 import sources
 import sql
 import tlsca
+import tlshelper
 
 PROBE = "EXAKIT_DNS_PROBE_V2"
 
@@ -153,8 +154,8 @@ class Engine(object):
             return None
         try:
             certs = tlsca.certificates(values["ca"])
-            if connector.get("tls_truststore"):
-                # A truststore holds the whole bundle; Java picks the signer.
+            if connector.get("tls_truststore") or connector.get("tls_class"):
+                # A truststore or the helper holds the whole bundle; Java picks the signer.
                 return "".join(certs)
             pem = tlsca.choose(certs, values["host"], values.get("port"), connector.get("ca_probe"), values["ca"])
         except tlsca.CaError as error:
@@ -241,11 +242,26 @@ class Engine(object):
             if made:
                 created["files"].append(dest)
             jars.append(self.runtime.bucket_sql(cid, "driver-" + driver_pin["version"], driver_pin["asset"]))
+        helper = None
+        if connector.get("tls_class"):
+            # Staged for every source of this connector, so the loader's
+            # settings.cfg never changes with which source uses a CA.
+            try:
+                helper = tlshelper.jar(self.db(), self.defs.root, self.cache.root)
+            except tlshelper.HelperError as error:
+                raise Failure(str(error), EXIT["failed"])
+            folder = "tls-helper-" + os.path.basename(os.path.dirname(helper))[:12]
+            dest = self.runtime.bucket_dir(cid, folder, tlshelper.JAR_NAME)
+            made = artifacts.stage_file(helper, dest)
+            self.store.add_consumer(dest, artifacts.sha256_file(helper), name, made)
+            if made:
+                created["files"].append(dest)
+            jars.append(self.runtime.bucket_sql(cid, folder, tlshelper.JAR_NAME))
         self.emit("OK", "Adapter %s and driver %s verified and staged" % (adapter_pin["version"], driver_pin["version"]))
         etl = connector.get("etl")
         if etl:
             loader = self.runtime.loader_dir(etl["drivername"])
-            settings = artifacts.settings_cfg(etl, driver_pin["asset"])
+            settings = artifacts.settings_cfg(etl, driver_pin["asset"], [tlshelper.JAR_NAME] if helper else [])
             cfg = os.path.join(loader, "settings.cfg")
             if os.path.isfile(cfg):
                 with open(cfg, encoding="utf-8") as handle:
@@ -264,6 +280,12 @@ class Engine(object):
                 created["files"].append(os.path.join(loader, driver_pin["asset"]))
             if made_cfg:
                 created["files"].append(cfg)
+            if helper:
+                dest = os.path.join(loader, tlshelper.JAR_NAME)
+                made = artifacts.stage_file(helper, dest)
+                self.store.add_consumer(dest, artifacts.sha256_file(helper), name, made)
+                if made:
+                    created["files"].append(dest)
             self.emit("OK", "Loader driver %s registered for IMPORT FROM JDBC" % etl["drivername"])
         return jars
 

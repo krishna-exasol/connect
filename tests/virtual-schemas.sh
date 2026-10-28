@@ -604,25 +604,73 @@ db '{"sources": {"my.example.com": {"tables": ["rental"], "fail": "tls"}}}'
 run_secret "$SECRET" connect mysql --name my $MY_SET --set ca="$CA/bundle.pem" --secret-stdin
 check "a MySQL connect that fails leaves no truststore behind" "1 gone gone" \
     "$RC $([ -e "$EXA/bucketfs/bfsdefault/default/exakit/vs/tls/my.jks" ] && echo kept || echo gone) $([ -e "$EXA/jdbc/MYSQL/buckets" ] && echo kept || echo gone)"
-# SQL Server: its loader starts in / of the database container (measured), so
-# no one path reaches both readers; it takes no ca rather than a broken one.
-run plan mssql --name ms --set host=ms.example.com --set database=erp --set user=reader --set ca="$CA/bundle.pem"
-check "SQL Server does not offer ca (it could not work there yet): exit 2" "2" "$RC"
-has "...named as an unknown input" "ca is not an input of sqlserver" "$OUT"
+printf '\n== a private CA for SQL Server: the kit'"'"'s TLS helper class ==\n'
+# Measured on Exasol Personal: the SQL Server loader starts in / of the
+# database container, so no file path reaches both readers; mssql-jdbc's
+# trustManagerClass carries the CA in the URL instead. The helper is built by
+# the database's Java (faked here) from setup/virtual-schemas/java/.
+MS_SET="--set host=ms.example.com --set database=erp --set user=reader"
+db '{"sources": {"ms.example.com": {"tables": ["ORDERS"]}}}'
+rm -rf "$HOME_K/cache/virtual-schemas/tls-helper"
+run plan mssql --name ms $MS_SET --set ca="$CA/bundle.pem"
+has "the plan names the helper and the host check" "(2 certificates, checked with the host name by the kit's TLS helper class)" "$OUT"
+run_secret "$SECRET" connect mssql --name ms $MS_SET --set ca="$CA/bundle.pem" --secret-stdin
+check "SQL Server with a CA bundle: exit 0 (no handshake from this computer: ms.example.com is not reachable)" "0" "$RC"
+URL="$(dbq 'd["connections"]["EXAKIT_SRC_MS"]["url"]')"
+has "...the URL names the helper class, with the host it must check" \
+    "encrypt=true;trustServerCertificate=false;trustManagerClass=exakit.tls.PemTrustManager;trustManagerConstructorArg=ms.example.com|" "$URL"
+check "...both certificates, as base64url DER, and nothing a ;-separated URL would split" "2 ok" \
+    "$(printf '%s' "${URL#*trustManagerConstructorArg=ms.example.com|}" | awk -F. '{print NF}') $(printf '%s' "${URL#*trustManagerConstructorArg=}" | grep -q '^[A-Za-z0-9_.|-]*$' && echo ok || echo bad)"
+lacks "...and no truststore file" "trustStore=" "$URL"
+MS_ADAPTER="$(dbq '[s for s in d["statements"] if "ADAPTER SCRIPT" in s and "ADAPTER_MS" in s][0]')"
+has "...the helper jar is on the adapter's classpath" "/exakit/vs/sqlserver/tls-helper-" "$MS_ADAPTER"
+check "...and on the loader's, as a second JAR= beside the driver" "JAR=exakit-tls.jar yes" \
+    "$(grep -x 'JAR=exakit-tls.jar' "$EXA/jdbc/SQLSERVER/settings.cfg") $([ -f "$EXA/jdbc/SQLSERVER/exakit-tls.jar" ] && echo yes || echo no)"
+check "...built once in the database, and its build script dropped" "1 no" \
+    "$(dbq 'd.get("tls_builds", 0)') $(dbq '"EXAKIT_VS.EXAKIT_TLS_BUILD" in d["scripts"]' | tr A-Z a-z | sed 's/true/yes/;s/false/no/')"
+python3 - "$STATE" <<'PYS'
+import json, sys
+d = json.load(open(sys.argv[1])); d["sources"]["ms2.example.com"] = {"tables": ["ITEMS"]}; json.dump(d, open(sys.argv[1], "w"))
+PYS
+run_secret "$SECRET" connect mssql --name ms2 --set host=ms2.example.com --set database=erp --set user=reader --secret-stdin
+check "a second SQL Server source (no ca): exit 0, the cached helper is reused, not rebuilt" "0 1" "$RC $(dbq 'd.get("tls_builds", 0)')"
+has "...it verifies with the default store, as before" "encrypt=true;trustServerCertificate=false;hostNameInCertificate=ms2.example.com" "$(dbq 'd["connections"]["EXAKIT_SRC_MS2"]["url"]')"
+run_secret "$NEWSECRET" reauth ms --secret-stdin
+has "reauth keeps the helper and the certificates in the URL" "trustManagerConstructorArg=ms.example.com|" "$(dbq 'd["connections"]["EXAKIT_SRC_MS"]["url"]')"
+run remove ms
+check "removing one source keeps the helper the other still uses" "0 yes" "$RC $([ -f "$EXA/jdbc/SQLSERVER/exakit-tls.jar" ] && echo yes || echo no)"
+run remove ms2
+check "the last one out removes the helper and the loader folder" "0 gone" "$RC $([ -e "$EXA/jdbc/SQLSERVER" ] && echo kept || echo gone)"
+rm -rf "$HOME_K/cache/virtual-schemas/tls-helper"
+db '{"sources": {"ms.example.com": {"tables": ["ORDERS"]}}, "tls_compiler": false}'
+run_secret "$SECRET" connect mssql --name ms $MS_SET --set ca="$CA/bundle.pem" --secret-stdin
+check "no Java compiler in the database: exit 1, said so, nothing kept" "1 {} gone" \
+    "$RC $(dbq 'd["connections"]') $([ -e "$EXA/jdbc/SQLSERVER" ] && echo kept || echo gone)"
+has "...the reason" "the kit's TLS helper could not be built in the database: no Java compiler" "$OUT"
+check "the helper jar is deterministic: the same classes give the same bytes" "same" \
+    "$(python3 - "$ROOT" <<'PYD'
+import sys; sys.path.insert(0, sys.argv[1] + "/setup/virtual-schemas/engine")
+import tlshelper
+a = tlshelper.package({"exakit/tls/PemTrustManager.class": b"x"}); b = tlshelper.package({"exakit/tls/PemTrustManager.class": b"x"})
+print("same" if a == b else "differs")
+PYD
+)"
+check "the helper's source ships as ASCII text, no binary" "0" \
+    "$(LC_ALL=C grep -c '[^[:print:][:space:]]' "$ROOT/setup/virtual-schemas/java/exakit/tls/PemTrustManager.java")"
 E6="$(python3 - "$ROOT" <<'PYE'
 import json, sys
 sys.path.insert(0, sys.argv[1] + "/setup/virtual-schemas/engine")
 import lifecycle
 load = lambda c: json.load(open(sys.argv[1] + "/setup/virtual-schemas/connectors/%s/connector.json" % c))
 text = "ETL-5402: ... Error: (internal_error) Unexpected error: java.security.InvalidAlgorithmParameterException: the trustAnchors parameter must be non-empty."
-print(lifecycle.tls_remedy(text, load("mysql")))
 print(lifecycle.tls_remedy(text, load("sqlserver")))
+print(lifecycle.tls_remedy(text, load("oracle")))
 PYE
 )"
 has "the loader's empty CA store (measured, Exasol Personal) is explained, with --set ca where it exists" \
     "has no CA store of its own (an Exasol Personal issue)" "$(printf '%s\n' "$E6" | sed -n 1p)"
-has "...for MySQL: give the CA" "give the CA as PEM with --set ca=<file>" "$(printf '%s\n' "$E6" | sed -n 1p)"
-has "...for SQL Server: says it cannot take one yet, and what require would mean" "cannot take a CA yet - tls=require encrypts without verifying" "$(printf '%s\n' "$E6" | sed -n 2p)"
+has "...for SQL Server now: give the CA" "give the CA as PEM with --set ca=<file>" "$(printf '%s\n' "$E6" | sed -n 1p)"
+has "...for a connector without ca yet: says so, and what require would mean" "cannot take a CA yet - tls=require encrypts without verifying" "$(printf '%s\n' "$E6" | sed -n 2p)"
 
 printf '\n== the hidden prompt hides from the first keystroke ==\n'
 # Measured: with the prompt printed first and echo turned off after it, input

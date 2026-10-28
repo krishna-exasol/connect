@@ -102,6 +102,16 @@ class Fake(object):
             if m.group(1) in doc["unreachable"]:
                 return [{"R": "tcp 10.0.0.9 SocketTimeoutException"}]
             return [{"R": "ok 10.0.0.9"}]
+        if sql.startswith("SELECT EXAKIT_VS.EXAKIT_TLS_BUILD("):
+            # The kit's TLS helper, compiled by the database's Java: a stand-in
+            # class, or the compiler's absence (tls_compiler false).
+            if "EXAKIT_VS.EXAKIT_TLS_BUILD" not in doc["scripts"]:
+                raise Exception("function EXAKIT_VS.EXAKIT_TLS_BUILD not found")
+            doc["tls_builds"] = doc.get("tls_builds", 0) + 1
+            if doc.get("tls_compiler") is False:
+                return [{"NAME": "ERROR", "B64": "no Java compiler in the database's Java container"}]
+            import base64
+            return [{"NAME": "exakit/tls/PemTrustManager.class", "B64": base64.b64encode(b"\xca\xfe\xba\xbe-stand-in").decode()}]
         m = re.search(r"FROM EXA_DBA_VIRTUAL_TABLES WHERE TABLE_SCHEMA = '([^']+)'", sql)
         if m:
             vs = doc["virtual"].get(m.group(1))
@@ -158,6 +168,9 @@ class Fake(object):
         m = re.match(r'DROP ADAPTER SCRIPT "([^"]+)"\."([^"]+)"', sql)
         if m:
             doc["scripts"] = [s for s in doc["scripts"] if s != "%s.%s" % m.groups()]
+            return
+        if sql == "DROP SCRIPT EXAKIT_VS.EXAKIT_TLS_BUILD":
+            doc["scripts"] = [s for s in doc["scripts"] if s != "EXAKIT_VS.EXAKIT_TLS_BUILD"]
             return
         m = re.match(r'DROP CONNECTION (?:IF EXISTS )?"([^"]+)"', sql)
         if m:

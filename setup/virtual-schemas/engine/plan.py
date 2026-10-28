@@ -178,6 +178,8 @@ def jdbc_url(connector, values, extra=None):
             fields["tls"] = connector["tls_ca"].format(ca_pem=tlsca.url_value(fields["ca_pem"]))
         elif fields.get("truststore") and connector.get("tls_truststore"):
             fields["tls"] = connector["tls_truststore"].format(**fields)
+        elif fields.get("ca_pem") and connector.get("tls_class"):
+            fields["tls"] = connector["tls_class"].format(tls_arg=tlsca.class_arg(values["host"], fields["ca_pem"]))
         else:
             fields["tls"] = connector["tls"][values.get("tls", "verify")].format(**fields)
     return connector["url"].format(**fields)
@@ -209,6 +211,9 @@ def describe(defs, connector_id, name, values, runtime, cache, store):
         count = len(tlsca.certificates(values["ca"]))
         if connector.get("tls_truststore"):
             how = "%d certificate%s, in a truststore for the adapter and the loader" % (count, "" if count == 1 else "s")
+        elif connector.get("tls_class"):
+            how = ("%d certificate%s, checked with the host name by the kit's TLS helper class"
+                   % (count, "" if count == 1 else "s"))
         elif count == 1:
             how = "1 certificate"
         else:

@@ -140,10 +140,13 @@ def stage_zip(source, dest_dir):
     return sorted(jars)
 
 
-def settings_cfg(etl, jar_name):
-    """The loader's settings.cfg: the documented keys, LF endings, a final blank line."""
+def settings_cfg(etl, jar_name, extra_jars=()):
+    """The loader's settings.cfg: the documented keys, LF endings, a final blank
+    line. Extra JAR= lines put more jars on the driver's classpath (measured:
+    the loader loads the kit's TLS helper from a second one)."""
     lines = ["DRIVERNAME=%s" % etl["drivername"], "PREFIX=%s" % etl["prefix"],
              "DRIVERMAIN=%s" % etl["main"], "FETCHSIZE=100000", "INSERTSIZE=-1", "JAR=%s" % jar_name]
+    lines += ["JAR=%s" % jar for jar in extra_jars]
     if etl.get("nosecurity"):
         lines.append("NOSECURITY=YES")
     return "\n".join(lines) + "\n\n"
