@@ -12,6 +12,8 @@ import json
 import os
 import re
 
+import tlsca
+
 KINDS = {
     "host": re.compile(r"^(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"
                        r"|^\d{1,3}(\.\d{1,3}){3}$|^\[?[0-9A-Fa-f:]+\]?$"),
@@ -122,6 +124,13 @@ def validate_inputs(connector, given):
             if raw not in spec["choices"]:
                 problems.append("%s must be one of %s, not %r" % (name, ", ".join(spec["choices"]), raw))
                 continue
+        elif kind == "ca-file":
+            raw = os.path.abspath(os.path.expanduser(raw))
+            try:
+                tlsca.certificates(raw)
+            except tlsca.CaError as error:
+                problems.append(str(error))
+                continue
         elif kind in KINDS and not KINDS[kind].match(raw):
             problems.append("%s=%r is not a valid %s" % (name, raw, kind))
             continue
@@ -133,6 +142,10 @@ def validate_inputs(connector, given):
             # a URL, and the route probe resolves the bare form.
             raw = raw.strip("[]")
         values[name] = raw.upper() if spec.get("upper") else raw
+    if values.get("ca") and values.get("tls", "verify") != "verify":
+        # A CA only means something to a check; with require or disable it
+        # would read as protection that is not there.
+        problems.append("ca is used to verify the server, so it needs tls=verify (not %s)" % values["tls"])
     if problems:
         raise PlanError("; ".join(problems))
     return values
@@ -154,12 +167,17 @@ def source_host(connector, values):
 
 
 def jdbc_url(connector, values, extra=None):
+    """The source's JDBC URL. extra["ca_pem"] is the one certificate chosen
+    from the `ca` input (tlsca.choose); with it, verify trusts that CA."""
     fields = dict(values)
     if ":" in fields.get("host", ""):
         fields["host"] = "[%s]" % fields["host"]
     fields.update(extra or {})
     if connector.get("tls"):
-        fields["tls"] = connector["tls"][values.get("tls", "verify")].format(**fields)
+        if fields.get("ca_pem") and connector.get("tls_ca"):
+            fields["tls"] = connector["tls_ca"].format(ca_pem=tlsca.url_value(fields["ca_pem"]))
+        else:
+            fields["tls"] = connector["tls"][values.get("tls", "verify")].format(**fields)
     return connector["url"].format(**fields)
 
 
@@ -185,6 +203,12 @@ def describe(defs, connector_id, name, values, runtime, cache, store):
     steps = ["verify Java and its DNS in the database (resolve %s)" % (source_host(connector, values) or "the source")]
     if connector.get("etl"):
         steps.append("register loader driver %s" % connector["etl"]["drivername"])
+    if values.get("ca"):
+        count = len(tlsca.certificates(values["ca"]))
+        steps.append("trust the CA in %s for this source only (%s)"
+                     % (values["ca"], "1 certificate" if count == 1 else
+                        "%d certificates; a verified handshake from this computer picks the one that signs %s"
+                        % (count, source_host(connector, values))))
     steps += ["create CONNECTION %s" % names["connection"],
               "create adapter script %s.%s" % (names["script_schema"], names["script"]),
               "create virtual schema %s" % names["schema"],

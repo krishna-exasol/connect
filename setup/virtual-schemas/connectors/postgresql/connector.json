@@ -72,6 +72,11 @@
         "require",
         "disable"
       ]
+    },
+    {
+      "name": "ca",
+      "label": "CA certificate file (PEM) - only for a private CA such as AWS RDS or Azure; Enter to skip",
+      "kind": "ca-file"
     }
   ],
   "auth": "password",
@@ -81,12 +86,14 @@
     "require": "sslmode=require",
     "disable": "sslmode=disable"
   },
+  "tls_ca": "sslmode=verify-full&sslfactory=org.postgresql.ssl.SingleCertValidatingFactory&sslfactoryarg={ca_pem}",
+  "ca_probe": "postgres",
   "vs_properties": {
     "CATALOG_NAME": "{database}",
     "SCHEMA_NAME": "{schema}"
   },
   "notes": [
     "The adapter JAR already contains pgJDBC 42.7.14; the driver pin is the same version so the two copies never disagree.",
-    "verify checks the server certificate AND its host name against the JVM's public CAs. A server with a private CA needs that CA trusted; require only encrypts."
+    "verify checks the server certificate AND its host name against the JVM's public CAs. A server with a private CA (AWS RDS, Azure, a company CA) is verified against it with --set ca=<PEM file or bundle>: the one certificate that signs the server travels in the URL (SingleCertValidatingFactory), because the loader's Java sandbox denies file reads. require only encrypts."
   ]
 }

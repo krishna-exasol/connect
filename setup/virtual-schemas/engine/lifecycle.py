@@ -14,11 +14,13 @@ The EXAKIT_VS schema also holds the DNS probe, and is dropped with the last sour
 """
 
 import os
+import re
 
 import artifacts
 import plan as planner
 import sources
 import sql
+import tlsca
 
 PROBE = "EXAKIT_DNS_PROBE_V2"
 
@@ -38,6 +40,23 @@ REMEDY_FOR = {
     "nojava": "the Java language container is not installed: exakit connect installs it, or run: exasol slc install java",
     "error": "see the log: exakit logs",
 }
+
+
+def tls_remedy(message, connector):
+    """The specific fix for a TLS failure, when the driver's words say which
+    one it is; None leaves the general remedy. Both cases were measured live
+    against RDS: the CA a JVM does not hold, and a database clock left behind
+    by a laptop that hibernated."""
+    text = str(message)
+    if re.search(r"validity check failed|NotYetValid|not yet valid|CertificateExpired|has expired", text, re.I):
+        return ("a certificate is outside its validity dates by the database's clock; if this computer slept or "
+                "hibernated, the database clock may be behind - restart it (exakit stop, then exakit start) and retry")
+    if (re.search(r"PKIX path building failed|unable to find valid certification path", text, re.I)
+            and any(spec["kind"] == "ca-file" for spec in connector["inputs"])):
+        return ("the database does not trust the certificate authority that signed the source's certificate - "
+                "managed databases (AWS RDS, Azure) and company servers use their own; download that CA as PEM "
+                "and give it with --set ca=<file>")
+    return None
 
 
 class Failure(Exception):
@@ -115,6 +134,23 @@ class Engine(object):
         self.ensure_probe()
         rows = self.db().query("SELECT EXAKIT_VS.%s(%s, %d) AS R" % (PROBE, sql.literal(host), int(port)))
         return (rows[0].get("R") if rows else "") or ""
+
+    def choose_ca(self, connector, values):
+        """The one certificate the source's CONNECTION will trust, or None
+        when no `ca` was given. Fails as kind tls: a wrong CA is a TLS problem."""
+        if not values.get("ca"):
+            return None
+        try:
+            certs = tlsca.certificates(values["ca"])
+            pem = tlsca.choose(certs, values["host"], values.get("port"), connector.get("ca_probe"), values["ca"])
+        except tlsca.CaError as error:
+            failure = Failure("%s; nothing was kept" % error, EXIT["failed"], "tls")
+            failure.complete = True  # it already says what to do
+            raise failure
+        if len(certs) > 1:
+            self.emit("OK", "Picked the certificate in %s that signs %s (1 of %d, verified handshake)"
+                      % (values["ca"], values["host"], len(certs)))
+        return pem
 
     def require_route(self, connector, values, name):
         host = planner.source_host(connector, values)
@@ -280,8 +316,9 @@ class Engine(object):
                             raise Failure("%s %s already exists in the database and is not a source the kit set up; "
                                           "it was left unchanged" % (kind, label), EXIT["conflict"])
                 self.require_route(connector, values, name)
+                ca_pem = self.choose_ca(connector, values)
                 jars = self.stage(connector, name, created)
-                url = planner.jdbc_url(connector, values)
+                url = planner.jdbc_url(connector, values, {"ca_pem": ca_pem})
                 self.create_connection(names, url, values.get("user"), secret, replace=reconnect)
                 if not reconnect:
                     made("connection")
@@ -316,7 +353,12 @@ class Engine(object):
                 # commands do not apply: nothing was left behind, and the fix is
                 # the same command with corrected input.
                 remedy = REMEDY_FOR.get(kind, REMEDY_FOR["error"]).format(name=name)
-                if not reconnect and kind in ("auth", "tls", "unreachable", "nohost"):
+                if getattr(error, "complete", False):
+                    raise error
+                specific = tls_remedy(error, connector) if kind == "tls" else None
+                if specific:
+                    remedy = "the source's certificate did not verify; nothing was kept - %s, then connect again" % specific
+                elif not reconnect and kind in ("auth", "tls", "unreachable", "nohost"):
                     remedy = {"auth": "the source rejected the credentials; nothing was kept - correct them and run the same exakit connect again",
                               "tls": "the source's certificate or host name did not verify; nothing was kept - fix the server certificate or choose tls=require knowingly, then connect again",
                               "unreachable": "the source did not answer from inside the database; nothing was kept - check host, port, firewall and VPN (a source on this computer must listen beyond 127.0.0.1), then connect again",
@@ -328,9 +370,14 @@ class Engine(object):
                 raise Failure("%s (%s)" % (error, remedy), code, kind)
             pins = {"adapter": connector["adapter"]["sha256"], "driver": connector["driver"]["sha256"],
                     "adapter_version": connector["adapter"]["version"], "driver_version": connector["driver"]["version"]}
-            self.store.save_config(name, {"schema_version": 1, "id": name, "connector": connector_id,
-                                          "profile": connector["profile"], "inputs": values, "objects": names,
-                                          "created_at": self.store.config(name).get("created_at") if reconnect else sources.now()})
+            record = {"schema_version": 1, "id": name, "connector": connector_id,
+                      "profile": connector["profile"], "inputs": values, "objects": names,
+                      "created_at": self.store.config(name).get("created_at") if reconnect else sources.now()}
+            if ca_pem:
+                # Kept with the source, so reauth rebuilds the same URL even
+                # after the file it came from has moved.
+                record["tls_ca"] = ca_pem
+            self.store.save_config(name, record)
             self.store.save_status(name, {"status": "ready", "pins": pins, "tables": len(tables),
                                           "last_check": {"at": sources.now(), "outcome": "ok",
                                                          "evidence": "metadata and a bounded read" if read else "metadata"}})
@@ -391,6 +438,11 @@ class Engine(object):
             kind = getattr(error, "kind", "error")
             status = self.record_check(name, "failed", str(error), kind)
             remedy = REMEDY_FOR.get(kind, REMEDY_FOR["error"]).format(name=name)
+            specific = tls_remedy(error, connector) if kind == "tls" else None
+            if specific:
+                remedy = "%s; then: exakit source check %s" % (specific.replace(
+                    "give it with --set ca=<file>", "reconnect with it: exakit source disconnect %s --yes, then "
+                    "exakit connect %s --name %s --set ca=<file>" % (name, config["connector"], name)), name)
             # Said here, not only in the result: a failed check exits 1, and
             # the reason has to reach a reader who gets no RESULT line.
             self.emit("FAIL", "%s is %s: %s" % (name, status, error))
@@ -408,7 +460,7 @@ class Engine(object):
         if not secret:
             raise Failure("reauth needs the new credential on standard input", EXIT["input"])
         connector = self.defs.connector(config["connector"])
-        url = planner.jdbc_url(connector, config["inputs"])
+        url = planner.jdbc_url(connector, config["inputs"], {"ca_pem": config.get("tls_ca")})
         with self.store.lock():
             # Tried before it replaces anything: a typo here must not break a
             # source that still works. The new credential goes into a pending

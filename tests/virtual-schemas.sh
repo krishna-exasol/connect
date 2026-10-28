@@ -441,6 +441,115 @@ check "a gated connector stops the wizard with the engine's exit 5" "5 resolve b
 has "...and the reason is shown" "not available yet" "$OUT"
 rm -f "$B/gated"
 
+printf '\n== a private CA (AWS RDS, Azure, a company CA) is trusted, not skipped ==\n'
+# Measured live against RDS PostgreSQL 18 (ap-south-1): tls=verify fails with
+# PKIX because the JVM does not hold Amazon's RDS roots. The certificate goes
+# into the URL, because the loader's sandbox denies file reads.
+CA="$WORK/ca"; mkdir -p "$CA"
+mkca() {
+    openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj "/CN=$1" -keyout "$CA/$1.key" -out "$CA/$1.pem" \
+        -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" >/dev/null 2>&1
+}
+mkca TestRootA; mkca TestRootB; mkca TestRootC
+printf 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=IP:127.0.0.1\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n' > "$CA/leaf.ext"
+openssl req -newkey rsa:2048 -nodes -subj "/CN=127.0.0.1" -keyout "$CA/server.key" -out "$CA/server.csr" >/dev/null 2>&1
+openssl x509 -req -in "$CA/server.csr" -CA "$CA/TestRootB.pem" -CAkey "$CA/TestRootB.key" -CAcreateserial -days 30 \
+    -extfile "$CA/leaf.ext" -out "$CA/server.pem" >/dev/null 2>&1
+cat "$CA/TestRootA.pem" "$CA/TestRootB.pem" > "$CA/bundle.pem"
+cat "$CA/TestRootA.pem" "$CA/TestRootC.pem" > "$CA/wrong.pem"
+printf 'not a certificate\n' > "$CA/garbage.pem"
+CHOICE="$(python3 - "$ROOT" "$CA" <<'PYCA'
+import os, socket, ssl, sys, threading
+sys.path.insert(0, sys.argv[1] + "/setup/virtual-schemas/engine")
+import tlsca
+ca = sys.argv[2]
+# A server that answers like PostgreSQL: SSLRequest, "S", then TLS.
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(os.path.join(ca, "server.pem"), os.path.join(ca, "server.key"))
+lsock = socket.socket(); lsock.bind(("127.0.0.1", 0)); lsock.listen(32); port = lsock.getsockname()[1]
+def serve():
+    while True:
+        try:
+            conn, _ = lsock.accept()
+            conn.recv(8); conn.sendall(b"S")
+            with ctx.wrap_socket(conn, server_side=True) as tls:
+                tls.recv(1)
+        except Exception:
+            pass
+threading.Thread(target=serve, daemon=True).start()
+pem = lambda n: tlsca.certificates(os.path.join(ca, n))
+def run(certs, p=port, name="bundle.pem"):
+    try:
+        got = tlsca.choose(certs, "127.0.0.1", p, "postgres", name, timeout=3)
+        return "B" if got == pem("TestRootB.pem")[0] else "A" if got == pem("TestRootA.pem")[0] else "?"
+    except tlsca.CaError as e:
+        return "ERR " + str(e)
+print(len(pem("bundle.pem")))
+print(run(pem("bundle.pem")))                               # B, found by handshake though A comes first
+print(run(pem("TestRootA.pem")))                            # a single certificate is taken as given
+print(run(pem("wrong.pem"), name="wrong.pem"))              # nothing in it signs the server
+free = socket.socket(); free.bind(("127.0.0.1", 0)); closed = free.getsockname()[1]; free.close()
+print(run(pem("bundle.pem"), p=closed))                     # cannot tell without reaching it
+try:
+    tlsca.certificates(os.path.join(ca, "garbage.pem")); print("read")
+except tlsca.CaError as e:
+    print("ERR " + str(e))
+print(tlsca.url_value(pem("TestRootB.pem")[0])[:40])
+PYCA
+)"
+check "a two-root bundle is read as two certificates" "2" "$(printf '%s\n' "$CHOICE" | sed -n 1p)"
+check "...the one that signs the server is picked by a verified handshake, not by position" "B" "$(printf '%s\n' "$CHOICE" | sed -n 2p)"
+check "a single certificate is taken as given (the database's own check judges it)" "A" "$(printf '%s\n' "$CHOICE" | sed -n 3p)"
+has "a bundle with no signer is refused, and says so" "none of the 2 certificates in wrong.pem signs 127.0.0.1" "$(printf '%s\n' "$CHOICE" | sed -n 4p)"
+has "a bundle against an unreachable server asks for the one root" "give the one root certificate instead" "$(printf '%s\n' "$CHOICE" | sed -n 5p)"
+has "a file with no PEM certificate is refused" "holds no PEM certificate" "$(printf '%s\n' "$CHOICE" | sed -n 6p)"
+check "the certificate survives URL decoding: only letters, digits and %XX (and -._~)" "-----BEGIN%20CERTIFICATE-----%0AMII" \
+    "$(printf '%s\n' "$CHOICE" | sed -n 7p | cut -c1-35)"
+
+db '{"sources": {"rds.example.com": {"tables": ["RENTAL"]}}}'
+RDS_SET="--set host=rds.example.com --set database=pagila --set user=reader"
+run plan pg --name rds $RDS_SET --set ca="$CA/missing.pem"
+check "a CA file that is not there: exit 2" "2" "$RC"; has "...named" "cannot be read" "$OUT"
+run plan pg --name rds $RDS_SET --set ca="$CA/TestRootA.pem" --set tls=require
+check "a CA with tls=require is refused: it would read as a check that is not made" "2" "$RC"
+has "...and says why" "needs tls=verify (not require)" "$OUT"
+run plan pg --name rds $RDS_SET --set ca="$CA/bundle.pem"
+has "the plan says which CA is trusted, and how one is chosen from a bundle" "trust the CA in $CA/bundle.pem for this source only (2 certificates" "$OUT"
+run_secret "$SECRET" connect pg --name rds $RDS_SET --set ca="$CA/TestRootA.pem" --secret-stdin
+check "connect with a CA: exit 0" "0" "$RC"
+URL="$(dbq 'd["connections"]["EXAKIT_SRC_RDS"]["url"]')"
+has "...the URL verifies host and chain against that CA" "?sslmode=verify-full&sslfactory=org.postgresql.ssl.SingleCertValidatingFactory&sslfactoryarg=-----BEGIN%20CERTIFICATE-----%0A" "$URL"
+lacks "...and never falls back to the JVM's public CAs" "DefaultJavaSSLFactory" "$URL"
+check "...the certificate is kept with the source" "yes" \
+    "$(python3 -c 'import json,sys; print("yes" if "BEGIN CERTIFICATE" in json.load(open(sys.argv[1])).get("tls_ca", "") else "no")' "$HOME_K/sources/rds/config.json")"
+run show rds; lacks "...but show does not dump it" "BEGIN CERTIFICATE" "$OUT"
+mv "$CA/TestRootA.pem" "$CA/moved.pem"
+run_secret "$NEWSECRET" reauth rds --secret-stdin
+check "reauth after the CA file moved: the kept certificate is used, exit 0" "0" "$RC"
+has "...in the replaced CONNECTION too" "SingleCertValidatingFactory" "$(dbq 'd["connections"]["EXAKIT_SRC_RDS"]["url"]')"
+run remove rds; check "...and it removes cleanly" "0" "$RC"
+
+REMEDIES="$(python3 - "$ROOT" <<'PYR'
+import json, sys
+sys.path.insert(0, sys.argv[1] + "/setup/virtual-schemas/engine")
+import lifecycle
+pg = json.load(open(sys.argv[1] + "/setup/virtual-schemas/connectors/postgresql/connector.json"))
+sf = json.load(open(sys.argv[1] + "/setup/virtual-schemas/connectors/snowflake/connector.json"))
+pkix = "E-VSPG-3: Unable to create PostgreSQL remote metadata reader. Caused by: 'SSL error: (certificate_unknown) PKIX path building failed: sun.security.provider.certpath.SunCertPathBuilderException: unable to find valid certification path to requested target'"
+clock = "E-VSPG-3: ... 'SSL error: (bad_certificate) PKIX path validation failed: java.security.cert.CertPathValidatorException: validity check failed'"
+print(lifecycle.tls_remedy(pkix, pg))
+print(lifecycle.tls_remedy(clock, pg))
+print(lifecycle.tls_remedy(pkix, sf))
+PYR
+)"
+has "an untrusted CA (measured on RDS) points at --set ca" "download that CA as PEM and give it with --set ca=<file>" "$(printf '%s\n' "$REMEDIES" | sed -n 1p)"
+has "a validity failure (measured: the clock after the laptop hibernated) points at the restart" "exakit stop, then exakit start" "$(printf '%s\n' "$REMEDIES" | sed -n 2p)"
+check "...a connector without a ca input is not told to use one" "None" "$(printf '%s\n' "$REMEDIES" | sed -n 3p)"
+db '{"sources": {"rds.example.com": {"tables": ["RENTAL"], "fail": "tls"}}}'
+run_secret "$SECRET" connect pg --name rds $RDS_SET --secret-stdin
+check "connect to a private-CA source without ca: exit 1, nothing kept" "1 {}" "$RC $(dbq 'd["connections"]')"
+has "...and the fix is named" "give it with --set ca=<file>, then connect again" "$OUT"
+
 printf '\n== the hidden prompt hides from the first keystroke ==\n'
 # Measured: with the prompt printed first and echo turned off after it, input
 # typed the moment the prompt appeared was echoed in clear (expect, typing at
