@@ -2921,6 +2921,51 @@ exakit_forget_db_reachable() {
     return 0
 }
 
+# exakit_db_clock_skew — how far the database's clock is from this computer's,
+# in whole seconds (negative: the database is behind). Non-zero, and nothing
+# printed, when the database cannot be asked.
+#
+# MEASURED ON EXASOL PERSONAL (macOS): the database runs in a VM whose clock
+# does not catch up after the Mac sleeps or hibernates - 2 h 26 min behind
+# after a night, 1 h 25 min and 32 min after shorter sleeps. Nothing else says
+# so: queries answer, and the first symptom is a remote source's certificate
+# that is "not yet valid" by the database's clock, or a scheduled job that
+# runs late. A restart resyncs it. POSIX_TIME() is the epoch whatever the
+# session time zone (it agreed with a Java UDF's System.currentTimeMillis to
+# 0.1 s), and the local reads either side of the query bound the round trip.
+# ⇄ twin: Get-ExakitDbClockSkew in setup/lib/exapump.ps1.
+EXAKIT_CLOCK_SKEW_LIMIT="${EXAKIT_CLOCK_SKEW_LIMIT:-120}"
+exakit_db_clock_skew() {
+    [ -n "$(manifest_get components.exapump.profile 2>/dev/null)" ] || return 1
+    _dcs_before="$(date +%s)"
+    _dcs_out="$(exakit_run_bounded "${EXAKIT_CLOCK_SQL_TIMEOUT:-10}" "$(exapump_cli)" sql -p "$EXAKIT_EXAPUMP_PROFILE" \
+        "SELECT 'EXAKIT_CLOCK=' || FLOOR(POSIX_TIME()) AS T" 2>/dev/null)" || return 1
+    _dcs_after="$(date +%s)"
+    _dcs_db="$(printf '%s\n' "$_dcs_out" | sed -n 's/^.*EXAKIT_CLOCK=\([0-9][0-9]*\).*$/\1/p' | head -1)"
+    [ -n "$_dcs_db" ] || return 1
+    printf '%s\n' $(( _dcs_db - (_dcs_before + _dcs_after) / 2 ))
+}
+
+# exakit_clock_skew_words <seconds> — "32 min behind", "1 h 25 min ahead":
+# the skew as the screen and the hint say it.
+exakit_clock_skew_words() {
+    _csw_s="$1"
+    _csw_dir="ahead"
+    if [ "$_csw_s" -lt 0 ]; then _csw_s=$(( -_csw_s )); _csw_dir="behind"; fi
+    _csw_m=$(( (_csw_s + 30) / 60 ))
+    if [ "$_csw_m" -ge 60 ]; then
+        printf '%s h %s min %s\n' $(( _csw_m / 60 )) $(( _csw_m % 60 )) "$_csw_dir"
+    else
+        printf '%s min %s\n' "$_csw_m" "$_csw_dir"
+    fi
+}
+
+# exakit_clock_skewed <seconds> — true when the skew is past the limit.
+exakit_clock_skewed() {
+    [ -n "$1" ] || return 1
+    [ "$1" -ge "$EXAKIT_CLOCK_SKEW_LIMIT" ] || [ "$1" -le "-$EXAKIT_CLOCK_SKEW_LIMIT" ]
+}
+
 # exakit_table_present <table> [schema] — does the table exist in the given
 # schema (default STARTER_KIT / $EXAKIT_SCHEMA)?
 exakit_table_present() {
