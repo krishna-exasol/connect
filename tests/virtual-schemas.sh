@@ -567,6 +567,39 @@ run_secret "$SECRET" connect pg --name rds $RDS_SET --secret-stdin
 check "connect to a private-CA source without ca: exit 1, nothing kept" "1 {}" "$RC $(dbq 'd["connections"]')"
 has "...and the fix is named" "give it with --set ca=<file>, then connect again" "$OUT"
 
+printf '\n== a database clock left behind by a sleeping laptop ==\n'
+# Measured on Exasol Personal (macOS): the VM's clock does not catch up after
+# the Mac sleeps (32 min to 2 h 26 min behind), and an RDS certificate issued
+# that morning failed as "validity check failed". connect and check measure it.
+check "with the skew measured, a validity failure names it instead of guessing" \
+    "the database clock is 33 min behind this computer, so the certificate is outside its validity dates by it - restart the database (exakit stop, then exakit start) and retry" \
+    "$(python3 - "$ROOT" <<'PYC'
+import json, sys
+sys.path.insert(0, sys.argv[1] + "/setup/virtual-schemas/engine")
+import lifecycle
+pg = json.load(open(sys.argv[1] + "/setup/virtual-schemas/connectors/postgresql/connector.json"))
+print(lifecycle.tls_remedy("PKIX path validation failed: java.security.cert.CertPathValidatorException: validity check failed",
+                           pg, lifecycle.clock_words(-1955)))
+PYC
+)"
+db '{"clock_skew": -1955, "sources": {"rds.example.com": {"tables": ["RENTAL"], "fail": "tls-validity"}}}'
+run_secret "$SECRET" connect pg --name rds $RDS_SET --set ca="$CA/moved.pem" --secret-stdin
+check "a certificate outside its dates by a clock 33 min behind: exit 1, nothing kept" "1 {}" "$RC $(dbq 'd["connections"]')"
+has "...connect warns about the clock before it creates anything" "The database clock is 33 min behind this computer" "$OUT"
+has "...and the fix is the restart, with the measured cause" "the database clock is 33 min behind this computer, so the certificate is outside its validity dates by it" "$OUT"
+db '{"clock_skew": -1955, "sources": {"rds.example.com": {"tables": ["RENTAL"]}}}'
+run_secret "$SECRET" connect pg --name rds $RDS_SET --set ca="$CA/moved.pem" --secret-stdin
+check "a source whose certificate is still in date connects anyway: exit 0" "0" "$RC"
+has "...with the warning" "Restart the database (exakit stop, then exakit start) to resync it" "$OUT"
+run check rds
+has "source check warns too" "The database clock is 33 min behind this computer" "$OUT"
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["clock_skew"]=3; d["statements"]=[]; json.dump(d, open(sys.argv[1], "w"))' "$STATE"
+run check rds
+check "a clock in sync: check exit 0" "0" "$RC"
+lacks "...and no clock warning" "database clock" "$OUT"
+check "the clock is asked once per run" "1" "$(dbq 'sum(1 for s in d["statements"] if s == "SELECT POSIX_TIME() AS T")')"
+run remove rds; check "...and it removes cleanly" "0" "$RC"
+
 printf '\n== a private CA for MySQL: a truststore file both readers find ==\n'
 # Measured on Exasol Personal: the adapter (a UDF) starts in "/" and sees the
 # bucket at /buckets/...; the MySQL loader resolves the same relative path

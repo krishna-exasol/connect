@@ -8,7 +8,8 @@ database and inspect it afterwards:
     dns         false -> the DNS probe answers "nodns ..." (no resolver at all);
                 a host ending in .invalid answers "dns ..." (no such name)
     unreachable host names whose TCP probe fails
-    sources     {host: {"tables": [...], "fail": null|"auth"|"tls"|"unreachable",
+    clock_skew  seconds the database clock is off this computer's (negative: behind)
+    sources     {host: {"tables": [...], "fail": null|"auth"|"tls"|"tls-validity"|"unreachable",
                         "secret": "<the credential the source accepts>"}}
     connections {NAME: {"url", "user", "secret"}}    what the engine created
     schemas, scripts, virtual {VS: {"connection", "tables"}}
@@ -56,6 +57,10 @@ def _source_for(doc, connection):
         raise Exception('FATAL: password authentication failed for user "%s"' % con["user"])
     if fail == "tls":
         raise Exception("PKIX path building failed: unable to find valid certification path")
+    if fail == "tls-validity":
+        # A certificate outside its dates by the database's clock (measured on RDS).
+        raise Exception("SSLHandshakeException: PKIX path validation failed: "
+                        "java.security.cert.CertPathValidatorException: validity check failed")
     if fail == "unreachable":
         raise Exception("Connection refused. Check that the hostname and port are correct")
     return src
@@ -102,6 +107,10 @@ class Fake(object):
             if m.group(1) in doc["unreachable"]:
                 return [{"R": "tcp 10.0.0.9 SocketTimeoutException"}]
             return [{"R": "ok 10.0.0.9"}]
+        if sql == "SELECT POSIX_TIME() AS T":
+            # The database clock: this computer's, shifted by clock_skew seconds.
+            import time
+            return [{"T": "%.3f" % (time.time() + doc.get("clock_skew", 0))}]
         if sql.startswith("SELECT EXAKIT_VS.EXAKIT_TLS_BUILD("):
             # The kit's TLS helper, compiled by the database's Java: a stand-in
             # class, or the compiler's absence (tls_compiler false).

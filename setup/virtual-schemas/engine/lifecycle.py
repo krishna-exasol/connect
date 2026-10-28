@@ -16,6 +16,7 @@ The EXAKIT_VS schema also holds the DNS probe, and is dropped with the last sour
 import hashlib
 import os
 import re
+import time
 
 import artifacts
 import plan as planner
@@ -44,11 +45,28 @@ REMEDY_FOR = {
 }
 
 
-def tls_remedy(message, connector):
+# Seconds the database clock may be off this computer's before it is named.
+# Measured on Exasol Personal (macOS): the VM's clock does not catch up after
+# the Mac sleeps - 2 h 26 min, 1 h 25 min and 32 min behind on one laptop - and
+# an RDS certificate issued that morning then failed as not yet valid.
+CLOCK_LIMIT = 120
+
+
+def clock_words(seconds):
+    """'33 min behind', '1 h 25 min ahead' - twin of exakit_clock_skew_words."""
+    direction = "behind" if seconds < 0 else "ahead"
+    minutes = (abs(int(seconds)) + 30) // 60
+    if minutes >= 60:
+        return "%d h %d min %s" % (minutes // 60, minutes % 60, direction)
+    return "%d min %s" % (minutes, direction)
+
+
+def tls_remedy(message, connector, clock=None):
     """The specific fix for a TLS failure, when the driver's words say which
     one it is; None leaves the general remedy. Both cases were measured live
     against RDS: the CA a JVM does not hold, and a database clock left behind
-    by a laptop that hibernated."""
+    by a laptop that hibernated. clock is the measured skew in words when it
+    is past CLOCK_LIMIT, so a validity failure names the cause, not a guess."""
     text = str(message)
     has_ca = any(spec["kind"] == "ca-file" for spec in connector["inputs"])
     if re.search(r"trustAnchors parameter must be non-empty", text, re.I):
@@ -61,6 +79,9 @@ def tls_remedy(message, connector):
                  if has_ca else "; this connector cannot take a CA yet - tls=require encrypts without verifying, "
                  "only if the user accepts that"))
     if re.search(r"validity check failed|NotYetValid|not yet valid|CertificateExpired|has expired", text, re.I):
+        if clock:
+            return ("the database clock is %s this computer, so the certificate is outside its validity dates "
+                    "by it - restart the database (exakit stop, then exakit start) and retry" % clock)
         return ("a certificate is outside its validity dates by the database's clock; if this computer slept or "
                 "hibernated, the database clock may be behind - restart it (exakit stop, then exakit start) and retry")
     if (re.search(r"PKIX path building failed|unable to find valid certification path|"
@@ -90,6 +111,28 @@ class Engine(object):
         self._db = None
 
     # --- the database --------------------------------------------------------------
+    def clock(self):
+        """The database clock's skew from this computer's, in words, when it is
+        past CLOCK_LIMIT; else None. Measured once per run with POSIX_TIME()
+        (the epoch in any session time zone); None too when it cannot be."""
+        if not hasattr(self, "_clock"):
+            self._clock = None
+            try:
+                before = time.time()
+                rows = self.db().query("SELECT POSIX_TIME() AS T")
+                skew = float(rows[0]["T"]) - (before + time.time()) / 2
+                if abs(skew) >= CLOCK_LIMIT:
+                    self._clock = clock_words(skew)
+            except (Failure, sql.DbError, LookupError, TypeError, ValueError):
+                pass
+        return self._clock
+
+    def warn_clock(self):
+        if self.clock():
+            self.emit("WARN", "The database clock is %s this computer, and certificates are checked by it - a TLS "
+                              "source can fail as not yet valid. Restart the database (exakit stop, then exakit "
+                              "start) to resync it" % self.clock())
+
     def db(self):
         if self._db is None:
             try:
@@ -380,6 +423,7 @@ class Engine(object):
                         if self.exists(kind, label):
                             raise Failure("%s %s already exists in the database and is not a source the kit set up; "
                                           "it was left unchanged" % (kind, label), EXIT["conflict"])
+                self.warn_clock()
                 self.require_route(connector, values, name)
                 ca_pem = self.choose_ca(connector, values)
                 jars = self.stage(connector, name, created)
@@ -421,7 +465,7 @@ class Engine(object):
                 remedy = REMEDY_FOR.get(kind, REMEDY_FOR["error"]).format(name=name)
                 if getattr(error, "complete", False):
                     raise error
-                specific = tls_remedy(error, connector) if kind == "tls" else None
+                specific = tls_remedy(error, connector, self.clock()) if kind == "tls" else None
                 if specific:
                     remedy = "the source's certificate did not verify; nothing was kept - %s, then connect again" % specific
                 elif not reconnect and kind in ("auth", "tls", "unreachable", "nohost"):
@@ -499,6 +543,7 @@ class Engine(object):
         connector = self.defs.connector(config["connector"])
         names = config["objects"]
         try:
+            self.warn_clock()
             self.require_route(connector, config["inputs"], name)
             tables = self.tables(names["schema"])
             read = self.bounded_read(names["schema"], tables)
@@ -506,7 +551,7 @@ class Engine(object):
             kind = getattr(error, "kind", "error")
             status = self.record_check(name, "failed", str(error), kind)
             remedy = REMEDY_FOR.get(kind, REMEDY_FOR["error"]).format(name=name)
-            specific = tls_remedy(error, connector) if kind == "tls" else None
+            specific = tls_remedy(error, connector, self.clock()) if kind == "tls" else None
             if specific:
                 remedy = "%s; then: exakit source check %s" % (specific.replace(
                     "give it with --set ca=<file>", "reconnect with it: exakit source disconnect %s --yes, then "

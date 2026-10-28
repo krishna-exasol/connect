@@ -67,7 +67,9 @@ Rules that are not negotiable:
   usually on port 2484, not 1521: `--set port=2484`.
 - **"validity check failed"** with a certificate that is in date means the
   database clock is behind - after the laptop slept or hibernated, Exasol
-  Personal's clock does not catch up. `exakit stop`, then `exakit start`.
+  Personal's clock does not catch up. `connect` and `source check` measure it
+  and warn ("The database clock is 33 min behind this computer"), and the
+  failure's fix then names it. `exakit stop`, then `exakit start`.
 - **Name**: lower case, `[a-z][a-z0-9_]`, e.g. `sales`. The tables appear as
   `VS_SALES`, the credential lives in the database's `EXAKIT_SRC_SALES`.
 - Show the user the plan's **exposure** line before connecting: the kit's MCP
