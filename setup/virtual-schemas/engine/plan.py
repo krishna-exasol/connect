@@ -7,6 +7,7 @@ kind before it reaches a template, and the templates only ever see validated
 values - nothing a user types is interpolated into SQL unchecked.
 """
 
+import base64
 import difflib
 import json
 import os
@@ -175,7 +176,13 @@ def jdbc_url(connector, values, extra=None):
     fields.update(extra or {})
     if connector.get("tls"):
         if fields.get("ca_pem") and connector.get("tls_ca"):
-            fields["tls"] = connector["tls_ca"].format(ca_pem=tlsca.url_value(fields["ca_pem"]))
+            if connector.get("ca_encoding") == "base64-bundle":
+                # The whole bundle, base64: ojdbc 23 reads a PEM wallet from a
+                # data: URI (wallet_location=data:;base64,...), trust-only.
+                value = base64.b64encode(fields["ca_pem"].encode("ascii")).decode("ascii")
+            else:
+                value = tlsca.url_value(fields["ca_pem"])
+            fields["tls"] = connector["tls_ca"].format(**dict(fields, ca_pem=value))
         elif fields.get("truststore") and connector.get("tls_truststore"):
             fields["tls"] = connector["tls_truststore"].format(**fields)
         elif fields.get("ca_pem") and connector.get("tls_class"):
@@ -211,6 +218,8 @@ def describe(defs, connector_id, name, values, runtime, cache, store):
         count = len(tlsca.certificates(values["ca"]))
         if connector.get("tls_truststore"):
             how = "%d certificate%s, in a truststore for the adapter and the loader" % (count, "" if count == 1 else "s")
+        elif connector.get("ca_encoding") == "base64-bundle":
+            how = "%d certificate%s, as a wallet inside the connection" % (count, "" if count == 1 else "s")
         elif connector.get("tls_class"):
             how = ("%d certificate%s, checked with the host name by the kit's TLS helper class"
                    % (count, "" if count == 1 else "s"))

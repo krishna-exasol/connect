@@ -71,6 +71,11 @@
         "verify",
         "disable"
       ]
+    },
+    {
+      "name": "ca",
+      "label": "CA certificate file (PEM) - only for a private CA such as AWS RDS or Azure; Enter to skip",
+      "kind": "ca-file"
     }
   ],
   "auth": "password",
@@ -79,12 +84,15 @@
     "verify": "tcps://{host}:{port}/{service}?oracle.net.ssl_server_dn_match=true",
     "disable": "//{host}:{port}/{service}"
   },
+  "tls_ca": "tcps://{host}:{port}/{service}?ssl_server_dn_match=true&wallet_location=data:;base64,{ca_pem}",
+  "ca_encoding": "base64-bundle",
   "vs_properties": {
     "SCHEMA_NAME": "{schema}"
   },
   "notes": [
     "The Java-only (thin) driver: no Oracle Client install. IMPORT FROM ORA stays off.",
-    "verify uses TCPS and checks the server certificate's name; the listener's TCPS port is often 2484, so set the port to match."
+    "verify uses TCPS and checks the server certificate's name; the listener's TCPS port is often 2484, so set the port to match.",
+    "A CA (--set ca=<PEM file or bundle>) travels inside the URL as a trust-only PEM wallet (wallet_location=data:;base64,...), which ojdbc 23 reads with no file - so the loader's empty CA store on Exasol Personal does not matter. The short parameter name is required: oracle.net.wallet_location in an Easy Connect URL is ORA-12261. ojdbc 23 checks the host name with or without ssl_server_dn_match (measured: by IP, ORA-17965). Verified against RDS Oracle 19c SE2 over TCPS 2484."
   ],
   "probe_sql": "SELECT 1 FROM DUAL"
 }

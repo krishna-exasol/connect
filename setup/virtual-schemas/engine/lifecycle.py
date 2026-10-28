@@ -154,7 +154,8 @@ class Engine(object):
             return None
         try:
             certs = tlsca.certificates(values["ca"])
-            if connector.get("tls_truststore") or connector.get("tls_class"):
+            if connector.get("tls_truststore") or connector.get("tls_class") or \
+                    connector.get("ca_encoding") == "base64-bundle":
                 # A truststore or the helper holds the whole bundle; Java picks the signer.
                 return "".join(certs)
             pem = tlsca.choose(certs, values["host"], values.get("port"), connector.get("ca_probe"), values["ca"])

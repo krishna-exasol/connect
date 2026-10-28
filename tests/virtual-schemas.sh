@@ -664,13 +664,33 @@ import lifecycle
 load = lambda c: json.load(open(sys.argv[1] + "/setup/virtual-schemas/connectors/%s/connector.json" % c))
 text = "ETL-5402: ... Error: (internal_error) Unexpected error: java.security.InvalidAlgorithmParameterException: the trustAnchors parameter must be non-empty."
 print(lifecycle.tls_remedy(text, load("sqlserver")))
-print(lifecycle.tls_remedy(text, load("oracle")))
+print(lifecycle.tls_remedy(text, load("snowflake")))
 PYE
 )"
 has "the loader's empty CA store (measured, Exasol Personal) is explained, with --set ca where it exists" \
     "has no CA store of its own (an Exasol Personal issue)" "$(printf '%s\n' "$E6" | sed -n 1p)"
 has "...for SQL Server now: give the CA" "give the CA as PEM with --set ca=<file>" "$(printf '%s\n' "$E6" | sed -n 1p)"
 has "...for a connector without ca yet: says so, and what require would mean" "cannot take a CA yet - tls=require encrypts without verifying" "$(printf '%s\n' "$E6" | sed -n 2p)"
+
+printf '\n== a private CA for Oracle: a wallet inside the connection ==\n'
+# Measured against RDS Oracle 19c over TCPS: ojdbc 23 reads a trust-only PEM
+# wallet from wallet_location=data:;base64,... - in both the loader and the
+# adapter's runtime, with no file - and checks the host name (ORA-17965 by IP).
+ORA_SET="--set host=ora.example.com --set port=2484 --set service=EXATEST --set schema=HR --set user=EXA_READER"
+db '{"sources": {"ora.example.com": {"tables": ["EMPLOYEES"]}}}'
+run plan oracle --name ora $ORA_SET --set ca="$CA/bundle.pem"
+has "the plan says the bundle travels as a wallet in the connection" "(2 certificates, as a wallet inside the connection)" "$OUT"
+run_secret "$SECRET" connect oracle --name ora $ORA_SET --set ca="$CA/bundle.pem" --secret-stdin
+check "Oracle with a CA bundle: exit 0, with no handshake from this computer (ora.example.com is not reachable)" "0" "$RC"
+OURL="$(dbq 'd["connections"]["EXAKIT_SRC_ORA"]["url"]')"
+has "...TCPS, host name matched, the short wallet_location name (oracle.net. is a syntax error there)" \
+    "jdbc:oracle:thin:@tcps://ora.example.com:2484/EXATEST?ssl_server_dn_match=true&wallet_location=data:;base64," "$OURL"
+check "...the wallet is the whole bundle, exactly" "same" \
+    "$(python3 -c 'import base64,sys; got=base64.b64decode(sys.argv[1].split("base64,",1)[1]).decode(); want=open(sys.argv[2]).read(); print("same" if got.split() == want.split() else "differs")' "$OURL" "$CA/bundle.pem")"
+check "...and no file was staged for it" "no" "$([ -e "$EXA/bucketfs/bfsdefault/default/exakit/vs/tls/ora.jks" ] || [ -e "$EXA/jdbc/ORACLE/buckets" ] && echo yes || echo no)"
+run_secret "$NEWSECRET" reauth ora --secret-stdin
+has "reauth keeps the wallet in the URL" "wallet_location=data:;base64," "$(dbq 'd["connections"]["EXAKIT_SRC_ORA"]["url"]')"
+run remove ora; check "...and remove is clean" "0" "$RC"
 
 printf '\n== the hidden prompt hides from the first keystroke ==\n'
 # Measured: with the prompt printed first and echo turned off after it, input
