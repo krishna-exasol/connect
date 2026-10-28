@@ -53,11 +53,11 @@ Rules that are not negotiable:
   in clear. Only lower it when the user says so, and say what it costs.
 - **A private CA is trusted, not skipped.** Managed databases (AWS RDS, Azure)
   and company servers sign with a CA Java does not hold, so the first verified
-  connect fails with "PKIX path building failed". PostgreSQL takes
+  connect fails with "PKIX path building failed" (MySQL: "Path does not chain
+  with any of the trust anchors"). PostgreSQL, MySQL and SQL Server take
   `--set ca=<PEM file>`: the CA's certificate, or the vendor's bundle (for RDS
-  the region's, from `https://truststore.pki.rds.amazonaws.com/<region>/<region>-bundle.pem`)
-  - the kit picks the certificate that signs the server with a verified
-  handshake and keeps it with the source. Do not answer a PKIX error with
+  the region's, from `https://truststore.pki.rds.amazonaws.com/<region>/<region>-bundle.pem`).
+  The kit keeps it with the source. Do not answer a PKIX error with
   `tls=require`.
 - **"validity check failed"** with a certificate that is in date means the
   database clock is behind - after the laptop slept or hibernated, Exasol
@@ -66,6 +66,14 @@ Rules that are not negotiable:
   `VS_SALES`, the credential lives in the database's `EXAKIT_SRC_SALES`.
 - Show the user the plan's **exposure** line before connecting: the kit's MCP
   read-only user can read every table of the new virtual schema.
+- **MySQL tables keep their lower-case names**: quote them,
+  `SELECT * FROM VS_SALES."orders"`. And write top-N queries on a MySQL
+  source as `ORDER BY x DESC NULLS LAST LIMIT n` - plain `DESC LIMIT n` is
+  pushed down with `NULLS FIRST`, which MySQL rejects (upstream adapter 6.1.0).
+- **PostgreSQL**: a column whose type is a domain fails every query that reads
+  it (`ETL-1299`; name the other columns instead of `*`), `numeric` arrives as
+  text (documented upstream; SUM and comparisons still work), array columns
+  are missing, and a partitioned table shows only its partitions.
 
 Inputs per connector are in `exakit help connect` and the plan. Defaults:
 PostgreSQL port 5432 schema `public`; MySQL 3306 (database only, no schema);
@@ -92,7 +100,7 @@ little work — keep remote queries selective.
 | 4 | no source by that name | `exakit source list` |
 | 5 | connector gated, or not confirmed | gated: tell the user. Not confirmed (`disconnect`/`remove` without `--yes`): nothing changed - ask the user, then add `--yes` |
 | `auth-failed` | the source rejected the credential | `exakit source reauth <name>` (new credential on stdin; it is tried first, and a refused one leaves the old in place) |
-| `tls-failed` | certificate or host name did not verify | PKIX: the CA is private - reconnect with `--set ca=<PEM>` (PostgreSQL). "validity check failed": restart the database (clock). Otherwise fix the server certificate; do not silently drop to `require` |
+| `tls-failed` | certificate or host name did not verify | PKIX: the CA is private - reconnect with `--set ca=<PEM>`. "validity check failed": restart the database (clock). Otherwise fix the server certificate; do not silently drop to `require` |
 | `unreachable` | the source does not answer from inside the database | host, port, firewall, VPN; `localhost` trap above |
 | "does not resolve" | the host name does not exist | check the spelling |
 

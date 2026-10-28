@@ -567,6 +567,50 @@ run_secret "$SECRET" connect pg --name rds $RDS_SET --secret-stdin
 check "connect to a private-CA source without ca: exit 1, nothing kept" "1 {}" "$RC $(dbq 'd["connections"]')"
 has "...and the fix is named" "give it with --set ca=<file>, then connect again" "$OUT"
 
+printf '\n== a private CA for drivers that read trust only from a file (MySQL, SQL Server) ==\n'
+# Measured on Exasol Personal: the adapter (a UDF) starts in "/" and sees the
+# bucket at /buckets/...; the loader starts in its driver folder and sees it
+# at /exa/bucketfs/... - so one RELATIVE path, with a copy under the loader.
+check "the truststore is a JKS: magic, version 2, two trusted entries, digest over the empty password" "ok" \
+    "$(python3 - "$ROOT" "$CA/bundle.pem" <<'PYJ'
+import hashlib, struct, sys
+sys.path.insert(0, sys.argv[1] + "/setup/virtual-schemas/engine")
+import tlsca
+data = tlsca.jks(tlsca.certificates(sys.argv[2]))
+magic, version, count = struct.unpack(">III", data[:12])
+tags = data.count(struct.pack(">I", 2) + struct.pack(">H", len("exakit-ca-0")))
+ok = (magic, version, count) == (0xFEEDFEED, 2, 2) and data[-20:] == hashlib.sha1(b"Mighty Aphrodite" + data[:-20]).digest()
+print("ok" if ok and tags >= 2 else "bad %x %d %d %d" % (magic, version, count, tags))
+PYJ
+)"
+db '{"sources": {"ms.example.com": {"tables": ["ORDERS"]}}}'
+MS_SET="--set host=ms.example.com --set database=erp --set user=reader"
+run plan mssql --name ms $MS_SET --set ca="$CA/bundle.pem"
+has "the plan says the whole bundle becomes a truststore (no handshake needed)" "(2 certificates, in a truststore for the adapter and the loader)" "$OUT"
+run_secret "$SECRET" connect mssql --name ms $MS_SET --set ca="$CA/bundle.pem" --secret-stdin
+check "SQL Server with a CA bundle: exit 0, with no handshake from this computer (ms.example.com is not reachable)" "0" "$RC"
+REL="buckets/bfsdefault/default/exakit/vs/tls/ms.jks"
+has "...the URL verifies against the truststore by its relative path" \
+    "encrypt=true;trustServerCertificate=false;hostNameInCertificate=ms.example.com;trustStore=$REL;trustStoreType=JKS" \
+    "$(dbq 'd["connections"]["EXAKIT_SRC_MS"]["url"]')"
+check "...one copy in the bucket for the adapter, one under the loader at the same relative path, identical" "yes" \
+    "$(cmp -s "$EXA/bucketfs/bfsdefault/default/exakit/vs/tls/ms.jks" "$EXA/jdbc/SQLSERVER/$REL" && echo yes || echo no)"
+run_secret "$NEWSECRET" reauth ms --secret-stdin
+has "reauth keeps the truststore in the URL" "trustStore=$REL" "$(dbq 'd["connections"]["EXAKIT_SRC_MS"]["url"]')"
+run remove ms
+check "remove deletes both copies (and the loader's now-empty folders)" "0 gone gone" \
+    "$RC $([ -e "$EXA/bucketfs/bfsdefault/default/exakit/vs/tls/ms.jks" ] && echo kept || echo gone) $([ -e "$EXA/jdbc/SQLSERVER/buckets" ] && echo kept || echo gone)"
+db '{"sources": {"my.example.com": {"tables": ["rental"], "fail": "tls"}}}'
+run_secret "$SECRET" connect mysql --name my --set host=my.example.com --set database=sakila --set user=reader --set ca="$CA/bundle.pem" --secret-stdin
+check "a MySQL connect that fails leaves no truststore behind" "1 gone gone" \
+    "$RC $([ -e "$EXA/bucketfs/bfsdefault/default/exakit/vs/tls/my.jks" ] && echo kept || echo gone) $([ -e "$EXA/jdbc/MYSQL/buckets" ] && echo kept || echo gone)"
+db '{"sources": {"my.example.com": {"tables": ["rental"]}}}'
+run_secret "$SECRET" connect mysql --name my --set host=my.example.com --set database=sakila --set user=reader --set ca="$CA/bundle.pem" --secret-stdin
+has "MySQL verifies identity against the truststore (Connector/J takes a file: URL)" \
+    "sslMode=VERIFY_IDENTITY&trustCertificateKeyStoreUrl=file:buckets/bfsdefault/default/exakit/vs/tls/my.jks&trustCertificateKeyStoreType=JKS" \
+    "$(dbq 'd["connections"]["EXAKIT_SRC_MY"]["url"]')"
+run remove my
+
 printf '\n== the hidden prompt hides from the first keystroke ==\n'
 # Measured: with the prompt printed first and echo turned off after it, input
 # typed the moment the prompt appeared was echoed in clear (expect, typing at

@@ -13,6 +13,7 @@ Object names for a source <name>:
 The EXAKIT_VS schema also holds the DNS probe, and is dropped with the last source.
 """
 
+import hashlib
 import os
 import re
 
@@ -143,6 +144,9 @@ class Engine(object):
             return None
         try:
             certs = tlsca.certificates(values["ca"])
+            if connector.get("tls_truststore"):
+                # A truststore holds the whole bundle; Java picks the signer.
+                return "".join(certs)
             pem = tlsca.choose(certs, values["host"], values.get("port"), connector.get("ca_probe"), values["ca"])
         except tlsca.CaError as error:
             failure = Failure("%s; nothing was kept" % error, EXIT["failed"], "tls")
@@ -152,6 +156,34 @@ class Engine(object):
             self.emit("OK", "Picked the certificate in %s that signs %s (1 of %d, verified handshake)"
                       % (values["ca"], values["host"], len(certs)))
         return pem
+
+    def stage_truststore(self, connector, name, ca_pem, created):
+        """For drivers that read trust only from a file (Connector/J,
+        mssql-jdbc): one JKS per source, written twice, and the RELATIVE path
+        that finds both copies.
+
+        Measured on Exasol Personal: the adapter (a Java UDF) runs with
+        user.dir "/" and sees the bucket only at /buckets/...; the loader runs
+        in the database container with its driver folder as the working
+        directory and sees the bucket at /exa/bucketfs/..., not /buckets. No
+        absolute path reaches both, so the path is relative, and the loader's
+        copy sits under its own driver folder at that same relative path."""
+        if not ca_pem or not connector.get("tls_truststore"):
+            return None
+        data = tlsca.jks(tlsca.certificates_from_text(ca_pem))
+        relative = self.runtime.bucket_sql("tls", name + ".jks").lstrip("/")
+        targets = [self.runtime.bucket_dir("tls", name + ".jks")]
+        if connector.get("etl"):
+            targets.append(os.path.join(self.runtime.loader_dir(connector["etl"]["drivername"]), *relative.split("/")))
+        digest = hashlib.sha256(data).hexdigest()
+        for path in targets:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as handle:
+                handle.write(data)
+            self.store.add_consumer(path, digest, name, True)
+            if path not in created["files"]:
+                created["files"].append(path)
+        return relative
 
     def require_route(self, connector, values, name):
         host = planner.source_host(connector, values)
@@ -319,7 +351,8 @@ class Engine(object):
                 self.require_route(connector, values, name)
                 ca_pem = self.choose_ca(connector, values)
                 jars = self.stage(connector, name, created)
-                url = planner.jdbc_url(connector, values, {"ca_pem": ca_pem})
+                truststore = self.stage_truststore(connector, name, ca_pem, created)
+                url = planner.jdbc_url(connector, values, {"ca_pem": ca_pem, "truststore": truststore})
                 self.create_connection(names, url, values.get("user"), secret, replace=reconnect)
                 if not reconnect:
                     made("connection")
@@ -378,6 +411,8 @@ class Engine(object):
                 # Kept with the source, so reauth rebuilds the same URL even
                 # after the file it came from has moved.
                 record["tls_ca"] = ca_pem
+            if truststore:
+                record["tls_truststore"] = truststore
             self.store.save_config(name, record)
             self.store.save_status(name, {"status": "ready", "pins": pins, "tables": len(tables),
                                           "last_check": {"at": sources.now(), "outcome": "ok",
@@ -461,7 +496,8 @@ class Engine(object):
         if not secret:
             raise Failure("reauth needs the new credential on standard input", EXIT["input"])
         connector = self.defs.connector(config["connector"])
-        url = planner.jdbc_url(connector, config["inputs"], {"ca_pem": config.get("tls_ca")})
+        url = planner.jdbc_url(connector, config["inputs"], {"ca_pem": config.get("tls_ca"),
+                                                             "truststore": config.get("tls_truststore")})
         with self.store.lock():
             # Tried before it replaces anything: a typo here must not break a
             # source that still works. The new credential goes into a pending

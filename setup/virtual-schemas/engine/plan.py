@@ -176,6 +176,8 @@ def jdbc_url(connector, values, extra=None):
     if connector.get("tls"):
         if fields.get("ca_pem") and connector.get("tls_ca"):
             fields["tls"] = connector["tls_ca"].format(ca_pem=tlsca.url_value(fields["ca_pem"]))
+        elif fields.get("truststore") and connector.get("tls_truststore"):
+            fields["tls"] = connector["tls_truststore"].format(**fields)
         else:
             fields["tls"] = connector["tls"][values.get("tls", "verify")].format(**fields)
     return connector["url"].format(**fields)
@@ -205,10 +207,14 @@ def describe(defs, connector_id, name, values, runtime, cache, store):
         steps.append("register loader driver %s" % connector["etl"]["drivername"])
     if values.get("ca"):
         count = len(tlsca.certificates(values["ca"]))
-        steps.append("trust the CA in %s for this source only (%s)"
-                     % (values["ca"], "1 certificate" if count == 1 else
-                        "%d certificates; a verified handshake from this computer picks the one that signs %s"
-                        % (count, source_host(connector, values))))
+        if connector.get("tls_truststore"):
+            how = "%d certificate%s, in a truststore for the adapter and the loader" % (count, "" if count == 1 else "s")
+        elif count == 1:
+            how = "1 certificate"
+        else:
+            how = ("%d certificates; a verified handshake from this computer picks the one that signs %s"
+                   % (count, source_host(connector, values)))
+        steps.append("trust the CA in %s for this source only (%s)" % (values["ca"], how))
     steps += ["create CONNECTION %s" % names["connection"],
               "create adapter script %s.%s" % (names["script_schema"], names["script"]),
               "create virtual schema %s" % names["schema"],

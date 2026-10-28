@@ -17,6 +17,8 @@ one that signs this server is found the way a client would: a verified TLS
 handshake from this computer, host name checked, one candidate at a time.
 """
 
+import base64
+import hashlib
 import re
 import socket
 import ssl
@@ -41,11 +43,15 @@ def certificates(path):
         raise CaError("the CA file %s cannot be read (%s)" % (path, error.strerror or error))
     if len(data) > MAX_BYTES:
         raise CaError("the CA file %s is larger than 2 MB; give the PEM certificate (or bundle) itself" % path)
-    found = [m.group(0) + "\n" for m in PEM.finditer(data.decode("ascii", "replace"))]
+    found = certificates_from_text(data.decode("ascii", "replace"))
     if not found:
         raise CaError("the CA file %s holds no PEM certificate (-----BEGIN CERTIFICATE-----); "
                       "a DER .cer/.crt needs converting to PEM first" % path)
     return found
+
+
+def certificates_from_text(text):
+    return [m.group(0) + "\n" for m in PEM.finditer(text or "")]
 
 
 def handshake(host, port, protocol, pem, timeout):
@@ -88,6 +94,20 @@ def choose(certs, host, port, protocol, path, timeout=8):
             break
     raise CaError("the bundle %s signs %s as a whole, but no single certificate in it does (an intermediate "
                   "without its root); give the root certificate" % (path, host))
+
+
+def jks(certs):
+    """A Java KeyStore (JKS, version 2) holding `certs` as trusted
+    certificates, for drivers that only read a truststore from a file
+    (Connector/J, mssql-jdbc). It holds public certificates only and is read
+    without a password, so the integrity digest is keyed on the empty one."""
+    body = struct.pack(">III", 0xFEEDFEED, 2, len(certs))
+    for index, pem in enumerate(certs):
+        der = base64.b64decode("".join(pem.strip().splitlines()[1:-1]))
+        alias = ("exakit-ca-%d" % index).encode("utf-8")
+        body += struct.pack(">I", 2) + struct.pack(">H", len(alias)) + alias + struct.pack(">Q", 0)
+        body += struct.pack(">H", 5) + b"X.509" + struct.pack(">I", len(der)) + der
+    return body + hashlib.sha1(b"Mighty Aphrodite" + body).digest()
 
 
 def url_value(pem):
