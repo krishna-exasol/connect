@@ -27,11 +27,23 @@ class DbError(Exception):
 # and Exasol's own; a generic failure stays "error" rather than guessing.
 _KINDS = (
     ("nojava", r"No usable script language container"),
+    # Object stores answer over HTTPS with their own codes (S3 measured live):
+    # a request signed by a clock too far off, a bucket in another region, a
+    # key that may not list or read - each has its own fix, so each is named.
+    ("clock", r"RequestTimeTooSkewed|difference between the request time and the current time is too large|"
+              r"Signature not yet current|Signature expired"),
+    ("region", r"must be addressed using the specified endpoint|PermanentRedirect|"
+               r"AuthorizationHeaderMalformed.*region|the region '[\w-]+' is wrong"),
+    ("nobucket", r"NoSuchBucket|The specified bucket does not exist|ContainerNotFound"),
+    ("denied", r"AccessDenied|not authorized to perform|AuthorizationPermissionMismatch|AuthorizationFailure"),
     ("dns", r"UnknownHostException|Name or service not known|nodename nor servname|unable to resolve host"),
     ("tls", r"PKIX|certificate|SSLHandshake|SSL connection|ssl_server_dn_match|TLS|SSLException"),
     ("auth", r"password authentication failed|Access denied for user|Login failed for user|ORA-01017|"
              r"Incorrect username or password|invalid username/password|authentication failed|"
-             r"JWT token is invalid|Programmatic access token is invalid|token has expired"),
+             r"JWT token is invalid|Programmatic access token is invalid|token has expired|"
+             r"signature we calculated does not match|InvalidAccessKeyId|Access Key Id you provided does not exist|"
+             r"security token included in the request is (invalid|expired)|ExpiredToken|"
+             r"Server failed to authenticate the request|AuthenticationFailed"),
     ("unreachable", r"Connection refused|connect timed out|The connection attempt failed|"
                     r"Communications link failure|No route to host|Network is unreachable|"
                     r"Connection timed out|ORA-12541|ORA-12170|TCP/IP connection to the host|"
@@ -88,6 +100,18 @@ def summarize(text):
     """
     text = str(text)
     coded = re.search(r"(E-[A-Z]+-\d+:[^\n]*)", text)
+    if not coded:
+        # A document adapter's failure carries no coded line: under the UDF
+        # wrapper sits the store SDK's exception (measured on S3:
+        # "software.amazon.awssdk...S3Exception: The request signature we
+        # calculated does not match ... (Service: S3, Status Code: 403, ...)").
+        for line in text.splitlines():
+            cause = re.match(r"\s*(?:Caused by: )?(?:[\w$]+\.)*([A-Z][\w$]*(?:Exception|Error)): (.+)$", line)
+            if cause and "ExaUDF" not in cause.group(1) and not cause.group(2).startswith("F-UDF"):
+                status = re.search(r"Status Code: (\d+)", cause.group(2))
+                detail = re.sub(r"\s*\((?:Service|SDK Attempt)[^)]*\)", "", cause.group(2)).strip()
+                return re.sub(r"\s+", " ", "%s: %s%s" % (cause.group(1).split("$")[0], detail,
+                                                         " (HTTP %s)" % status.group(1) if status else "")).strip()
     # pyexasol's own wrapper: "(\n message => ...\n dsn => ...\n query => ...)".
     # The message field is the error; the fields under it describe the session.
     field = re.search(r"^\s*message\s*=>\s*(.+)$", text, re.M)

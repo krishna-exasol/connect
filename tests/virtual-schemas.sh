@@ -44,11 +44,13 @@ def seed(pin, data):
     folder = os.path.join(home, "cache", "virtual-schemas", pin["sha256"])
     os.makedirs(folder, exist_ok=True)
     open(os.path.join(folder, pin["asset"]), "wb").write(data)
-for cid in ("postgresql", "mysql", "sqlserver", "oracle", "snowflake", "bigquery"):
+for cid in ("postgresql", "mysql", "sqlserver", "oracle", "snowflake", "bigquery", "s3"):
     path = os.path.join(defs, "connectors", cid, "connector.json")
     doc = json.load(open(path))
     seed(doc["adapter"], ("adapter-" + cid).encode())
-    if doc["driver"].get("bundle") == "zip":
+    if not doc.get("driver"):
+        pass
+    elif doc["driver"].get("bundle") == "zip":
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w") as z:
             z.writestr("GoogleBigQueryJDBC42.jar", b"a"); z.writestr("dep.jar", b"b"); z.writestr("EULA.txt", b"c")
@@ -62,7 +64,7 @@ STATE="$WORK/db.json"
 db() { printf '%s\n' "$1" > "$STATE"; }
 dbq() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); v=eval(sys.argv[2], {"d": d}); print(json.dumps(v) if not isinstance(v, str) else v)' "$STATE" "$1"; }
 eng() {
-    EXAKIT_VS_FAKE_DB="$ROOT/tests/lib/fake-exasol-vs.py" FAKE_VS_STATE="$STATE" \
+    EXAKIT_VS_FAKE_DB="$ROOT/tests/lib/fake-exasol-vs.py" FAKE_VS_STATE="$STATE" FAKE_VS_EXA="$EXA" \
         python3 "$ROOT/setup/virtual-schemas/engine/cli.py" --defs "$DEFS" --kit-home "$HOME_K" \
         --deployment-dir "$DEPLOY" --dsn 127.0.0.1:8563 --user sys --password-file /nonexistent "$@"
 }
@@ -117,6 +119,8 @@ samples = {"host": "db.example.com", "database": "sales", "schema": "public", "u
            "account": "myorg-acct1", "warehouse": "COMPUTE_WH", "project": "my-proj", "dataset": "analytics"}
 for entry in defs.entries():
     c = defs.connector(entry["id"])
+    if c.get("credential"):
+        continue    # a document source has no JDBC URL (its own section below)
     given = {s["name"]: samples[s["name"]] for s in c["inputs"] if s["name"] in samples}
     tls = next((s for s in c["inputs"] if s["name"] == "tls"), None)
     for mode in (tls["choices"] if tls else [None]):
@@ -724,6 +728,127 @@ check "...and no file was staged for it" "no" "$([ -e "$EXA/bucketfs/bfsdefault/
 run_secret "$NEWSECRET" reauth ora --secret-stdin
 has "reauth keeps the wallet in the URL" "wallet_location=data:;base64," "$(dbq 'd["connections"]["EXAKIT_SRC_ORA"]["url"]')"
 run remove ora; check "...and remove is clean" "0" "$RC"
+
+printf '\n== Profile B: S3 document files ==\n'
+# Measured against a real bucket (Exasol Personal 2.3.0, adapter 5.0.0): the
+# adapter and its import UDF come from one JAR, the CONNECTION holds JSON, the
+# mapping is read from the bucket path, and each failure below is the text S3
+# returned. The fake reads the staged mapping exactly where the adapter would.
+MAPS="$WORK/edml"; mkdir -p "$MAPS"
+for t in orders:data/orders/*.jsonl customers:data/customers/customers.csv events:data/events/event-*.json; do
+    printf '{"$schema": "https://schemas.exasol.com/edml-2.1.0.json", "source": "%s", "destinationTable": "%s"}\n' \
+        "${t#*:}" "$(printf '%s' "${t%%:*}" | tr 'a-z' 'A-Z')" > "$MAPS/${t%%:*}.json"
+done
+printf 'not a mapping\n' > "$MAPS/README.txt"
+KEYID="AKIAEXAMPLEKEYID0001"; AWSSECRET="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+S3_SET="--set bucket=docs-bucket --set region=ap-south-1 --set mapping=$MAPS"
+S3HOST="docs-bucket.s3.ap-south-1.amazonaws.com"
+db '{"sources": {"'"$S3HOST"'": {"secret": "'"$AWSSECRET"'", "region": "ap-south-1"}}}'
+run plan s3 --name docs $S3_SET
+check "plan: exit 0" "0" "$RC"
+has "...stages the mapping, naming its tables" '3 mapped tables: CUSTOMERS, EVENTS, ORDERS' "$OUT"
+has "...names the shared import script" 'import script EXAKIT_VS.IMPORT_FROM_S3_DOCUMENT_FILES' "$OUT"
+check "...downloads the adapter and nothing else (no JDBC driver)" "1" "$(printf '%s' "$OUT" | grep -c '"role":')"
+run plan s3 --name docs --set bucket=my.dotted.bucket --set region=ap-south-1 --set mapping=$MAPS
+has "a dotted bucket is refused: its HTTPS name fails the certificate" "does not match the S3 certificate" "$OUT"
+run plan s3 --name docs --set bucket=docs-bucket --set region=cn-north-1 --set mapping=$MAPS
+has "a China region is refused, by name" "China regions use other endpoints" "$OUT"
+BADMAP="$WORK/badmap"; mkdir -p "$BADMAP"
+printf '{"$schema": "https://schemas.exasol.com/edml-2.1.0.json", "source": "s3://docs-bucket/a.json", "destinationTable": "A"}\n' > "$BADMAP/a.json"
+printf '{"$schema": "https://schemas.exasol.com/edml-2.1.0.json", "source": "b/*.json", "destinationTable": "a"}\n' > "$BADMAP/b.json"
+printf '{"source": "c.json", "destinationTable": "C D"}\n' > "$BADMAP/c.json"
+run plan s3 --name docs --set bucket=docs-bucket --set region=ap-south-1 --set mapping=$BADMAP
+check "a bad mapping is refused before anything happens, exit 2" "2" "$RC"
+has "...a source with s3:// is named" 'is the key inside the bucket, without s3://' "$OUT"
+has "...two files mapping one table are named" 'a.json and b.json both map to table A' "$OUT"
+has "...and a missing \$schema and a bad table name" 'c.json needs "$schema"' "$OUT"
+has "...and a bad table name" 'c.json needs a "destinationTable" that is a plain SQL name' "$OUT"
+run plan s3 --name docs $S3_SET --set access_key_id=not-a-key
+has "a malformed access key ID is refused" "not a valid aws-key-id" "$OUT"
+
+run_secret "$AWSSECRET" connect s3 --name docs $S3_SET --set access_key_id=$KEYID --secret-stdin
+check "connect with the secret key on stdin: exit 0" "0" "$RC"
+has "...every table is read" 'Virtual schema VS_DOCS: 3 table(s); a bounded read of each table succeeded' "$OUT"
+check "...the CONNECTION holds the adapter's JSON, with bucket and region" \
+    '{"awsAccessKeyId": "AKIAEXAMPLEKEYID0001", "awsSecretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "awsRegion": "ap-south-1", "s3Bucket": "docs-bucket"}' \
+    "$(dbq 'd["connections"]["EXAKIT_SRC_DOCS"]["secret"]')"
+check "...with no URL and no user" '["", ""]' "$(dbq '[d["connections"]["EXAKIT_SRC_DOCS"]["url"], d["connections"]["EXAKIT_SRC_DOCS"]["user"]]')"
+lacks "...the secret key never reaches the output" "$AWSSECRET" "$OUT"
+lacks "...nor the source's records" "$AWSSECRET" "$(cat "$HOME_K"/virtual-schemas/sources/docs/*.json 2>/dev/null) $(cat "$HOME_K"/virtual-schemas/*.json 2>/dev/null)"
+STAGED="$EXA/bucketfs/bfsdefault/default/exakit/vs/mappings/docs"
+check "...the mapping's .json files are staged in the kit's bucket folder, nothing else" "customers.json events.json orders.json" \
+    "$(ls "$STAGED" | tr '\n' ' ' | sed 's/ $//')"
+check "...and the virtual schema has the mapping's tables" '["CUSTOMERS", "EVENTS", "ORDERS"]' "$(dbq 'd["virtual"]["VS_DOCS"]["tables"]')"
+VSQL="$(dbq '[x for x in d["statements"] if x.startswith("CREATE VIRTUAL SCHEMA")][-1]')"
+has "...MAPPING names the bucket path the adapter reads (no /buckets)" "MAPPING = '/bfsdefault/default/exakit/vs/mappings/docs'" "$VSQL"
+IMPORT="$(dbq '[x for x in d["statements"] if "IMPORT_FROM_S3_DOCUMENT_FILES" in x][-1]')"
+has "...the import script has the adapter's signature" 'CREATE OR REPLACE JAVA SET SCRIPT "EXAKIT_VS"."IMPORT_FROM_S3_DOCUMENT_FILES"(DATA_LOADER VARCHAR(2000000), SCHEMA_MAPPING_REQUEST VARCHAR(2000000), CONNECTION_NAME VARCHAR(500)) EMITS(...) AS' "$IMPORT"
+has "...runs the adapter's own UDF class from the same JAR" '%scriptclass com.exasol.adapter.document.UdfEntryPoint;' "$IMPORT"
+check "...with telemetry off, after %scriptclass (the measured order)" "yes" \
+    "$(printf '%s\n' "$IMPORT" | awk '/%scriptclass/{c=NR} /%env EXASOL_TELEMETRY_DISABLE=1;/{e=NR} END{print (c && e && c < e) ? "yes" : "no"}')"
+ADQ="$(dbq '[x for x in d["statements"] if x.startswith("CREATE OR REPLACE JAVA ADAPTER SCRIPT \"EXAKIT_VS\".\"ADAPTER_DOCS\"")][-1]')"
+has "...and the adapter script too" '%env EXASOL_TELEMETRY_DISABLE=1;' "$ADQ"
+check "...no loader driver was registered" "" "$(ls "$EXA/jdbc" | grep -v java.security)"
+
+printf '%s' '{"AccessKey": {"UserName": "reader", "AccessKeyId": "AKIAEXAMPLEKEYID0001", "Status": "Active", "SecretAccessKey": "'"$AWSSECRET"'"}}' > "$WORK/s3key.json"
+OUT="$(eng connect s3 --name docs2 $S3_SET --secret-stdin < "$WORK/s3key.json" 2>&1)"; RC=$?
+check "a second source from the JSON aws iam create-access-key prints: exit 0" "0" "$RC"
+check "...both share the one import script" "1" "$(dbq 'd["scripts"].count("EXAKIT_VS.IMPORT_FROM_S3_DOCUMENT_FILES")')"
+run remove docs --dry-run
+lacks "removing one: the shared import script is not in its plan" "IMPORT_FROM_S3_DOCUMENT_FILES" "$OUT"
+run remove docs
+check "...removed, exit 0" "0" "$RC"
+has "...and the other source keeps the import script" "EXAKIT_VS.IMPORT_FROM_S3_DOCUMENT_FILES" "$(dbq 'd["scripts"]')"
+check "...its staged mapping is gone" "no" "$([ -d "$STAGED" ] && echo yes || echo no)"
+run remove docs2 --dry-run
+has "the last one out plans to drop the import script" "import script EXAKIT_VS.IMPORT_FROM_S3_DOCUMENT_FILES (no other s3 source uses it)" "$OUT"
+run remove docs2
+check "...and does" "[]" "$(dbq '[s for s in d["scripts"] if "IMPORT_FROM" in s]')"
+
+db '{"sources": {"'"$S3HOST"'": {"secret": "'"$AWSSECRET"'", "empty": ["EVENTS"]}}}'
+run_secret "$AWSSECRET" connect s3 --name docs $S3_SET --set access_key_id=$KEYID --secret-stdin
+check "a table whose glob matches nothing still connects: exit 0" "0" "$RC"
+has "...and is named, with where to look" 'No rows in EVENTS: their mapping'"'"'s source matches no objects' "$OUT"
+run check docs
+check "check names it too" '["EVENTS"]' "$(eng --json check docs 2>/dev/null | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin).get("empty_tables")))')"
+run remove docs
+
+for case in "wrong secret|auth|rejected the credentials; nothing was kept" \
+            "denied|denied|s3:ListBucket on the mapped prefixes" \
+            "wrong region|region|connect again with --set region=<the bucket's region>"; do
+    label="${case%%|*}"; rest="${case#*|}"; fail_kind="${rest%%|*}"; expect="${rest#*|}"
+    case "$fail_kind" in
+        auth) db '{"sources": {"'"$S3HOST"'": {"secret": "something-else-entirely-0000000000000000"}}}' ;;
+        denied) db '{"sources": {"'"$S3HOST"'": {"fail": "denied"}}}' ;;
+        region) db '{"sources": {"docs-bucket.s3.eu-central-1.amazonaws.com": {}}}' ;;
+    esac
+    run_secret "$AWSSECRET" connect s3 --name docs $S3_SET --set access_key_id=$KEYID --secret-stdin
+    check "S3 $label: exit 1" "1" "$RC"
+    has "...the fix is named" "$expect" "$OUT"
+    check "...and nothing was kept: no connection, import script or mapping" '[{}, []] no' \
+        "$(dbq '[d["connections"], [s for s in d["scripts"] if "IMPORT_FROM" in s]]') $([ -d "$STAGED" ] && echo yes || echo no)"
+done
+has "the SDK's own words reach the user, not the UDF wrapper" "AccessDeniedException: User: arn:aws:iam::1:user/reader is not authorized" \
+    "$(db '{"sources": {"'"$S3HOST"'": {"fail": "denied"}}}'; run_secret "$AWSSECRET" connect s3 --name docs $S3_SET --set access_key_id=$KEYID --secret-stdin; printf '%s' "$OUT")"
+
+db '{"sources": {"'"$S3HOST"'": {"secret": "'"$AWSSECRET"'"}}}'
+run_secret "$AWSSECRET" connect s3 --name docs $S3_SET --set access_key_id=ASIAEXAMPLEKEYID0001 --secret-stdin
+check "a temporary key without its session token is refused, exit 2" "2" "$RC"
+has "...saying what to give" "need their session token" "$OUT"
+printf '%s' '{"Credentials": {"AccessKeyId": "ASIAEXAMPLEKEYID0001", "SecretAccessKey": "'"$AWSSECRET"'", "SessionToken": "FwoGZXIvYXdzEXAMPLETOKEN", "Expiration": "2026-10-29T01:00:00Z"}}' > "$WORK/sts.json"
+OUT="$(eng connect s3 --name docs $S3_SET --secret-stdin < "$WORK/sts.json" 2>&1)"; RC=$?
+check "the JSON aws sts prints connects: exit 0" "0" "$RC"
+has "...the token travels in the CONNECTION" '"awsSessionToken": "FwoGZXIvYXdzEXAMPLETOKEN"' "$(dbq 'd["connections"]["EXAKIT_SRC_DOCS"]["secret"]')"
+has "...and the user hears that it expires, with the reauth" "temporary credentials expire" "$OUT"
+lacks "...the token is not printed" "FwoGZXIvYXdzEXAMPLETOKEN" "$OUT"
+NEWAWS="AnotherSecretKeyValue0000000000000000000"
+db "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["sources"][sys.argv[2]]["secret"]=sys.argv[3]; print(json.dumps(d))' "$STATE" "$S3HOST" "$NEWAWS")"
+printf '%s' '{"AccessKey": {"AccessKeyId": "AKIAEXAMPLEKEYID0002", "SecretAccessKey": "'"$NEWAWS"'"}}' > "$WORK/s3key2.json"
+OUT="$(eng reauth docs --secret-stdin < "$WORK/s3key2.json" 2>&1)"; RC=$?
+check "reauth with a new key file: exit 0" "0" "$RC"
+has "...the CONNECTION holds the new key, the bucket and region kept" '{"awsAccessKeyId": "AKIAEXAMPLEKEYID0002", "awsSecretAccessKey": "AnotherSecretKeyValue0000000000000000000", "awsRegion": "ap-south-1", "s3Bucket": "docs-bucket"}' \
+    "$(dbq 'd["connections"]["EXAKIT_SRC_DOCS"]["secret"]')"
+run remove docs
 
 printf '\n== the hidden prompt hides from the first keystroke ==\n'
 # Measured: with the prompt printed first and echo turned off after it, input

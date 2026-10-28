@@ -13,6 +13,7 @@ import json
 import os
 import re
 
+import document
 import tlsca
 
 KINDS = {
@@ -21,6 +22,11 @@ KINDS = {
     "name": re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_$.-]{0,127}$"),
     "account": re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"),
     "text": re.compile(r"^[^\x00-\x1f'\"\\]{1,128}$"),
+    # No dots: a dotted bucket's virtual-hosted name (a.b.s3.<region>.amazonaws.com)
+    # does not match the S3 certificate, and path-style access is not offered.
+    "s3-bucket": re.compile(r"^(?!xn--)[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$"),
+    "aws-region": re.compile(r"^[a-z]{2}(-gov)?-[a-z]+-\d{1,2}$"),
+    "aws-key-id": document.KEY_ID,
 }
 
 
@@ -132,8 +138,22 @@ def validate_inputs(connector, given):
             except tlsca.CaError as error:
                 problems.append(str(error))
                 continue
+        elif kind == "edml":
+            raw = os.path.abspath(os.path.expanduser(raw))
+            try:
+                document.load_mappings(raw)
+            except document.DocumentError as error:
+                problems.append(str(error))
+                continue
+        elif kind == "s3-bucket" and "." in raw:
+            problems.append("bucket %s has dots: its HTTPS name does not match the S3 certificate, and the kit "
+                            "reads only over verified HTTPS" % raw)
+            continue
         elif kind in KINDS and not KINDS[kind].match(raw):
             problems.append("%s=%r is not a valid %s" % (name, raw, kind))
+            continue
+        if kind == "aws-region" and raw.startswith("cn-"):
+            problems.append("the China regions use other endpoints, which this connector does not reach")
             continue
         if kind == "host" and raw.strip("[]").lower() in LOOPBACK:
             problems.append(LOOPBACK_ADVICE)
@@ -208,7 +228,9 @@ def describe(defs, connector_id, name, values, runtime, cache, store):
     names = objects(name)
     downloads = []
     for role in ("adapter", "driver"):
-        pin = connector[role]
+        pin = connector.get(role)
+        if not pin:
+            continue
         downloads.append({"role": role, "asset": pin["asset"], "version": pin["version"], "bytes": pin["size"],
                           "cached": cache.has(pin), "license": pin["license"]})
     steps = ["verify Java and its DNS in the database (resolve %s)" % (source_host(connector, values) or "the source")]
@@ -229,10 +251,21 @@ def describe(defs, connector_id, name, values, runtime, cache, store):
             how = ("%d certificates; a verified handshake from this computer picks the one that signs %s"
                    % (count, source_host(connector, values)))
         steps.append("trust the CA in %s for this source only (%s)" % (values["ca"], how))
-    steps += ["create CONNECTION %s" % names["connection"],
-              "create adapter script %s.%s" % (names["script_schema"], names["script"]),
-              "create virtual schema %s" % names["schema"],
-              "verify metadata and one bounded read"]
+    if values.get("mapping"):
+        tables = document.load_mappings(values["mapping"])
+        steps += ["stage the mapping from %s (%d mapped table%s: %s)" % (values["mapping"], len(tables),
+                                                                "" if len(tables) == 1 else "s",
+                                                                ", ".join(t["table"] for t in tables)),
+                  "create CONNECTION %s (the credential as JSON, inside the database only)" % names["connection"],
+                  "create adapter script %s.%s and its import script %s.%s"
+                  % (names["script_schema"], names["script"], names["script_schema"], connector["import_script"]),
+                  "create virtual schema %s" % names["schema"],
+                  "verify every table with a bounded read"]
+    else:
+        steps += ["create CONNECTION %s" % names["connection"],
+                  "create adapter script %s.%s" % (names["script_schema"], names["script"]),
+                  "create virtual schema %s" % names["schema"],
+                  "verify metadata and one bounded read"]
     plan = {
         "connector": connector_id, "name": name, "tier": entry["tier"], "status": entry["status"],
         "objects": names, "downloads": downloads, "steps": steps,

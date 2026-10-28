@@ -9,8 +9,12 @@ database and inspect it afterwards:
                 a host ending in .invalid answers "dns ..." (no such name)
     unreachable host names whose TCP probe fails
     clock_skew  seconds the database clock is off this computer's (negative: behind)
-    sources     {host: {"tables": [...], "fail": null|"auth"|"tls"|"tls-validity"|"unreachable",
+    sources     {host: {"tables": [...], "fail": null|"auth"|"tls"|"tls-validity"|"unreachable"|"denied",
                         "secret": "<the credential the source accepts>"}}
+                a document source (S3) is keyed by <bucket>.s3.<region>.amazonaws.com
+                and also takes "region" (the bucket's real one) and "empty"
+                (tables whose objects match nothing); its tables come from the
+                mapping staged under FAKE_VS_EXA, as the adapter reads them
     connections {NAME: {"url", "user", "secret"}}    what the engine created
     schemas, scripts, virtual {VS: {"connection", "tables"}}
     statements  every statement, secrets included, so a test can prove where
@@ -45,10 +49,49 @@ def _host(url):
     return m.group(1) if m else ""
 
 
+def _s3_error(text):
+    # The shape measured on Exasol Personal: the UDF wrapper, then the SDK's exception.
+    return Exception("VM error: F-UDF-CL-LIB-1126: F-UDF-CL-SL-JAVA-1006: F-UDF-CL-SL-JAVA-1026:\n"
+                     "com.exasol.ExaUDFException: F-UDF-CL-SL-JAVA-1068: Exception during singleCall adapterCall\n"
+                     "software.amazon.awssdk.services.s3.model.%s (SDK Attempt Count: 1)\n"
+                     "\tsoftware.amazon.awssdk.services.s3.model.S3Exception$BuilderImpl.build(S3Exception.java:113)" % text)
+
+
+def _document_source(doc, con):
+    cred = json.loads(con["secret"])
+    host = "%s.s3.%s.amazonaws.com" % (cred["s3Bucket"], cred["awsRegion"])
+    src = doc["sources"].get(host)
+    if src is None:
+        # The bucket answers from its own region: any other region's endpoint redirects.
+        for other, candidate in doc["sources"].items():
+            if other.startswith(cred["s3Bucket"] + ".s3."):
+                raise _s3_error("S3Exception: The bucket you are attempting to access must be addressed using the "
+                                "specified endpoint. Please send all future requests to this endpoint. (Service: S3, "
+                                "Status Code: 301, Request ID: R1)")
+        raise _s3_error("NoSuchBucketException: The specified bucket does not exist (Service: S3, Status Code: 404, "
+                        "Request ID: R2)")
+    if src.get("fail") == "auth" or (src.get("secret") is not None and cred["awsSecretAccessKey"] != src["secret"]):
+        raise _s3_error("S3Exception: The request signature we calculated does not match the signature you provided. "
+                        "Check your key and signing method. (Service: S3, Status Code: 403, Request ID: R3)")
+    if src.get("fail") == "denied":
+        raise _s3_error("AccessDeniedException: User: arn:aws:iam::1:user/reader is not authorized to perform: "
+                        "s3:ListBucket on resource: \"arn:aws:s3:::%s\" (Service: S3, Status Code: 403, Request ID: R4)"
+                        % cred["s3Bucket"])
+    return src
+
+
+def _mapping_tables(path):
+    folder = os.path.join(os.environ["FAKE_VS_EXA"], "bucketfs", *path.strip("/").split("/"))
+    return sorted(json.load(open(os.path.join(folder, n)))["destinationTable"].upper()
+                  for n in os.listdir(folder) if n.endswith(".json"))
+
+
 def _source_for(doc, connection):
     con = doc["connections"].get(connection)
     if not con:
         raise Exception("connection %s not found" % connection)
+    if con["url"] == "" and con["secret"].startswith("{"):
+        return _document_source(doc, con)
     src = doc["sources"].get(_host(con["url"]))
     if src is None:
         raise Exception("JDBC-Client-Error: The connection attempt failed.")
@@ -134,15 +177,15 @@ class Fake(object):
             vs = doc["virtual"].get(m.group(1))
             if vs is None:
                 raise Exception("schema %s not found" % m.group(1))
-            _source_for(doc, vs["connection"])
-            return [{"X": 1}]
+            src = _source_for(doc, vs["connection"])
+            return [] if m.group(2) in src.get("empty", []) else [{"X": 1}]
         raise Exception("fake: unexpected query: %s" % sql[:80])
 
     def _execute(self, doc, sql):
         if sql == "CREATE SCHEMA EXAKIT_VS":
             doc["schemas"].append("EXAKIT_VS")
             return
-        m = re.match(r"CREATE OR REPLACE JAVA (SCALAR|ADAPTER) SCRIPT (?:\"?)([\w]+)(?:\"?)\.(?:\"?)([\w]+)", sql)
+        m = re.match(r"CREATE OR REPLACE JAVA (SCALAR|ADAPTER|SET) SCRIPT (?:\"?)([\w]+)(?:\"?)\.(?:\"?)([\w]+)", sql)
         if m:
             if not doc["java"]:
                 raise Exception("No usable script language container is installed for the requested language.")
@@ -157,6 +200,11 @@ class Fake(object):
             doc["connections"][m.group(2)] = {"url": m.group(3), "user": (m.group(4) or "").replace("''", "'"),
                                               "secret": (m.group(5) or "").replace("''", "'")}
             return
+        m = re.match(r'CREATE VIRTUAL SCHEMA "([^"]+)" USING .* CONNECTION_NAME = \'([^\']+)\' MAPPING = \'([^\']+)\'', sql)
+        if m:
+            # Measured: with explicit fields the adapter reads no object until a query.
+            doc["virtual"][m.group(1)] = {"connection": m.group(2), "tables": _mapping_tables(m.group(3))}
+            return
         m = re.match(r'CREATE VIRTUAL SCHEMA "([^"]+)" USING .* CONNECTION_NAME = \'([^\']+)\'', sql)
         if m:
             src = _source_for(doc, m.group(2))
@@ -165,7 +213,9 @@ class Fake(object):
         m = re.match(r'ALTER VIRTUAL SCHEMA "([^"]+)" REFRESH', sql)
         if m:
             vs = doc["virtual"][m.group(1)]
-            vs["tables"] = list(_source_for(doc, vs["connection"]).get("tables", []))
+            src = _source_for(doc, vs["connection"])
+            if "tables" in src:
+                vs["tables"] = list(src["tables"])
             return
         m = re.match(r'DROP (FORCE )?VIRTUAL SCHEMA "([^"]+)"', sql)
         if m:
@@ -175,6 +225,10 @@ class Fake(object):
             doc["virtual"].pop(m.group(2), None)
             return
         m = re.match(r'DROP ADAPTER SCRIPT "([^"]+)"\."([^"]+)"', sql)
+        if m:
+            doc["scripts"] = [s for s in doc["scripts"] if s != "%s.%s" % m.groups()]
+            return
+        m = re.match(r'DROP SCRIPT "([^"]+)"\."([^"]+)"$', sql)
         if m:
             doc["scripts"] = [s for s in doc["scripts"] if s != "%s.%s" % m.groups()]
             return

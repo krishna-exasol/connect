@@ -1,6 +1,6 @@
 ---
 name: exasol-virtual-schemas
-description: Query an external database - PostgreSQL, MySQL, SQL Server, Oracle or Snowflake - from the local Exasol database through a virtual schema, with exakit connect and exakit source. Covers giving inputs unattended, passing the credential safely (never as an argument), reading the plan, the "localhost inside the database is not this computer" trap, the failure classes and their fixes (auth, TLS, unreachable, no DNS, no Java), reauth after a password change, disconnect versus remove, and why BigQuery is gated. Triggers — "connect my Postgres to Exasol", "query MySQL from Exasol", "virtual schema", "federate a remote database", "exakit connect", "exakit source", "my source password changed", "the virtual schema stopped working", "remove a connected source", "join local tables with a remote database", "connect Snowflake", "connect SQL Server", "connect Oracle".
+description: Query an external database - PostgreSQL, MySQL, SQL Server, Oracle or Snowflake - or JSON, CSV and Parquet files in an Amazon S3 bucket from the local Exasol database through a virtual schema, with exakit connect and exakit source. Covers giving inputs unattended, passing the credential safely (never as an argument), reading the plan, the "localhost inside the database is not this computer" trap, the failure classes and their fixes (auth, TLS, unreachable, no DNS, no Java, S3 access denied or wrong region), the EDML mapping that turns S3 objects into tables, reauth after a password change, disconnect versus remove, and why BigQuery is gated. Triggers — "connect my Postgres to Exasol", "query MySQL from Exasol", "virtual schema", "federate a remote database", "exakit connect", "exakit source", "my source password changed", "the virtual schema stopped working", "remove a connected source", "join local tables with a remote database", "connect Snowflake", "connect SQL Server", "connect Oracle", "query files in S3", "connect an S3 bucket", "JSON files in S3 as a table", "EDML mapping".
 ---
 
 # Virtual schemas — query a remote database from local Exasol
@@ -17,6 +17,7 @@ database runs every query, even after `exakit` exits.
 | SQL Server | `sqlserver` (`mssql`) | candidate |
 | Oracle | `oracle` (`ora`) | candidate |
 | Snowflake | `snowflake` (`sf`) | candidate |
+| Amazon S3 (JSON, CSV, Parquet files) | `s3` (`aws-s3`) | candidate |
 | BigQuery | `bigquery` (`bq`) | **gated** — not available yet |
 
 `candidate` means defined and tested against a simulated database, not yet
@@ -90,6 +91,44 @@ SQL Server 1433 schema `dbo`; Oracle 1521 (TCPS listeners are often 2484) with
 `service` and `schema`; Snowflake `account` (`orgname-account`), `database`,
 `warehouse`, a programmatic access token as the credential.
 
+## Amazon S3: files as tables
+
+S3 is not a database, so two things replace host/user/password: an **EDML
+mapping** that says which objects become which table, and an **access key**.
+
+```bash
+# mapping/orders.json - one file per table (a folder of them is fine)
+{"$schema": "https://schemas.exasol.com/edml-2.1.0.json",
+ "source": "data/orders/*.jsonl", "destinationTable": "ORDERS",
+ "mapping": {"fields": {"order_id": {"toDecimalMapping": {"decimalPrecision": 10, "decimalScale": 0}},
+                        "status": {"toVarcharMapping": {"varcharColumnSize": 20}}}}}
+
+exakit connect s3 --name docs --set bucket=my-bucket --set region=eu-central-1 \
+  --set mapping=./mapping --password-file ~/keys/reader.json
+```
+
+- **The key**: `--password-file` with the JSON that `aws iam create-access-key`
+  or `aws sts get-session-token` prints, or the secret key alone on stdin plus
+  `--set access_key_id=AKIA...`. Temporary (`ASIA...`) keys need their
+  session token, so give the sts JSON; they expire, and `exakit source reauth
+  <name> --password-file <new.json>` replaces them. The kit never reads `~/.aws`.
+- **Least privilege**: the key needs `s3:ListBucket` on the mapped prefixes and
+  `s3:GetObject` on the objects - nothing else. Suggest a dedicated read-only
+  IAM user, not the user's own keys.
+- **The mapping**: `source` is the object key or glob inside the bucket (no
+  `s3://`); the type comes from the extension - `.json` (one document per
+  file), `.jsonl`, `.csv`, `.parquet`. CSV and Parquet can omit `mapping` and
+  have columns inferred; JSON needs explicit fields. A nested list becomes a
+  second table (`toTableMapping`, e.g. `ORDERS_ITEMS` keyed by
+  `ORDERS_ORDER_ID`); `"addSourceReferenceColumn": true` adds the object key
+  as `SOURCE_REFERENCE`, and `WHERE SOURCE_REFERENCE = '...'` reads one file.
+  The kit checks the mapping before anything happens.
+- **A glob that matches nothing is an empty table, not an error**: connect and
+  check name such tables ("No rows in EVENTS").
+- Standard regional endpoints over verified HTTPS only: a bucket with dots,
+  China regions, custom endpoints and anonymous access are refused.
+- To change the mapping: `exakit source remove <name>`, then connect again.
+
 ## Query it
 
 ```bash
@@ -112,6 +151,9 @@ little work — keep remote queries selective.
 | `tls-failed` | certificate or host name did not verify | PKIX: the CA is private - reconnect with `--set ca=<PEM>`. "validity check failed": restart the database (clock). Otherwise fix the server certificate; do not silently drop to `require` |
 | `unreachable` | the source does not answer from inside the database | host, port, firewall, VPN; `localhost` trap above |
 | "does not resolve" | the host name does not exist | check the spelling |
+| `access-denied` | S3: the key works but may not list or read (the message names the action, e.g. `s3:ListBucket`) | grant that permission on the prefix, then `exakit source check <name>` - not reauth |
+| S3 "addressed using the specified endpoint" | the bucket is in another region | reconnect with `--set region=<the bucket's region>` |
+| S3 "RequestTimeTooSkewed" | the database clock is off (signed requests allow 15 minutes) | `exakit stop`, then `exakit start` |
 
 A failed **first** connect leaves nothing behind — re-run it with corrected
 input. The kit repairs two things itself and retries once: Java in the database
