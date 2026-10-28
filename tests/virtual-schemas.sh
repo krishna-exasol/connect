@@ -181,6 +181,23 @@ raw = sys.argv[2]
 print(sql.classify_raw(sql.summarize(raw), raw))
 PYC
 )"
+# Measured live on RDS MySQL 8.4: Connector/J wraps a failed certificate
+# check in "Communications link failure", and the kit had sent the user to
+# check the firewall of a server its own route check had just reached.
+RAW_MY_TLS='com.exasol.adapter.jdbc.RemoteMetadataReaderException: E-VSMYSQL-1: Unable to create MySQL remote metadata reader. Caused by: Communications link failure
+Caused by: com.mysql.cj.jdbc.exceptions.CommunicationsException: Communications link failure
+Caused by: com.mysql.cj.exceptions.CJCommunicationsException: Communications link failure
+Caused by: javax.net.ssl.SSLHandshakeException: (certificate_unknown) java.security.cert.CertPathValidatorException: Path does not chain with any of the trust anchors'
+RAW_MY_DOWN='com.exasol.adapter.jdbc.RemoteMetadataReaderException: E-VSMYSQL-1: Unable to create MySQL remote metadata reader. Caused by: Communications link failure
+Caused by: com.mysql.cj.jdbc.exceptions.CommunicationsException: Communications link failure
+Caused by: java.net.ConnectException: Connection refused'
+check "MySQL's 'Communications link failure' over a certificate cause is tls; over a refused connect, unreachable" "tls unreachable" \
+    "$(python3 - "$ROOT" "$RAW_MY_TLS" "$RAW_MY_DOWN" <<'PYC'
+import sys; sys.path.insert(0, sys.argv[1] + "/setup/virtual-schemas/engine")
+import sql
+print(" ".join(sql.classify_raw(sql.summarize(raw), raw) for raw in sys.argv[2:4]))
+PYC
+)"
 
 printf '\n== connect: the happy path ==\n'
 db '{"sources": {"pg.example.com": {"tables": ["ORDERS", "CUSTOMERS"]}}}'

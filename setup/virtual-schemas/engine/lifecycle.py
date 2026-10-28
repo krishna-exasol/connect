@@ -51,7 +51,8 @@ def tls_remedy(message, connector):
     if re.search(r"validity check failed|NotYetValid|not yet valid|CertificateExpired|has expired", text, re.I):
         return ("a certificate is outside its validity dates by the database's clock; if this computer slept or "
                 "hibernated, the database clock may be behind - restart it (exakit stop, then exakit start) and retry")
-    if (re.search(r"PKIX path building failed|unable to find valid certification path", text, re.I)
+    if (re.search(r"PKIX path building failed|unable to find valid certification path|"
+                  r"Path does not chain with any of the trust anchors", text, re.I)
             and any(spec["kind"] == "ca-file" for spec in connector["inputs"])):
         return ("the database does not trust the certificate authority that signed the source's certificate - "
                 "managed databases (AWS RDS, Azure) and company servers use their own; download that CA as PEM "

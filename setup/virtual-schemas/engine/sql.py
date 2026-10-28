@@ -57,10 +57,16 @@ def classify_raw(summary, raw):
     are read - a whole stack names classes (SSL..., TLS...) that would
     misfile it."""
     kind = classify(summary)
-    if kind != "error":
+    if kind not in ("error", "unreachable"):
         return kind
-    causes = [l for l in str(raw).splitlines() if "Caused by" in l or re.search(r"Exception: ", l)]
-    return classify("\n".join(causes))
+    causes = classify("\n".join(l for l in str(raw).splitlines() if "Caused by" in l or re.search(r"Exception: ", l)))
+    if kind == "unreachable" and causes != "tls":
+        return kind
+    # MySQL's Connector/J reports a failed certificate check as
+    # "Communications link failure" and names the SSLHandshakeException only
+    # in a cause (measured on RDS MySQL 8.4): the server answered, so the
+    # fix is the certificate, not the firewall.
+    return causes
 
 
 def ident(name):
