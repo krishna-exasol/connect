@@ -72,11 +72,6 @@
         "require",
         "disable"
       ]
-    },
-    {
-      "name": "ca",
-      "label": "CA certificate file (PEM) - only for a private CA such as AWS RDS or Azure; Enter to skip",
-      "kind": "ca-file"
     }
   ],
   "auth": "password",
@@ -86,7 +81,6 @@
     "require": "encrypt=true;trustServerCertificate=true",
     "disable": "encrypt=false"
   },
-  "tls_truststore": "encrypt=true;trustServerCertificate=false;hostNameInCertificate={host};trustStore={truststore};trustStoreType=JKS",
   "vs_properties": {
     "CATALOG_NAME": "{database}",
     "SCHEMA_NAME": "{schema}"
@@ -94,6 +88,6 @@
   "notes": [
     "SQL Server login only; Windows authentication and Entra ID are not part of this connector.",
     "Exasol tested the jre8 build of mssql-jdbc 13.4.0; it runs on the Java 17 container.",
-    "A server with a private CA (AWS RDS, Azure, a company CA) is verified against it with --set ca=<PEM file or bundle>: mssql-jdbc reads trust only from a file, so the kit writes the bundle as a JKS truststore for this source and gives its path relative to where both the adapter and the loader start."
+    "No ca input (yet): mssql-jdbc reads trust only from a file, and on Exasol Personal no path reaches both readers - the adapter starts in / with the bucket at /buckets, the loader starts in / of the database container with the bucket at /exa/bucketfs (measured). And the loader's own CA store is empty (its Java's cacerts is an absolute symlink outside its root), so verify fails there for any CA until Exasol Personal fixes it."
   ]
 }

@@ -54,11 +54,16 @@ Rules that are not negotiable:
 - **A private CA is trusted, not skipped.** Managed databases (AWS RDS, Azure)
   and company servers sign with a CA Java does not hold, so the first verified
   connect fails with "PKIX path building failed" (MySQL: "Path does not chain
-  with any of the trust anchors"). PostgreSQL, MySQL and SQL Server take
+  with any of the trust anchors"). PostgreSQL and MySQL take
   `--set ca=<PEM file>`: the CA's certificate, or the vendor's bundle (for RDS
   the region's, from `https://truststore.pki.rds.amazonaws.com/<region>/<region>-bundle.pem`).
   The kit keeps it with the source. Do not answer a PKIX error with
   `tls=require`.
+- **"the trustAnchors parameter must be non-empty"** is Exasol Personal's
+  JDBC loader having no CA store of its own: it verifies nothing unless given
+  a CA. PostgreSQL and MySQL: `--set ca=<PEM>` (a public CA's root works too).
+  SQL Server cannot take a CA on Exasol Personal yet; `tls=require` encrypts
+  without verifying - only if the user accepts that.
 - **"validity check failed"** with a certificate that is in date means the
   database clock is behind - after the laptop slept or hibernated, Exasol
   Personal's clock does not catch up. `exakit stop`, then `exakit start`.

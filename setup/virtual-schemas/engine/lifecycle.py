@@ -49,12 +49,21 @@ def tls_remedy(message, connector):
     against RDS: the CA a JVM does not hold, and a database clock left behind
     by a laptop that hibernated."""
     text = str(message)
+    has_ca = any(spec["kind"] == "ca-file" for spec in connector["inputs"])
+    if re.search(r"trustAnchors parameter must be non-empty", text, re.I):
+        # Measured on Exasol Personal 2.3.0: the JDBC loader runs the language
+        # container's Java outside it, and that Java's cacerts is an absolute
+        # symlink into the container's /etc - so the loader trusts nothing.
+        return ("the database's JDBC loader has no CA store of its own (an Exasol Personal issue), so it cannot "
+                "verify any certificate without one given to it" +
+                ("; give the CA as PEM with --set ca=<file> - for a public CA too, its root certificate"
+                 if has_ca else "; this connector cannot take a CA yet - tls=require encrypts without verifying, "
+                 "only if the user accepts that"))
     if re.search(r"validity check failed|NotYetValid|not yet valid|CertificateExpired|has expired", text, re.I):
         return ("a certificate is outside its validity dates by the database's clock; if this computer slept or "
                 "hibernated, the database clock may be behind - restart it (exakit stop, then exakit start) and retry")
     if (re.search(r"PKIX path building failed|unable to find valid certification path|"
-                  r"Path does not chain with any of the trust anchors", text, re.I)
-            and any(spec["kind"] == "ca-file" for spec in connector["inputs"])):
+                  r"Path does not chain with any of the trust anchors", text, re.I) and has_ca):
         return ("the database does not trust the certificate authority that signed the source's certificate - "
                 "managed databases (AWS RDS, Azure) and company servers use their own; download that CA as PEM "
                 "and give it with --set ca=<file>")

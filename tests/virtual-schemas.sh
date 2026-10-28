@@ -567,10 +567,10 @@ run_secret "$SECRET" connect pg --name rds $RDS_SET --secret-stdin
 check "connect to a private-CA source without ca: exit 1, nothing kept" "1 {}" "$RC $(dbq 'd["connections"]')"
 has "...and the fix is named" "give it with --set ca=<file>, then connect again" "$OUT"
 
-printf '\n== a private CA for drivers that read trust only from a file (MySQL, SQL Server) ==\n'
+printf '\n== a private CA for MySQL: a truststore file both readers find ==\n'
 # Measured on Exasol Personal: the adapter (a UDF) starts in "/" and sees the
-# bucket at /buckets/...; the loader starts in its driver folder and sees it
-# at /exa/bucketfs/... - so one RELATIVE path, with a copy under the loader.
+# bucket at /buckets/...; the MySQL loader resolves the same relative path
+# under its driver folder (/exa/jdbc/MYSQL), where the kit puts a copy.
 check "the truststore is a JKS: magic, version 2, two trusted entries, digest over the empty password" "ok" \
     "$(python3 - "$ROOT" "$CA/bundle.pem" <<'PYJ'
 import hashlib, struct, sys
@@ -583,33 +583,46 @@ ok = (magic, version, count) == (0xFEEDFEED, 2, 2) and data[-20:] == hashlib.sha
 print("ok" if ok and tags >= 2 else "bad %x %d %d %d" % (magic, version, count, tags))
 PYJ
 )"
-db '{"sources": {"ms.example.com": {"tables": ["ORDERS"]}}}'
-MS_SET="--set host=ms.example.com --set database=erp --set user=reader"
-run plan mssql --name ms $MS_SET --set ca="$CA/bundle.pem"
+MY_SET="--set host=my.example.com --set database=sakila --set user=reader"
+db '{"sources": {"my.example.com": {"tables": ["rental"]}}}'
+run plan mysql --name my $MY_SET --set ca="$CA/bundle.pem"
 has "the plan says the whole bundle becomes a truststore (no handshake needed)" "(2 certificates, in a truststore for the adapter and the loader)" "$OUT"
-run_secret "$SECRET" connect mssql --name ms $MS_SET --set ca="$CA/bundle.pem" --secret-stdin
-check "SQL Server with a CA bundle: exit 0, with no handshake from this computer (ms.example.com is not reachable)" "0" "$RC"
-REL="buckets/bfsdefault/default/exakit/vs/tls/ms.jks"
-has "...the URL verifies against the truststore by its relative path" \
-    "encrypt=true;trustServerCertificate=false;hostNameInCertificate=ms.example.com;trustStore=$REL;trustStoreType=JKS" \
-    "$(dbq 'd["connections"]["EXAKIT_SRC_MS"]["url"]')"
+run_secret "$SECRET" connect mysql --name my $MY_SET --set ca="$CA/bundle.pem" --secret-stdin
+check "MySQL with a CA bundle: exit 0, with no handshake from this computer (my.example.com is not reachable)" "0" "$RC"
+REL="buckets/bfsdefault/default/exakit/vs/tls/my.jks"
+has "...the URL verifies identity against the truststore by its relative path" \
+    "sslMode=VERIFY_IDENTITY&trustCertificateKeyStoreUrl=file:$REL&trustCertificateKeyStoreType=JKS" \
+    "$(dbq 'd["connections"]["EXAKIT_SRC_MY"]["url"]')"
 check "...one copy in the bucket for the adapter, one under the loader at the same relative path, identical" "yes" \
-    "$(cmp -s "$EXA/bucketfs/bfsdefault/default/exakit/vs/tls/ms.jks" "$EXA/jdbc/SQLSERVER/$REL" && echo yes || echo no)"
-run_secret "$NEWSECRET" reauth ms --secret-stdin
-has "reauth keeps the truststore in the URL" "trustStore=$REL" "$(dbq 'd["connections"]["EXAKIT_SRC_MS"]["url"]')"
-run remove ms
+    "$(cmp -s "$EXA/bucketfs/bfsdefault/default/exakit/vs/tls/my.jks" "$EXA/jdbc/MYSQL/$REL" && echo yes || echo no)"
+run_secret "$NEWSECRET" reauth my --secret-stdin
+has "reauth keeps the truststore in the URL" "trustCertificateKeyStoreUrl=file:$REL" "$(dbq 'd["connections"]["EXAKIT_SRC_MY"]["url"]')"
+run remove my
 check "remove deletes both copies (and the loader's now-empty folders)" "0 gone gone" \
-    "$RC $([ -e "$EXA/bucketfs/bfsdefault/default/exakit/vs/tls/ms.jks" ] && echo kept || echo gone) $([ -e "$EXA/jdbc/SQLSERVER/buckets" ] && echo kept || echo gone)"
+    "$RC $([ -e "$EXA/bucketfs/bfsdefault/default/exakit/vs/tls/my.jks" ] && echo kept || echo gone) $([ -e "$EXA/jdbc/MYSQL/buckets" ] && echo kept || echo gone)"
 db '{"sources": {"my.example.com": {"tables": ["rental"], "fail": "tls"}}}'
-run_secret "$SECRET" connect mysql --name my --set host=my.example.com --set database=sakila --set user=reader --set ca="$CA/bundle.pem" --secret-stdin
+run_secret "$SECRET" connect mysql --name my $MY_SET --set ca="$CA/bundle.pem" --secret-stdin
 check "a MySQL connect that fails leaves no truststore behind" "1 gone gone" \
     "$RC $([ -e "$EXA/bucketfs/bfsdefault/default/exakit/vs/tls/my.jks" ] && echo kept || echo gone) $([ -e "$EXA/jdbc/MYSQL/buckets" ] && echo kept || echo gone)"
-db '{"sources": {"my.example.com": {"tables": ["rental"]}}}'
-run_secret "$SECRET" connect mysql --name my --set host=my.example.com --set database=sakila --set user=reader --set ca="$CA/bundle.pem" --secret-stdin
-has "MySQL verifies identity against the truststore (Connector/J takes a file: URL)" \
-    "sslMode=VERIFY_IDENTITY&trustCertificateKeyStoreUrl=file:buckets/bfsdefault/default/exakit/vs/tls/my.jks&trustCertificateKeyStoreType=JKS" \
-    "$(dbq 'd["connections"]["EXAKIT_SRC_MY"]["url"]')"
-run remove my
+# SQL Server: its loader starts in / of the database container (measured), so
+# no one path reaches both readers; it takes no ca rather than a broken one.
+run plan mssql --name ms --set host=ms.example.com --set database=erp --set user=reader --set ca="$CA/bundle.pem"
+check "SQL Server does not offer ca (it could not work there yet): exit 2" "2" "$RC"
+has "...named as an unknown input" "ca is not an input of sqlserver" "$OUT"
+E6="$(python3 - "$ROOT" <<'PYE'
+import json, sys
+sys.path.insert(0, sys.argv[1] + "/setup/virtual-schemas/engine")
+import lifecycle
+load = lambda c: json.load(open(sys.argv[1] + "/setup/virtual-schemas/connectors/%s/connector.json" % c))
+text = "ETL-5402: ... Error: (internal_error) Unexpected error: java.security.InvalidAlgorithmParameterException: the trustAnchors parameter must be non-empty."
+print(lifecycle.tls_remedy(text, load("mysql")))
+print(lifecycle.tls_remedy(text, load("sqlserver")))
+PYE
+)"
+has "the loader's empty CA store (measured, Exasol Personal) is explained, with --set ca where it exists" \
+    "has no CA store of its own (an Exasol Personal issue)" "$(printf '%s\n' "$E6" | sed -n 1p)"
+has "...for MySQL: give the CA" "give the CA as PEM with --set ca=<file>" "$(printf '%s\n' "$E6" | sed -n 1p)"
+has "...for SQL Server: says it cannot take one yet, and what require would mean" "cannot take a CA yet - tls=require encrypts without verifying" "$(printf '%s\n' "$E6" | sed -n 2p)"
 
 printf '\n== the hidden prompt hides from the first keystroke ==\n'
 # Measured: with the prompt printed first and echo turned off after it, input
