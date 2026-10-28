@@ -53,8 +53,8 @@ CLOCK_LIMIT = 120
 
 
 def clock_words(seconds):
-    """'33 min behind', '1 h 25 min ahead' - twin of exakit_clock_skew_words."""
-    direction = "behind" if seconds < 0 else "ahead"
+    """'33 min behind', '1 h 25 min ahead of' - twin of exakit_clock_skew_words."""
+    direction = "behind" if seconds < 0 else "ahead of"
     minutes = (abs(int(seconds)) + 30) // 60
     if minutes >= 60:
         return "%d h %d min %s" % (minutes // 60, minutes % 60, direction)
