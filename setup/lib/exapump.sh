@@ -2946,11 +2946,11 @@ exakit_db_clock_skew() {
     printf '%s\n' $(( _dcs_db - (_dcs_before + _dcs_after) / 2 ))
 }
 
-# exakit_clock_skew_words <seconds> — "32 min behind", "1 h 25 min ahead":
+# exakit_clock_skew_words <seconds> — "32 min behind", "1 h 25 min ahead of":
 # the skew as the screen and the hint say it.
 exakit_clock_skew_words() {
     _csw_s="$1"
-    _csw_dir="ahead"
+    _csw_dir="ahead of"
     if [ "$_csw_s" -lt 0 ]; then _csw_s=$(( -_csw_s )); _csw_dir="behind"; fi
     _csw_m=$(( (_csw_s + 30) / 60 ))
     if [ "$_csw_m" -ge 60 ]; then

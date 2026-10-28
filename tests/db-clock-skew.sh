@@ -76,7 +76,7 @@ took=$(( $(date +%s) - start ))
 [ "$rc" -ne 0 ] && [ "$took" -le 6 ] && pass "a database that never answers is given up on (${took}s)" \
     || fail "a database that never answers held the check ${took}s (rc $rc)"
 
-for pair in "0|0 min ahead" "-1955|33 min behind" "-5100|1 h 25 min behind" "-8760|2 h 26 min behind" "150|3 min ahead"; do
+for pair in "0|0 min ahead of" "-1955|33 min behind" "-5100|1 h 25 min behind" "-8760|2 h 26 min behind" "150|3 min ahead of"; do
     expect "words for ${pair%%|*}" "${pair#*|}" "$(helpers exakit_clock_skew_words "${pair%%|*}")"
 done
 for pair in "0|no" "-119|no" "119|no" "-120|yes" "120|yes" "-1955|yes" "|no"; do

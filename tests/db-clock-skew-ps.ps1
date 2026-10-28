@@ -63,11 +63,11 @@ try {
 
     Write-Host ""
     Write-Host "== the words and the limit (twin of exakit_clock_skew_words / exakit_clock_skewed) =="
-    Check "words for 0" "0 min ahead" (Format-ExakitClockSkew 0)
+    Check "words for 0" "0 min ahead of" (Format-ExakitClockSkew 0)
     Check "words for -1955" "33 min behind" (Format-ExakitClockSkew -1955)
     Check "words for -5100" "1 h 25 min behind" (Format-ExakitClockSkew -5100)
     Check "words for -8760" "2 h 26 min behind" (Format-ExakitClockSkew -8760)
-    Check "words for 150" "3 min ahead" (Format-ExakitClockSkew 150)
+    Check "words for 150" "3 min ahead of" (Format-ExakitClockSkew 150)
     Check "skewed? -119" $false (Test-ExakitClockSkewed -119)
     Check "skewed? 119" $false (Test-ExakitClockSkewed 119)
     Check "skewed? -120" $true (Test-ExakitClockSkewed -120)

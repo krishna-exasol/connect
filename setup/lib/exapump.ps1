@@ -2910,11 +2910,11 @@ function Get-ExakitDbClockSkew {
     return [long]$Matches[1] - [long][Math]::Floor(($before + $after) / 2)
 }
 
-# Format-ExakitClockSkew <seconds> - "32 min behind", "1 h 25 min ahead".
+# Format-ExakitClockSkew <seconds> - "32 min behind", "1 h 25 min ahead of".
 # twin: exakit_clock_skew_words in setup/lib/exapump.sh.
 function Format-ExakitClockSkew {
     param([long]$Seconds)
-    $dir = "ahead"
+    $dir = "ahead of"
     if ($Seconds -lt 0) { $Seconds = -$Seconds; $dir = "behind" }
     $minutes = [long][Math]::Floor(($Seconds + 30) / 60)
     if ($minutes -ge 60) { return "$([long][Math]::Floor($minutes / 60)) h $($minutes % 60) min $dir" }
