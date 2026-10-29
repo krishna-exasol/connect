@@ -33,6 +33,10 @@ KINDS = {
     # Host list, path and options only: the credentials go into the CONNECTION.
     "mongodb-uri": re.compile(r"^mongodb(\+srv)?://[A-Za-z0-9.,:\[\]_-]+(/[A-Za-z0-9._~%&=?,:/+-]*)?$"),
     "mongo-name": re.compile(r"^[^\x00-\x1f'\"\\$/\s]{1,120}$"),
+    # The adapter puts these into a REST query string unencoded and the path
+    # into the JDBC URL, so neither may carry & # ? ; or a quote.
+    "databricks-name": re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]{0,254}$"),
+    "databricks-http-path": re.compile(r"^/sql/1\.0/warehouses/[A-Za-z0-9]{1,64}$|^/sql/protocolv1/o/\d{1,20}/[A-Za-z0-9-]{1,64}$"),
 }
 
 
@@ -263,7 +267,7 @@ def describe(defs, connector_id, name, values, runtime, cache, store):
     names = objects(name, connector)
     profile = defs.profile(connector["profile"])
     downloads = []
-    for role in ("adapter", "driver"):
+    for role in ("adapter", "trust", "driver"):
         pin = connector.get(role)
         if not pin:
             continue
@@ -301,6 +305,13 @@ def describe(defs, connector_id, name, values, runtime, cache, store):
                   % (names["script_schema"], names["script"], names["script_schema"], connector["import_script"]),
                   "create virtual schema %s" % names["schema"],
                   "verify every table with a bounded read"]
+    elif profile["adapter_script"].get("language") == "LUA":
+        steps += ["create CONNECTION %s (the token as its password, inside the database only)" % names["connection"],
+                  "create Lua adapter script %s.%s: upstream's file unchanged, plus the kit's check of the REST "
+                  "API's certificate and host name against the pinned CA bundle (upstream turns it off)"
+                  % (names["script_schema"], names["script"]),
+                  "create virtual schema %s" % names["schema"],
+                  "verify metadata and one bounded read"]
     elif connector.get("shared_adapter"):
         steps += ["create CONNECTION %s" % names["connection"],
                   "create adapter script %s.%s and its scan UDF %s.%s (shared by every %s source)"

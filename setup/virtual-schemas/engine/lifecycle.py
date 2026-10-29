@@ -29,6 +29,7 @@ import sources
 import sql
 import tlsca
 import keyfile
+import luaadapter
 import tlshelper
 
 PROBE = "EXAKIT_DNS_PROBE_V2"
@@ -58,14 +59,19 @@ REMEDY_FOR = {
 
 
 
-def remedy_for(kind, name, connector):
-    """The fix for a failure class, in the words of the connector's store."""
+def remedy_for(kind, name, connector, message=None):
+    """The fix for a failure class, in the words of the connector's store.
+    An error_hint given as {"match", "text"} is said only for a message it
+    matches; a plain string, for every unclassified failure."""
     text = REMEDY_FOR.get(kind, REMEDY_FOR["error"]).format(
         name=name, access=connector.get("access", "read access"), store=connector.get("store", "bucket"))
     if kind == "auth" and connector.get("auth_hint"):
         text += "; %s" % connector["auth_hint"]
-    if kind == "error" and connector.get("error_hint"):
-        text = "%s; %s" % (connector["error_hint"], text)
+    hint = connector.get("error_hint")
+    if isinstance(hint, dict):
+        hint = hint["text"] if re.search(hint["match"], str(message or "")) else None
+    if kind == "error" and hint:
+        text = "%s; %s" % (hint, text)
     return text
 
 # Seconds the database clock may be off this computer's before it is named.
@@ -389,13 +395,19 @@ class Engine(object):
         adapter_pin, driver_pin = connector["adapter"], connector.get("driver")
         jars = []
         adapter_src = self.cache.fetch(adapter_pin)
-        dest = self.runtime.bucket_dir(cid, adapter_pin["version"], adapter_pin["asset"])
-        made = artifacts.stage_file(adapter_src, dest)
-        self.store.add_consumer(dest, adapter_pin["sha256"], name, made)
-        if made:
-            created["files"].append(dest)
-            self.store.save_journal(name, dict(self.store.journal(name) or {}, created=created))
-        jars.append(self.runtime.bucket_sql(cid, adapter_pin["version"], adapter_pin["asset"]))
+        lua = self.defs.profile(connector["profile"])["adapter_script"].get("language") == "LUA"
+        if lua:
+            # A Lua adapter's text goes into CREATE SCRIPT (adapter_sql reads
+            # these verified cache copies); the database reads no file of it.
+            jars += [adapter_src, self.cache.fetch(connector["trust"])]
+        else:
+            dest = self.runtime.bucket_dir(cid, adapter_pin["version"], adapter_pin["asset"])
+            made = artifacts.stage_file(adapter_src, dest)
+            self.store.add_consumer(dest, adapter_pin["sha256"], name, made)
+            if made:
+                created["files"].append(dest)
+                self.store.save_journal(name, dict(self.store.journal(name) or {}, created=created))
+            jars.append(self.runtime.bucket_sql(cid, adapter_pin["version"], adapter_pin["asset"]))
         if not driver_pin:
             # A document-files adapter carries its store's SDK; nothing else to stage.
             self.emit("OK", "Adapter %s verified and staged" % adapter_pin["version"])
@@ -407,7 +419,8 @@ class Engine(object):
                 jars.append(self.runtime.bucket_sql(cid, "driver-" + driver_pin["version"], jar))
                 self.store.add_consumer(os.path.join(bundle_dir, jar), driver_pin["sha256"], name, True)
                 created["files"].append(os.path.join(bundle_dir, jar))
-        else:
+        elif not lua:
+            # The Java adapter loads the driver too; a Lua one only the loader does.
             dest = self.runtime.bucket_dir(cid, "driver-" + driver_pin["version"], driver_pin["asset"])
             made = artifacts.stage_file(driver_src, dest)
             self.store.add_consumer(dest, driver_pin["sha256"], name, made)
@@ -504,10 +517,20 @@ class Engine(object):
                 failure.complete = True  # the credential's own problem, named; nothing ran
                 raise failure
             return "", "", text, hidden, notes
-        return None, values.get("user"), secret, [], []
+        # A connector with one fixed account name (Databricks: "token") takes
+        # no user input.
+        return None, connector.get("user", values.get("user")), secret, [], []
 
     def adapter_sql(self, names, jars, profile=None):
         script = (profile or self.profile)["adapter_script"]
+        if script.get("language") == "LUA":
+            try:
+                text = luaadapter.body(self.defs.root, script["suffix"], jars[0], jars[1])
+            except (luaadapter.LuaAdapterError, OSError, UnicodeDecodeError) as error:
+                raise Failure("the Lua adapter could not be assembled: %s" % error, EXIT["failed"])
+            # No closing "/": everything after AS is the Lua program.
+            return "CREATE OR REPLACE LUA ADAPTER SCRIPT %s.%s AS\n%s" % (
+                sql.ident(names["script_schema"]), sql.ident(names["script"]), text)
         if script.get("language") == "RUST":
             # The .so's entry point is bound to this script's name (measured).
             return "CREATE OR REPLACE RUST ADAPTER SCRIPT %s.%s AS\n%%udf_object %s;\n/" % (
@@ -709,7 +732,7 @@ class Engine(object):
                 # A first connect has no source record yet, so the lifecycle
                 # commands do not apply: nothing was left behind, and the fix is
                 # the same command with corrected input.
-                remedy = remedy_for(kind, name, connector)
+                remedy = remedy_for(kind, name, connector, error)
                 if getattr(error, "complete", False):
                     raise error
                 specific = tls_remedy(error, connector, self.clock()) if kind == "tls" else None
@@ -815,7 +838,7 @@ class Engine(object):
         except (Failure, sql.DbError) as error:
             kind = getattr(error, "kind", "error")
             status = self.record_check(name, "failed", str(error), kind)
-            remedy = remedy_for(kind, name, connector)
+            remedy = remedy_for(kind, name, connector, error)
             specific = tls_remedy(error, connector, self.clock()) if kind == "tls" else None
             if specific:
                 remedy = "%s; then: exakit source check %s" % (specific.replace(
@@ -1078,5 +1101,6 @@ class Engine(object):
                 connector = self.defs.connector(row["connector"])
             except (OSError, ValueError):
                 connector = {}
-            rows.append(dict(row, remedy=remedy_for(check.get("kind") or "error", row["name"], connector)))
+            rows.append(dict(row, remedy=remedy_for(check.get("kind") or "error", row["name"], connector,
+                                                                check.get("evidence"))))
         return rows

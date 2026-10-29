@@ -111,6 +111,18 @@
       "status": "candidate"
     },
     {
+      "id": "databricks",
+      "name": "Databricks",
+      "aliases": [
+        "dbx",
+        "databricks-sql",
+        "unity-catalog"
+      ],
+      "profile": "lua-jdbc",
+      "tier": "GA",
+      "status": "candidate"
+    },
+    {
       "id": "mongodb",
       "name": "MongoDB",
       "aliases": [

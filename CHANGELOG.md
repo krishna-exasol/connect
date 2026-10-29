@@ -97,6 +97,17 @@ can now finish setup that only the installer can do.**
   `exakit.loader.TrustStoreDriver`, which points it at the language
   container's own CA store and hands over to the Snowflake driver; nothing
   is disabled.
+- Databricks (Profile C, a Lua adapter): `exakit connect databricks` maps one
+  Unity Catalog schema through exasol/databricks-virtual-schema 1.0.2, with
+  the rows read over IMPORT FROM JDBC by the Databricks JDBC driver 3.4.3
+  (Apache-2.0, Maven Central). Upstream calls the REST API with certificate
+  verification off (its issue 4): the database's LuaSec refuses every CA
+  file. The kit keeps the dist file byte for byte and appends a suffix that
+  verifies the chain against a pinned Mozilla CA bundle (curl.se
+  2026-10-20) and the host name, in memory, before any request is sent.
+  A personal access token only (M2M would put its secret in the URL);
+  join pushdown is off (1.0.2 writes a three-table join Databricks refuses);
+  the samples catalog is named as unreadable (its metadata has no columns).
 - MongoDB (Profile D, a native adapter): `exakit connect mongodb` maps one
   collection to a root table plus a child table per nested object and array,
   through exasol-labs' exasol-mongodb-vs 0.1.3 in the Rust language container
