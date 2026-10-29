@@ -2611,7 +2611,7 @@ exakit_runtime_remedy() {
 exakit_loaded_datasets() {
     [ -f "$EXAKIT_MANIFEST" ] || return 0
     if command -v exakit_verified_datasets >/dev/null 2>&1; then
-        _eld_verified="$(exakit_verified_datasets 2>/dev/null)" && {
+        _eld_verified="$(exakit_verified_datasets "${EXAKIT_STATUS_SQL_TIMEOUT:-20}" 2>/dev/null)" && {
             [ -n "$_eld_verified" ] && printf '%s\n' "$_eld_verified"
             return 0
         }

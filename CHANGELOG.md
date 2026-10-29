@@ -10,6 +10,16 @@ and the install ended with "one step did not complete". Without a person at
 the table that row is now dropped and the run says how to name a file
 unattended (`EXAKIT_DATA_FILE`). Same on Windows.
 
+**`exakit status` no longer waits forever on a database that stops
+answering.** Its dataset check asked the database without a time limit, after
+a probe that only proves the TLS handshake. A database that accepted logins
+and then answered nothing (seen live: a deadlocked loader) held status, and
+any agent calling it, for as long as it hung. The check now gives up after
+`EXAKIT_STATUS_SQL_TIMEOUT` seconds (default 20) and reports the manifest's
+answer, as it does for a database that is down. Same on Windows. Other callers
+keep waiting: under load a login alone can take seconds, and the installer must
+not read that as "down".
+
 **The database-password prompt hides input from the first keystroke.** It
 printed itself and only then turned terminal echo off, so a password pasted or
 typed by a password manager the moment the prompt appeared was echoed in clear
