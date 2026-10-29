@@ -31,7 +31,7 @@ _KINDS = (
     # a request signed by a clock too far off, a bucket in another region, a
     # key that may not list or read - each has its own fix, so each is named.
     ("clock", r"RequestTimeTooSkewed|difference between the request time and the current time is too large|"
-              r"Signature not yet current|Signature expired"),
+              r"Signature not yet current|Signature expired|Request date header too (old|new)"),
     ("region", r"must be addressed using the specified endpoint|PermanentRedirect|"
                r"AuthorizationHeaderMalformed.*region|the region '[\w-]+' is wrong"),
     ("nobucket", r"NoSuchBucket|The specified bucket does not exist|ContainerNotFound"),
@@ -90,34 +90,66 @@ def literal(value):
     return "'%s'" % str(value).replace("'", "''")
 
 
+def store_cause(text):
+    """An object store's own answer under an adapter failure, as one line.
+
+    Azure's SDK puts advice about logging the string to sign ahead of the
+    answer; the store's code and message are in the XML body under it
+    (measured: "Status code 403, "<?xml ...><Error><Code>..."). S3's SDK names
+    its exception (measured: "software.amazon.awssdk...S3Exception: The
+    request signature we calculated does not match ... (Service: S3, Status
+    Code: 403, ...)").
+    """
+    body = re.search(r'Status code (\d+), "[^<]*<\?xml[^>]*\?>\s*<Error><Code>(\w+)</Code><Message>([^<\n]*)', text)
+    if body:
+        names = [n for n in re.findall(r"(?:[\w$]+\.)*([A-Z][\w$]*Exception): ", text[:body.start()])
+                 if "ExaUDF" not in n]
+        detail = re.search(r"<AuthenticationErrorDetail>([^<\n]{1,200})</AuthenticationErrorDetail>", text)
+        return "%s%s: %s%s (HTTP %s)" % (names[-1] + ": " if names else "", body.group(2), body.group(3).strip(),
+                                         " " + detail.group(1).strip() if detail else "", body.group(1))
+    for line in text.splitlines():
+        cause = re.match(r"\s*(?:Caused by: )?software\.amazon\.awssdk\.(?:[\w$]+\.)*([A-Z][\w$]*(?:Exception|Error)): (.+)$",
+                         line)
+        if cause:
+            return _sdk_line(cause)
+    return None
+
+
+def _sdk_line(cause):
+    status = re.search(r"Status Code: (\d+)", cause.group(2))
+    detail = re.sub(r"\s*\((?:Service|SDK Attempt)[^)]*\)", "", cause.group(2)).strip()
+    return "%s: %s%s" % (cause.group(1).split("$")[0], detail, " (HTTP %s)" % status.group(1) if status else "")
+
+
 def summarize(text):
     """One readable line out of Exasol's multi-line UDF error wrapper.
 
     An adapter failure arrives as "VM error: F-UDF-CL-... com.exasol..." with a
     Java stack under it; the line worth reading is the adapter's own coded
-    message (E-VSPG-3: ... Caused by: '...'). Anything else keeps its first
+    message (E-VSPG-3: ... Caused by: '...'). A document adapter's coded line
+    can be generic (E-VSD-102: Schema auto inference ... failed), so the
+    store's own answer under it is added. Anything else keeps its first
     meaningful line.
     """
     text = str(text)
     coded = re.search(r"(E-[A-Z]+-\d+:[^\n]*)", text)
-    if not coded:
-        # A document adapter's failure carries no coded line: under the UDF
-        # wrapper sits the store SDK's exception (measured on S3:
-        # "software.amazon.awssdk...S3Exception: The request signature we
-        # calculated does not match ... (Service: S3, Status Code: 403, ...)").
-        for line in text.splitlines():
-            cause = re.match(r"\s*(?:Caused by: )?(?:[\w$]+\.)*([A-Z][\w$]*(?:Exception|Error)): (.+)$", line)
-            if cause and "ExaUDF" not in cause.group(1) and not cause.group(2).startswith("F-UDF"):
-                status = re.search(r"Status Code: (\d+)", cause.group(2))
-                detail = re.sub(r"\s*\((?:Service|SDK Attempt)[^)]*\)", "", cause.group(2)).strip()
-                return re.sub(r"\s+", " ", "%s: %s%s" % (cause.group(1).split("$")[0], detail,
-                                                         " (HTTP %s)" % status.group(1) if status else "")).strip()
+    store = store_cause(text)
+    if coded:
+        line = re.sub(r"\s*Known mitigations:\s*$", "", coded.group(1).strip())
+        if store:
+            line = "%s - caused by %s" % (line, store)
+        return re.sub(r"\s+", " ", line).strip()
+    if store:
+        return re.sub(r"\s+", " ", store).strip()
+    # Any other SDK under the UDF wrapper: its first exception line.
+    for line in text.splitlines():
+        cause = re.match(r"\s*(?:Caused by: )?(?:[\w$]+\.)*([A-Z][\w$]*(?:Exception|Error)): (.+)$", line)
+        if cause and "ExaUDF" not in cause.group(1) and not cause.group(2).startswith("F-UDF"):
+            return re.sub(r"\s+", " ", _sdk_line(cause)).strip()
     # pyexasol's own wrapper: "(\n message => ...\n dsn => ...\n query => ...)".
     # The message field is the error; the fields under it describe the session.
     field = re.search(r"^\s*message\s*=>\s*(.+)$", text, re.M)
-    if coded:
-        line = coded.group(1)
-    elif field:
+    if field:
         line = field.group(1)
     else:
         lines = [l.strip() for l in text.splitlines() if l.strip() and l.strip() not in ("(", ")")]

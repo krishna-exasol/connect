@@ -8,9 +8,11 @@ virtual schema fail or collide, the credential for its shape, so a typo is
 named on this computer instead of as a Java stack from inside the database.
 """
 
+import datetime
 import json
 import os
 import re
+from urllib.parse import parse_qs, quote
 
 EDML_SCHEMA = re.compile(r"^https://schemas\.exasol\.com/edml-\d+\.\d+\.\d+\.json$")
 TABLE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
@@ -18,6 +20,14 @@ MAX_FILES = 50
 MAX_BYTES = 1 << 20
 
 KEY_ID = re.compile(r"^(AKIA|ASIA)[A-Z0-9]{16}$")
+
+AZURE_ACCOUNT = re.compile(r"^[a-z0-9]{3,24}$")
+AZURE_CONTAINER = re.compile(r"^(?!.*--)[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$")
+AZURE_KEY = re.compile(r"^[A-Za-z0-9+/]{86}==$")
+# Where a connection string begins, and the names a SAS token is made of.
+AZURE_FIELDS = ("defaultendpointsprotocol", "accountname", "accountkey", "blobendpoint", "sharedaccesssignature",
+                "endpointsuffix", "usedevelopmentstorage")
+SAS_FIELD = re.compile(r"^\??(sv|ss|srt|sp|se|st|spr|sr|si|sig|skoid|sdd)=")
 
 
 class DocumentError(Exception):
@@ -95,8 +105,10 @@ def _first(doc, *keys):
     return ""
 
 
-def credential(kind, values, secret):
+def credential(kind, values, secret, now=None):
     """(the CONNECTION's JSON, every string to redact, notes) for a document source."""
+    if kind == "azure-blob":
+        return _azure(values, secret.strip(), now or datetime.datetime.now(datetime.timezone.utc))
     if kind != "s3":
         raise DocumentError("unknown credential kind %s" % kind)
     key_id, secret_key, token = values.get("access_key_id", ""), secret, ""
@@ -135,3 +147,113 @@ def credential(kind, values, secret):
                      "exakit source reauth <name> --password-file <file>")
     text = json.dumps(body)
     return text, [h for h in hidden + [text] if h], notes
+
+
+def _sas_time(raw):
+    for form in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%MZ", "%Y-%m-%d"):
+        try:
+            return datetime.datetime.strptime(re.sub(r"\.\d+Z$", "Z", raw), form).replace(tzinfo=datetime.timezone.utc)
+        except ValueError:
+            continue
+    raise DocumentError("the SAS time %s is not a date the kit can read" % raw)
+
+
+def _sas(token, now):
+    """Notes for a SAS that can list and read a container; DocumentError for one that cannot."""
+    fields = {k: v[0] for k, v in parse_qs(token, keep_blank_values=True).items()}
+    if not fields.get("sig"):
+        raise DocumentError("the SAS token has no signature (sig=...): give the whole token")
+    perms = fields.get("sp", "")
+    missing = [name for flag, name in (("r", "read (r)"), ("l", "list (l)")) if flag not in perms]
+    if missing and not fields.get("si"):
+        raise DocumentError("the SAS lacks %s permission: the adapter lists the container, then reads the files"
+                            % " and ".join(missing))
+    if fields.get("sr") and fields["sr"] != "c":
+        raise DocumentError("the SAS is for a single blob or directory (sr=%s); it needs to cover the container (sr=c)"
+                            % fields["sr"])
+    if fields.get("srt") and not ("c" in fields["srt"] and "o" in fields["srt"]):
+        raise DocumentError("the account SAS needs the container and object resource types (srt=co)")
+    if fields.get("ss") and "b" not in fields["ss"]:
+        raise DocumentError("the account SAS does not include the blob service (ss needs b)")
+    if fields.get("spr") == "http":
+        raise DocumentError("the SAS allows only HTTP; the kit reads over HTTPS")
+    notes = []
+    if fields.get("st") and _sas_time(fields["st"]) > now:
+        raise DocumentError("the SAS is not valid before %s" % fields["st"])
+    if fields.get("se"):
+        expires = _sas_time(fields["se"])
+        if expires <= now:
+            raise DocumentError("the SAS expired at %s: generate a new one" % fields["se"])
+        notes.append("this SAS expires at %s; then give a new one with: exakit source reauth <name> "
+                     "--password-file <file>" % expires.strftime("%Y-%m-%d %H:%M UTC"))
+    return notes
+
+
+def _azure(values, text, now):
+    account, container = values["account"], values["container"]
+    endpoint = "https://%s.blob.core.windows.net/" % account
+    key = sas = None
+    if text.startswith("{"):
+        # The adapter's own IDENTIFIED BY body, as its user guide writes it.
+        try:
+            doc = json.loads(text)
+        except ValueError as error:
+            raise DocumentError("the credential file is not valid JSON (%s)" % error)
+        if not isinstance(doc, dict) or not isinstance(doc.get("absStorageAccountConnectionString"), str):
+            raise DocumentError("a JSON credential needs absStorageAccountConnectionString")
+        if doc.get("absContainerName") not in (None, container):
+            raise DocumentError("the credential file names container %s, not %s" % (doc["absContainerName"], container))
+        inner = doc["absStorageAccountConnectionString"].strip()
+        body, hidden, notes = _azure(values, inner, now)
+        return body, [text] + hidden, notes
+    first = text.split("=", 1)[0].strip().lower()
+    if first in AZURE_FIELDS:
+        parts = {}
+        for item in filter(None, (p.strip() for p in text.split(";"))):
+            name, sep, value = item.partition("=")
+            name = name.strip().lower()
+            if not sep or name not in AZURE_FIELDS + ("queueendpoint", "tableendpoint", "fileendpoint"):
+                raise DocumentError("the connection string has a part the kit does not know: %s"
+                                    % (name or "an empty name"))
+            parts[name] = value.strip()
+        if parts.get("usedevelopmentstorage"):
+            raise DocumentError("a development-storage (Azurite) connection string is not reached from the database")
+        if parts.get("defaultendpointsprotocol", "https").lower() != "https":
+            raise DocumentError("the connection string uses %s; the kit reads only over HTTPS"
+                                % parts["defaultendpointsprotocol"])
+        if parts.get("endpointsuffix", "core.windows.net").lower() != "core.windows.net":
+            raise DocumentError("endpoint suffix %s is a sovereign cloud, which this connector does not reach"
+                                % parts["endpointsuffix"])
+        if parts.get("accountname") and parts["accountname"] != account:
+            raise DocumentError("the connection string is for account %s, not %s" % (parts["accountname"], account))
+        if parts.get("blobendpoint") and parts["blobendpoint"].rstrip("/").lower() != endpoint.rstrip("/"):
+            raise DocumentError("the blob endpoint must be %s (custom domains and other clouds are not reached)"
+                                % endpoint)
+        key, sas = parts.get("accountkey"), parts.get("sharedaccesssignature")
+        if key and sas:
+            raise DocumentError("the connection string holds both an account key and a SAS; give one of them")
+        if not key and not sas:
+            raise DocumentError("the connection string holds neither AccountKey nor SharedAccessSignature")
+    elif SAS_FIELD.match(text):
+        sas = text
+    elif AZURE_KEY.match(text):
+        key = text
+    else:
+        raise DocumentError("the credential must be the storage account's connection string, a SAS token "
+                            "(sv=...&sig=...) or the account key")
+    if key:
+        if not AZURE_KEY.match(key):
+            raise DocumentError("the account key is malformed (88 base64 characters ending in ==)")
+        conn = "DefaultEndpointsProtocol=https;AccountName=%s;AccountKey=%s;EndpointSuffix=core.windows.net" % (
+            account, key)
+        notes = ["an account key opens every container of %s, for writing too; a SAS limited to container %s with "
+                 "read and list permissions and an expiry is the narrower credential" % (account, container)]
+    else:
+        sas = sas.lstrip("?")
+        notes = _sas(sas, now)
+        conn = "BlobEndpoint=%s;SharedAccessSignature=%s" % (endpoint, sas)
+    body = json.dumps({"absStorageAccountConnectionString": conn, "absContainerName": container})
+    # The signature alone too, in either encoding: an SDK message can quote it.
+    sig = parse_qs(sas or "").get("sig", [""])[0]
+    hidden = [text, key, sas, conn, body, sig, quote(sig, safe="")]
+    return body, [h for h in hidden if h], notes

@@ -44,7 +44,7 @@ def seed(pin, data):
     folder = os.path.join(home, "cache", "virtual-schemas", pin["sha256"])
     os.makedirs(folder, exist_ok=True)
     open(os.path.join(folder, pin["asset"]), "wb").write(data)
-for cid in ("postgresql", "mysql", "sqlserver", "oracle", "snowflake", "bigquery", "s3"):
+for cid in ("postgresql", "mysql", "sqlserver", "oracle", "snowflake", "bigquery", "s3", "azure-blob"):
     path = os.path.join(defs, "connectors", cid, "connector.json")
     doc = json.load(open(path))
     seed(doc["adapter"], ("adapter-" + cid).encode())
@@ -849,6 +849,117 @@ check "reauth with a new key file: exit 0" "0" "$RC"
 has "...the CONNECTION holds the new key, the bucket and region kept" '{"awsAccessKeyId": "AKIAEXAMPLEKEYID0002", "awsSecretAccessKey": "AnotherSecretKeyValue0000000000000000000", "awsRegion": "ap-south-1", "s3Bucket": "docs-bucket"}' \
     "$(dbq 'd["connections"]["EXAKIT_SRC_DOCS"]["secret"]')"
 run remove docs
+
+printf '\n== Profile B: Azure Blob Storage document files ==\n'
+# Measured against a real storage account (Exasol Personal 2.3.0, adapter
+# 3.1.0): a container SAS with read + list works through the adapter's
+# connection string, as does the account key; each failure below is the text
+# Azure returned. The CSV mapping has no fields, so CREATE reads the container
+# to infer them - and a failure there arrives wrapped in E-VSD-102.
+AZACCT="docsacct"; AZHOST="$AZACCT.blob.core.windows.net"
+AZKEY="$(printf 'QUFB%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21)QQ=="
+AZSIG="abcSig%2Bdef%3D"
+AZSAS="sv=2022-11-02&spr=https&se=2099-01-01T00%3A00Z&sr=c&sp=rl&sig=$AZSIG"
+AZ_SET="--set account=$AZACCT --set container=vs-test --set mapping=$MAPS"
+azdb() { db '{"sources": {"'"$AZHOST"'": {"key": "'"$AZKEY"'", "sas": {"vs-test": "'"$AZSIG"'"}, "containers": ["vs-test", "vs-private"]'"${1:-}"'}}}'; }
+AZSTAGED="$EXA/bucketfs/bfsdefault/default/exakit/vs/mappings/azdocs"
+azgone() { check "...and nothing was kept: no connection, import script or mapping" '[{}, []] no' \
+    "$(dbq '[d["connections"], [s for s in d["scripts"] if "IMPORT_FROM" in s]]') $([ -d "$AZSTAGED" ] && echo yes || echo no)"; }
+
+azdb
+run plan azure --name azdocs $AZ_SET
+check "plan: 'azure' finds the connector, exit 0" "0" "$RC"
+has "...it is azure-blob" '"connector": "azure-blob"' "$OUT"
+has "...resolves the account's blob endpoint first" "resolve $AZHOST" "$OUT"
+has "...names the adapter's import script" 'import script EXAKIT_VS.IMPORT_FROM_AZURE_BLOB_STORAGE_DOCUMENT_FILES' "$OUT"
+run plan azure-blob --name azdocs --set account=My_Account --set container=vs-test --set mapping=$MAPS
+has "an account name that cannot exist is refused" "account='My_Account' is not a valid azure-account" "$OUT"
+run plan azure-blob --name azdocs --set account=$AZACCT --set container=vs--test --set mapping=$MAPS
+has "...and a container name" "container='vs--test' is not a valid azure-container" "$OUT"
+
+run_secret "$AZSAS" connect azure-blob --name azdocs $AZ_SET --secret-stdin
+check "connect with a container SAS on stdin: exit 0" "0" "$RC"
+has "...every table is read" 'Virtual schema VS_AZDOCS: 3 table(s); a bounded read of each table succeeded' "$OUT"
+check "...the CONNECTION holds the adapter's JSON: a connection string the kit built, and the container" \
+    '{"absStorageAccountConnectionString": "BlobEndpoint=https://docsacct.blob.core.windows.net/;SharedAccessSignature='"$AZSAS"'", "absContainerName": "vs-test"}' \
+    "$(dbq 'd["connections"]["EXAKIT_SRC_AZDOCS"]["secret"]')"
+check "...with no URL and no user" '["", ""]' "$(dbq '[d["connections"]["EXAKIT_SRC_AZDOCS"]["url"], d["connections"]["EXAKIT_SRC_AZDOCS"]["user"]]')"
+lacks "...the SAS signature never reaches the output" "$AZSIG" "$OUT"
+lacks "...nor the source's records" "$AZSIG" "$(cat "$HOME_K"/virtual-schemas/sources/azdocs/*.json 2>/dev/null) $(cat "$HOME_K"/virtual-schemas/*.json 2>/dev/null)"
+has "...the SAS's expiry is said, with this source's reauth" "this SAS expires at 2099-01-01 00:00 UTC; then give a new one with: exakit source reauth azdocs" "$OUT"
+AZIMPORT="$(dbq '[x for x in d["statements"] if "IMPORT_FROM_AZURE_BLOB_STORAGE_DOCUMENT_FILES" in x][-1]')"
+has "...the import script has the adapter's signature" 'CREATE OR REPLACE JAVA SET SCRIPT "EXAKIT_VS"."IMPORT_FROM_AZURE_BLOB_STORAGE_DOCUMENT_FILES"(DATA_LOADER VARCHAR(2000000), SCHEMA_MAPPING_REQUEST VARCHAR(2000000), CONNECTION_NAME VARCHAR(500)) EMITS(...) AS' "$AZIMPORT"
+has "...from the Azure JAR, telemetry off" '%env EXASOL_TELEMETRY_DISABLE=1;' "$AZIMPORT"
+has "...the JAR is the Azure adapter's" 'azure-blob-storage-3.1.0.jar' "$AZIMPORT"
+check "...the mapping is staged for this source" "customers.json events.json orders.json" "$(ls "$AZSTAGED" | tr '\n' ' ' | sed 's/ $//')"
+
+printf 'DefaultEndpointsProtocol=https;EndpointSuffix=core.windows.net;AccountName=%s;AccountKey=%s;BlobEndpoint=https://%s/;FileEndpoint=https://%s.file.core.windows.net/;QueueEndpoint=https://%s.queue.core.windows.net/;TableEndpoint=https://%s.table.core.windows.net/\n' \
+    "$AZACCT" "$AZKEY" "$AZHOST" "$AZACCT" "$AZACCT" "$AZACCT" > "$WORK/azconn.txt"
+OUT="$(eng connect azure-blob --name azkey $AZ_SET --secret-stdin < "$WORK/azconn.txt" 2>&1)"; RC=$?
+check "the connection string az prints (every endpoint listed) connects: exit 0" "0" "$RC"
+check "...the CONNECTION holds the account key form, HTTPS" \
+    "DefaultEndpointsProtocol=https;AccountName=$AZACCT;AccountKey=$AZKEY;EndpointSuffix=core.windows.net" \
+    "$(dbq '__import__("json").loads(d["connections"]["EXAKIT_SRC_AZKEY"]["secret"])["absStorageAccountConnectionString"]')"
+has "...and the user hears what an account key opens" "an account key opens every container of $AZACCT, for writing too" "$OUT"
+lacks "...the key is not printed" "$AZKEY" "$OUT"
+check "...both sources share one import script" "1" "$(dbq 'd["scripts"].count("EXAKIT_VS.IMPORT_FROM_AZURE_BLOB_STORAGE_DOCUMENT_FILES")')"
+
+# Reauth: a key, then a SAS the kit refuses (kept the key), then the SAS back.
+run_secret "$AZKEY" reauth azdocs --secret-stdin
+check "reauth with the bare account key: exit 0" "0" "$RC"
+has "...the CONNECTION now holds the key" "AccountKey=$AZKEY" "$(dbq 'd["connections"]["EXAKIT_SRC_AZDOCS"]["secret"]')"
+run_secret "${AZSAS/sp=rl/sp=r}" reauth azdocs --secret-stdin
+check "reauth with a SAS that cannot list is refused here, exit 2" "2" "$RC"
+has "...saying which permission is missing" "the SAS lacks list (l) permission" "$OUT"
+lacks "...without sending anyone to the log" "exakit logs" "$OUT"
+has "...and the working key is kept" "AccountKey=$AZKEY" "$(dbq 'd["connections"]["EXAKIT_SRC_AZDOCS"]["secret"]')"
+run remove azkey --dry-run
+lacks "removing one: the shared import script is not in its plan" "IMPORT_FROM_AZURE" "$OUT"
+run remove azkey; run remove azdocs
+check "the last one out drops the import script" "[]" "$(dbq '[s for s in d["scripts"] if "IMPORT_FROM" in s]')"
+
+for case in "a SAS that cannot list|sp=r|the SAS lacks list (l) permission" \
+            "an expired SAS|expired|the SAS expired at 2020-01-01T00:00Z" \
+            "a blob SAS|blob|it needs to cover the container (sr=c)" \
+            "an HTTP connection string|http|the kit reads only over HTTPS" \
+            "another account's connection string|other|is for account otheracct, not docsacct" \
+            "a password-like secret|junk|a SAS token (sv=...&sig=...) or the account key"; do
+    label="${case%%|*}"; rest="${case#*|}"; form="${rest%%|*}"; expect="${rest#*|}"
+    case "$form" in
+        sp=r) cred="${AZSAS/sp=rl/sp=r}" ;;
+        expired) cred="${AZSAS/2099/2020}" ;;
+        blob) cred="${AZSAS/sr=c/sr=b}" ;;
+        http) cred="DefaultEndpointsProtocol=http;AccountName=$AZACCT;AccountKey=$AZKEY" ;;
+        other) cred="DefaultEndpointsProtocol=https;AccountName=otheracct;AccountKey=$AZKEY" ;;
+        junk) cred="hunter2" ;;
+    esac
+    azdb
+    run_secret "$cred" connect azure-blob --name azdocs $AZ_SET --secret-stdin
+    check "$label is refused before anything is created, exit 2" "2" "$RC"
+    has "...naming why" "$expect" "$OUT"
+    check "...and nothing was created" '[{}, {}]' "$(dbq '[d["connections"], d["virtual"]]')"
+done
+
+for case in "wrong key|key|rejected the credentials; nothing was kept|AuthenticationFailed" \
+            "a SAS made for another container|other|a SAS is valid only for the container it was made for|AuthenticationFailed" \
+            "a missing container|missing|check the container name, then connect again|ContainerNotFound" \
+            "a SAS without the permission|denied|a SAS with read (r) and list (l) on this container|AuthorizationPermissionMismatch"; do
+    label="${case%%|*}"; rest="${case#*|}"; form="${rest%%|*}"; rest="${rest#*|}"; expect="${rest%%|*}"; code="${rest#*|}"
+    cred="$AZSAS"; container=vs-test
+    case "$form" in
+        key) azdb; cred="DefaultEndpointsProtocol=https;AccountName=$AZACCT;AccountKey=$(printf 'QkJC%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21)QQ==" ;;
+        other) azdb; container=vs-private ;;
+        missing) azdb; cred="DefaultEndpointsProtocol=https;AccountName=$AZACCT;AccountKey=$AZKEY"; container=nosuch ;;
+        denied) azdb ', "fail": "denied"' ;;
+    esac
+    run_secret "$cred" connect azure-blob --name azdocs --set account=$AZACCT --set container=$container --set mapping=$MAPS --secret-stdin
+    check "Azure $label: exit 1" "1" "$RC"
+    has "...the fix is named" "$expect" "$OUT"
+    has "...Azure's own code is shown, under the adapter's" "E-VSD-102: Schema auto inference for source 'data/customers/customers.csv' failed. - caused by BlobStorageException: $code" "$OUT"
+    lacks "...not the SDK's advice about logging" "Azure-Storage-Log-String-To-Sign" "$OUT"
+    lacks "...nor the mitigations' empty heading" "Known mitigations:" "$OUT"
+    azgone
+done
 
 printf '\n== the hidden prompt hides from the first keystroke ==\n'
 # Measured: with the prompt printed first and echo turned off after it, input

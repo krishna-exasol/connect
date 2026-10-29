@@ -48,6 +48,8 @@
   "auth": "aws-keys",
   "host": "{bucket}.s3.{region}.amazonaws.com",
   "credential": "s3",
+  "store": "bucket",
+  "access": "S3: s3:ListBucket on the mapped prefixes and s3:GetObject on the objects",
   "vs_properties": {
     "MAPPING": "{mapping_path}"
   },

@@ -1,6 +1,6 @@
 ---
 name: exasol-virtual-schemas
-description: Query an external database - PostgreSQL, MySQL, SQL Server, Oracle or Snowflake - or JSON, CSV and Parquet files in an Amazon S3 bucket from the local Exasol database through a virtual schema, with exakit connect and exakit source. Covers giving inputs unattended, passing the credential safely (never as an argument), reading the plan, the "localhost inside the database is not this computer" trap, the failure classes and their fixes (auth, TLS, unreachable, no DNS, no Java, S3 access denied or wrong region), the EDML mapping that turns S3 objects into tables, reauth after a password change, disconnect versus remove, and why BigQuery is gated. Triggers — "connect my Postgres to Exasol", "query MySQL from Exasol", "virtual schema", "federate a remote database", "exakit connect", "exakit source", "my source password changed", "the virtual schema stopped working", "remove a connected source", "join local tables with a remote database", "connect Snowflake", "connect SQL Server", "connect Oracle", "query files in S3", "connect an S3 bucket", "JSON files in S3 as a table", "EDML mapping".
+description: Query an external database - PostgreSQL, MySQL, SQL Server, Oracle or Snowflake - or JSON, CSV and Parquet files in an Amazon S3 bucket or an Azure Blob Storage container from the local Exasol database through a virtual schema, with exakit connect and exakit source. Covers giving inputs unattended, passing the credential safely (never as an argument), reading the plan, the "localhost inside the database is not this computer" trap, the failure classes and their fixes (auth, TLS, unreachable, no DNS, no Java, S3 access denied or wrong region, Azure SAS permissions), the EDML mapping that turns S3 objects and Azure blobs into tables, which Azure credential to use (a container SAS over the account key), reauth after a password change, disconnect versus remove, and why BigQuery is gated. Triggers — "connect my Postgres to Exasol", "query MySQL from Exasol", "virtual schema", "federate a remote database", "exakit connect", "exakit source", "my source password changed", "the virtual schema stopped working", "remove a connected source", "join local tables with a remote database", "connect Snowflake", "connect SQL Server", "connect Oracle", "query files in S3", "connect an S3 bucket", "JSON files in S3 as a table", "EDML mapping", "query files in Azure Blob Storage", "connect an Azure storage container", "Azure SAS token".
 ---
 
 # Virtual schemas — query a remote database from local Exasol
@@ -18,6 +18,7 @@ database runs every query, even after `exakit` exits.
 | Oracle | `oracle` (`ora`) | candidate |
 | Snowflake | `snowflake` (`sf`) | candidate |
 | Amazon S3 (JSON, CSV, Parquet files) | `s3` (`aws-s3`) | candidate |
+| Azure Blob Storage (JSON, CSV, Parquet files) | `azure-blob` (`azure`, `abs`) | candidate |
 | BigQuery | `bigquery` (`bq`) | **gated** — not available yet |
 
 `candidate` means defined and tested against a simulated database, not yet
@@ -129,6 +130,32 @@ exakit connect s3 --name docs --set bucket=my-bucket --set region=eu-central-1 \
   China regions, custom endpoints and anonymous access are refused.
 - To change the mapping: `exakit source remove <name>`, then connect again.
 
+## Azure Blob Storage: files as tables
+
+The same EDML mapping (`source` is the blob name or glob inside the
+container), with a storage account and container instead of bucket and region:
+
+```bash
+exakit connect azure-blob --name docs --set account=mystorageacct --set container=data \
+  --set mapping=./mapping --password-file ~/keys/data-sas.txt
+```
+
+- **The credential - recommend a container SAS**: read + list only, an expiry,
+  HTTPS only. Have the user make it themselves, straight into a file:
+  `umask 077; az storage container generate-sas --account-name <acct> -n <container>
+  --permissions rl --expiry <date> --https-only --auth-mode key -o tsv > sas.txt`.
+  The account's connection string, its bare account key, or the adapter's own
+  JSON also work, but a key opens every container of the account, for writing
+  too - the kit says so.
+- The kit checks a SAS before anything is created: read (`r`) and list (`l`)
+  permission, not expired, a container SAS (not one blob). It builds the
+  connection string itself, always HTTPS to `<account>.blob.core.windows.net`;
+  Azurite, custom domains and sovereign clouds are refused.
+- **A SAS cannot be narrowed to a folder**: it opens the whole container. Data
+  the database must not read belongs in another container.
+- A SAS expires: connect prints when, and `exakit source reauth <name>
+  --password-file <new-sas.txt>` replaces it (a refused one keeps the old).
+
 ## Query it
 
 ```bash
@@ -154,6 +181,10 @@ little work — keep remote queries selective.
 | `access-denied` | S3: the key works but may not list or read (the message names the action, e.g. `s3:ListBucket`) | grant that permission on the prefix, then `exakit source check <name>` - not reauth |
 | S3 "addressed using the specified endpoint" | the bucket is in another region | reconnect with `--set region=<the bucket's region>` |
 | S3 "RequestTimeTooSkewed" | the database clock is off (signed requests allow 15 minutes) | `exakit stop`, then `exakit start` |
+| Azure `AuthenticationFailed` | wrong key, an expired SAS - or a SAS made for another container (a SAS is signed for one container, so a wrong container name reads the same) | check the container name; else `exakit source reauth <name>` |
+| Azure `AuthorizationPermissionMismatch` (`access-denied`) | the SAS lacks a permission | a new SAS with `rl`, then reauth |
+| Azure `ContainerNotFound` | no container by that name (seen with an account key) | check the name, remove and connect again |
+| `E-VSD-102: Schema auto inference ... failed - caused by ...` | a CSV/Parquet mapping without fields is read at connect to infer columns; the cause after "caused by" is the real failure | act on the cause |
 
 A failed **first** connect leaves nothing behind — re-run it with corrected
 input. The kit repairs two things itself and retries once: Java in the database

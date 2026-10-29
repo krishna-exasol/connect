@@ -27,6 +27,8 @@ KINDS = {
     "s3-bucket": re.compile(r"^(?!xn--)[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$"),
     "aws-region": re.compile(r"^[a-z]{2}(-gov)?-[a-z]+-\d{1,2}$"),
     "aws-key-id": document.KEY_ID,
+    "azure-account": document.AZURE_ACCOUNT,
+    "azure-container": document.AZURE_CONTAINER,
 }
 
 

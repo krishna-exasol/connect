@@ -47,13 +47,22 @@ REMEDY_FOR = {
     "nohost": "the host name no longer resolves: check it (a private name may need a VPN), then: exakit source check {name}",
     "dns": "Java in the database could not resolve the host name; restart the database with exakit start (it repairs DNS), then: exakit source check {name}",
     "nojava": "the Java language container is not installed: exakit connect installs it, or run: exasol slc install java",
-    "denied": "the account signs in but may not read this data: grant it what the message names (S3: s3:ListBucket on the mapped prefixes and s3:GetObject on the objects), then: exakit source check {name}",
+    "denied": "the account signs in but may not read this data: grant it what the message names ({access}), then: exakit source check {name}",
     "region": "the bucket is in another region: exakit source disconnect {name} --yes, then exakit connect <connector> --name {name} --set region=<the bucket's region> with the credential again",
-    "nobucket": "the bucket does not exist under that name: check it, then remove and connect again",
+    "nobucket": "the {store} does not exist under that name: check it, then remove and connect again",
     "clock": "the database clock is too far from the store's for a signed request; restart the database (exakit stop, then exakit start), then: exakit source check {name}",
     "error": "see the log: exakit logs",
 }
 
+
+
+def remedy_for(kind, name, connector):
+    """The fix for a failure class, in the words of the connector's store."""
+    text = REMEDY_FOR.get(kind, REMEDY_FOR["error"]).format(
+        name=name, access=connector.get("access", "read access"), store=connector.get("store", "bucket"))
+    if kind == "auth" and connector.get("auth_hint"):
+        text += "; %s" % connector["auth_hint"]
+    return text
 
 # Seconds the database clock may be off this computer's before it is named.
 # Measured on Exasol Personal (macOS): the VM's clock does not catch up after
@@ -390,7 +399,9 @@ class Engine(object):
             try:
                 text, hidden, notes = document.credential(connector["credential"], values, secret)
             except document.DocumentError as error:
-                raise Failure(str(error), EXIT["input"])
+                failure = Failure(str(error), EXIT["input"])
+                failure.complete = True  # the credential's own problem, named; nothing ran
+                raise failure
             return "", "", text, hidden, notes
         return None, values.get("user"), secret, [], []
 
@@ -551,7 +562,7 @@ class Engine(object):
                     made("schema")
                 tables, read, how, empty = self.verify(connector, names["schema"])
                 for note in notes:
-                    self.emit("INFO", note)
+                    self.emit("INFO", note.replace("<name>", name))
                 if read:
                     self.emit("OK", "Virtual schema %s: %d table(s); %s succeeded" % (names["schema"], len(tables), how))
                 else:
@@ -574,7 +585,7 @@ class Engine(object):
                 # A first connect has no source record yet, so the lifecycle
                 # commands do not apply: nothing was left behind, and the fix is
                 # the same command with corrected input.
-                remedy = REMEDY_FOR.get(kind, REMEDY_FOR["error"]).format(name=name)
+                remedy = remedy_for(kind, name, connector)
                 if getattr(error, "complete", False):
                     raise error
                 specific = tls_remedy(error, connector, self.clock()) if kind == "tls" else None
@@ -582,11 +593,12 @@ class Engine(object):
                     remedy = "the source's certificate did not verify; nothing was kept - %s, then connect again" % specific
                 elif not reconnect and kind in ("auth", "tls", "unreachable", "nohost", "denied", "region", "nobucket",
                                                 "clock"):
-                    remedy = {"denied": "the account signs in but may not read this data; nothing was kept - grant it what the message names (S3: s3:ListBucket on the mapped prefixes, s3:GetObject on the objects), then connect again",
+                    remedy = {"denied": "the account signs in but may not read this data; nothing was kept - grant it what the message names (%s), then connect again" % connector.get("access", "read access"),
                               "region": "the bucket is in another region; nothing was kept - connect again with --set region=<the bucket's region>",
-                              "nobucket": "nothing was kept - check the bucket name, then connect again",
+                              "nobucket": "nothing was kept - check the %s name, then connect again" % connector.get("store", "bucket"),
                               "clock": "the database clock is too far from the store's for a signed request; nothing was kept - restart the database (exakit stop, then exakit start), then connect again",
-                              "auth": "the source rejected the credentials; nothing was kept - correct them and run the same exakit connect again",
+                              "auth": "the source rejected the credentials; nothing was kept - correct them and run the same exakit connect again"
+                                      + ("; %s" % connector["auth_hint"] if connector.get("auth_hint") else ""),
                               "tls": "the source's certificate or host name did not verify; nothing was kept - fix the server certificate or choose tls=require knowingly, then connect again",
                               "unreachable": "the source did not answer from inside the database; nothing was kept - check host, port, firewall and VPN (a source on this computer must listen beyond 127.0.0.1), then connect again",
                               "nohost": "nothing was kept - check the spelling (a private name may need a VPN), then connect again"}[kind]
@@ -675,7 +687,7 @@ class Engine(object):
         except (Failure, sql.DbError) as error:
             kind = getattr(error, "kind", "error")
             status = self.record_check(name, "failed", str(error), kind)
-            remedy = REMEDY_FOR.get(kind, REMEDY_FOR["error"]).format(name=name)
+            remedy = remedy_for(kind, name, connector)
             specific = tls_remedy(error, connector, self.clock()) if kind == "tls" else None
             if specific:
                 remedy = "%s; then: exakit source check %s" % (specific.replace(
@@ -721,7 +733,7 @@ class Engine(object):
                 raise Failure("the credential could not be replaced: %s" % error, EXIT["failed"])
         self.emit("OK", "Credential replaced in %s" % config["objects"]["connection"])
         for note in notes:
-            self.emit("INFO", note)
+            self.emit("INFO", note.replace("<name>", name))
         return self.check(name)
 
     def try_credential(self, connector, names, url, user, secret):
@@ -871,5 +883,9 @@ class Engine(object):
             if status_filter and row["status"] != status_filter:
                 continue
             check = row.get("last_check") or {}
-            rows.append(dict(row, remedy=REMEDY_FOR.get(check.get("kind") or "error", REMEDY_FOR["error"]).format(name=row["name"])))
+            try:
+                connector = self.defs.connector(row["connector"])
+            except (OSError, ValueError):
+                connector = {}
+            rows.append(dict(row, remedy=remedy_for(check.get("kind") or "error", row["name"], connector)))
         return rows

@@ -96,6 +96,20 @@
       "profile": "java-document-files",
       "tier": "GA",
       "status": "candidate"
+    },
+    {
+      "id": "azure-blob",
+      "name": "Azure Blob Storage",
+      "aliases": [
+        "azure",
+        "abs",
+        "azure-storage",
+        "azure-blob-storage",
+        "blob-storage"
+      ],
+      "profile": "java-document-files",
+      "tier": "GA",
+      "status": "candidate"
     }
   ]
 }
