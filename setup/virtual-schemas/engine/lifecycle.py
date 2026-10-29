@@ -88,6 +88,7 @@ def tls_remedy(message, connector, clock=None):
     is past CLOCK_LIMIT, so a validity failure names the cause, not a guess."""
     text = str(message)
     has_ca = any(spec["kind"] == "ca-file" for spec in connector["inputs"])
+    has_tls = any(spec["name"] == "tls" for spec in connector["inputs"])
     if re.search(r"trustAnchors parameter must be non-empty", text, re.I):
         # Measured on Exasol Personal 2.3.0: the JDBC loader runs the language
         # container's Java outside it, and that Java's cacerts is an absolute
@@ -96,7 +97,9 @@ def tls_remedy(message, connector, clock=None):
                 "verify any certificate without one given to it" +
                 ("; give the CA as PEM with --set ca=<file> - for a public CA too, its root certificate"
                  if has_ca else "; this connector cannot take a CA yet - tls=require encrypts without verifying, "
-                 "only if the user accepts that"))
+                 "only if the user accepts that" if has_tls else
+                 "; this connector always verifies and its driver reads trust only from that store, so it cannot "
+                 "connect on this database until the loader has one"))
     if re.search(r"validity check failed|NotYetValid|not yet valid|CertificateExpired|has expired", text, re.I):
         if clock:
             return ("the database clock is %s this computer, so the certificate is outside its validity dates "

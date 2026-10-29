@@ -37,7 +37,8 @@ _KINDS = (
     ("nobucket", r"NoSuchBucket|The specified bucket does not exist|ContainerNotFound"),
     ("denied", r"AccessDenied|not authorized to perform|AuthorizationPermissionMismatch|AuthorizationFailure"),
     ("dns", r"UnknownHostException|Name or service not known|nodename nor servname|unable to resolve host"),
-    ("tls", r"PKIX|certificate|SSLHandshake|SSL connection|ssl_server_dn_match|TLS|SSLException"),
+    ("tls", r"PKIX|certificate|SSLHandshake|SSL connection|ssl_server_dn_match|TLS|SSLException|"
+            r"trustAnchors parameter must be non-empty"),
     ("auth", r"password authentication failed|Access denied for user|Login failed for user|ORA-01017|"
              r"Incorrect username or password|invalid username/password|authentication failed|"
              r"JWT token is invalid|Programmatic access token is invalid|token has expired|"

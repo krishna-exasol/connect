@@ -702,12 +702,18 @@ load = lambda c: json.load(open(sys.argv[1] + "/setup/virtual-schemas/connectors
 text = "ETL-5402: ... Error: (internal_error) Unexpected error: java.security.InvalidAlgorithmParameterException: the trustAnchors parameter must be non-empty."
 print(lifecycle.tls_remedy(text, load("sqlserver")))
 print(lifecycle.tls_remedy(text, load("snowflake")))
+print(lifecycle.tls_remedy(text, load("mysql")))
+import sql
+print(sql.classify(text))
 PYE
 )"
 has "the loader's empty CA store (measured, Exasol Personal) is explained, with --set ca where it exists" \
     "has no CA store of its own (an Exasol Personal issue)" "$(printf '%s\n' "$E6" | sed -n 1p)"
 has "...for SQL Server now: give the CA" "give the CA as PEM with --set ca=<file>" "$(printf '%s\n' "$E6" | sed -n 1p)"
-has "...for a connector without ca yet: says so, and what require would mean" "cannot take a CA yet - tls=require encrypts without verifying" "$(printf '%s\n' "$E6" | sed -n 2p)"
+has "...for Snowflake (no ca, no tls choice): says it cannot connect here, offers no require" "always verifies and its driver reads trust only from that store" "$(printf '%s\n' "$E6" | sed -n 2p)"
+lacks "...and does not offer tls=require, which Snowflake does not have" "tls=require" "$(printf '%s\n' "$E6" | sed -n 2p)"
+has "...MySQL keeps the ca advice" "give the CA as PEM with --set ca=<file>" "$(printf '%s\n' "$E6" | sed -n 3p)"
+check "...and the error is filed as TLS, so the remedy is shown (measured: Snowflake fell to 'see the log')" "tls" "$(printf '%s\n' "$E6" | sed -n 4p)"
 
 printf '\n== a private CA for Oracle: a wallet inside the connection ==\n'
 # Measured against RDS Oracle 19c over TCPS: ojdbc 23 reads a trust-only PEM
