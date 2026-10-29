@@ -419,11 +419,7 @@ exapump_create_profile() {
         _password="$(cat "$_pwfile")"
     fi
     if [ -z "$_password" ] && (: < /dev/tty) 2>/dev/null; then
-        printf '    %s?%s Database password for user %s (input hidden): ' "${UI_ASK:-}" "${UI_RESET:-}" "$_user"
-        stty -echo < /dev/tty 2>/dev/null
-        read -r _password < /dev/tty
-        stty echo < /dev/tty 2>/dev/null
-        printf '\n'
+        _password="$(exakit_read_hidden "Database password for user $_user")" || _password=""
     fi
     if [ -z "$_password" ]; then
         warn "No database password available — create the profile manually with: exapump profile init $EXAKIT_EXAPUMP_PROFILE"
