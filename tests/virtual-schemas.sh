@@ -44,10 +44,14 @@ def seed(pin, data):
     folder = os.path.join(home, "cache", "virtual-schemas", pin["sha256"])
     os.makedirs(folder, exist_ok=True)
     open(os.path.join(folder, pin["asset"]), "wb").write(data)
-for cid in ("postgresql", "mysql", "sqlserver", "oracle", "snowflake", "bigquery", "s3", "azure-blob"):
+for cid in ("postgresql", "mysql", "sqlserver", "oracle", "snowflake", "bigquery", "s3", "azure-blob", "mongodb"):
     path = os.path.join(defs, "connectors", cid, "connector.json")
     doc = json.load(open(path))
-    seed(doc["adapter"], ("adapter-" + cid).encode())
+    if "arch" in doc["adapter"]:
+        for arch, pin in doc["adapter"]["arch"].items():
+            seed(pin, ("adapter-%s-%s" % (cid, arch)).encode())
+    else:
+        seed(doc["adapter"], ("adapter-" + cid).encode())
     if not doc.get("driver"):
         pass
     elif doc["driver"].get("bundle") == "zip":
@@ -119,8 +123,8 @@ samples = {"host": "db.example.com", "database": "sales", "schema": "public", "u
            "account": "myorg-acct1", "warehouse": "COMPUTE_WH", "project": "my-proj", "dataset": "analytics"}
 for entry in defs.entries():
     c = defs.connector(entry["id"])
-    if c.get("credential"):
-        continue    # a document source has no JDBC URL (its own section below)
+    if c.get("credential") or c.get("shared_adapter"):
+        continue    # document and native sources have no JDBC URL or probe host (their own sections below)
     given = {s["name"]: samples[s["name"]] for s in c["inputs"] if s["name"] in samples}
     tls = next((s for s in c["inputs"] if s["name"] == "tls"), None)
     for mode in (tls["choices"] if tls else [None]):
@@ -850,6 +854,96 @@ PYC
 )"
 check "a missing URL property is configuration, not unreachable (measured: 'Connection Refused' misfiled it)" "error" "$(printf '%s\n' "$BQCLS" | sed -n 1p)"
 check "a refused token request is a rejected credential" "auth" "$(printf '%s\n' "$BQCLS" | sed -n 2p)"
+
+printf '\n== MongoDB (Profile D): a native adapter in the Rust language container ==\n'
+# Measured against Atlas (exasol-mongodb-vs 0.1.3, language-container-rs
+# 0.33.0, aarch64): the .so's entry points are bound to the script names
+# MONGODB_ADAPTER and MONGODB_SCAN, so every MongoDB source shares them; CREATE
+# reads the collection's metadata, so a wrong password fails there.
+MG_URI="mongodb+srv://cluster0.example.net/?authSource=admin"
+MG_SET="--set uri=$MG_URI --set database=sample_mflix --set user=reader"
+mgdb() { db '{"sources": {"cluster0.example.net": {"tables": ["MOVIES", "MOVIES_imdb", "MOVIES_genres_arr"], "secret": "'"$SECRET"'", "collections": ["sample_mflix.movies", "sample_mflix.theaters"]}}'"${1:-}"'}'; }
+mgdb
+run plan mongodb --name mg $MG_SET --set collection=movies
+check "plan: exit 0" "0" "$RC"
+has "...the Rust language container, not Java, is the prerequisite" "verify the Rust language container in the database" "$OUT"
+has "...the scripts are named and shared" "create adapter script EXAKIT_VS.MONGODB_ADAPTER and its scan UDF EXAKIT_VS.MONGODB_SCAN (shared by every MongoDB source)" "$OUT"
+check "...the adapter is this machine's build" "1" "$(printf '%s' "$OUT" | grep -c -E 'exasol-mongodb-vs-0.1.3-linux-(aarch64|x86_64).so')"
+OUT="$(EXAKIT_VS_ARCH=x86_64 eng plan mongodb --name mg $MG_SET --set collection=movies 2>&1)"
+has "...and the x86_64 one on x86_64" "exasol-mongodb-vs-0.1.3-linux-x86_64.so" "$OUT"
+OUT="$(EXAKIT_VS_ARCH=aarch64 eng plan mongodb --name mg $MG_SET --set collection=movies 2>&1)"
+has "...and the aarch64 one on ARM" "exasol-mongodb-vs-0.1.3-linux-aarch64.so" "$OUT"
+run plan mongodb --name mg --set "uri=mongodb://reader:pw@h:27017/" --set database=d --set collection=c --set user=reader
+has "a URI carrying user:password@ is refused - the password belongs in the CONNECTION" "the MongoDB URI carries credentials" "$OUT"
+run plan mongodb --name mg --set "uri=postgres://h/" --set database=d --set collection=c --set user=reader
+has "...and a URI that is not MongoDB's" "is not a valid mongodb-uri" "$OUT"
+
+mgdb ', "rust": false'
+run_secret "$SECRET" connect mongodb --name mg $MG_SET --set collection=movies --secret-stdin
+check "without the Rust container: exit 23 (the shell offers to install it), nothing created" "23 {} {}" "$RC $(dbq 'd["connections"]') $(dbq 'd["virtual"]')"
+has "...said plainly" "the Rust language container is not installed in the database (no RUST language alias)" "$OUT"
+
+mgdb
+run_secret "$SECRET" connect mongodb --name mg $MG_SET --set collection=movies --secret-stdin
+check "connect: exit 0" "0" "$RC"
+has "...the collection's tables" "Virtual schema VS_MG: 3 table(s)" "$OUT"
+check "...the CONNECTION holds the URI, the user and the password" "[\"$MG_URI\", \"reader\", true]" \
+    "$(dbq '[d["connections"]["EXAKIT_SRC_MG"]["url"], d["connections"]["EXAKIT_SRC_MG"]["user"], d["connections"]["EXAKIT_SRC_MG"]["secret"] == "'"$SECRET"'"]')"
+MGA="$(dbq '[x for x in d["statements"] if "RUST ADAPTER SCRIPT" in x][-1]')"
+has "...the adapter script keeps the name the .so exports" 'CREATE OR REPLACE RUST ADAPTER SCRIPT "EXAKIT_VS"."MONGODB_ADAPTER" AS' "$MGA"
+has "...and loads the staged .so" '%udf_object /buckets/bfsdefault/default/exakit/vs/mongodb/0.1.3/exasol-mongodb-vs-0.1.3-linux-' "$MGA"
+has "...the scan UDF too" 'CREATE OR REPLACE RUST SCALAR SCRIPT "EXAKIT_VS"."MONGODB_SCAN"(spec VARCHAR(2000000)) EMITS (...) AS' \
+    "$(dbq '[x for x in d["statements"] if "MONGODB_SCAN" in x][-1]')"
+has "...the virtual schema names the connection the adapter's way" "MONGODB_CONNECTION = 'EXAKIT_SRC_MG' DATABASE = 'sample_mflix' COLLECTION = 'movies'" \
+    "$(dbq '[x for x in d["statements"] if x.startswith("CREATE VIRTUAL SCHEMA \"VS_MG\"")][-1]')"
+lacks "...the password is not printed" "$SECRET" "$OUT"
+
+run_secret "$SECRET" connect mongodb --name mgt $MG_SET --set collection=theaters --secret-stdin
+check "a second MongoDB source: exit 0, the two scripts shared, not doubled" "0 1 1" \
+    "$RC $(dbq 'd["scripts"].count("EXAKIT_VS.MONGODB_ADAPTER")') $(dbq 'd["scripts"].count("EXAKIT_VS.MONGODB_SCAN")')"
+run_secret "$SECRET" connect mongodb --name mgx $MG_SET --set collection=nope --secret-stdin
+check "a collection that is not there (or not readable): exit 1, the shared scripts kept for the others" "1 1 1" \
+    "$RC $(dbq 'd["scripts"].count("EXAKIT_VS.MONGODB_ADAPTER")') $(dbq 'd["scripts"].count("EXAKIT_VS.MONGODB_SCAN")')"
+has "...the adapter's words, and what they can mean" "a database the account may not read as a collection that 'does not exist'" "$OUT"
+
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["sources"]["cluster0.example.net"]["secret"]="n3w-secret"; json.dump(d, open(sys.argv[1],"w"))' "$STATE"
+run_secret "still-the-old-one" reauth mg --secret-stdin
+check "reauth with a password the source refuses: exit 1" "1" "$RC"
+has "...tried on a throwaway schema first, so the old one is kept" "the source refused the new credential, so the previous one was kept" "$OUT"
+check "...nothing pending is left behind" "[] []" \
+    "$(dbq '[c for c in d["connections"] if c.endswith("_PENDING")]') $(dbq '[v for v in d["virtual"] if v.endswith("_PENDING")]')"
+check "...and the CONNECTION still holds the old password" "true" "$(dbq 'd["connections"]["EXAKIT_SRC_MG"]["secret"] == "'"$SECRET"'"')"
+run_secret "n3w-secret" reauth mg --secret-stdin
+check "reauth with the password the source accepts: exit 0" "0" "$RC"
+has "...accepted on the trial, then replaced" "The source accepted the new credential" "$OUT"
+
+run_secret "wrong" connect mongodb --name mgbad $MG_SET --set collection=movies --secret-stdin
+check "a wrong password on first connect: exit 1, nothing of its own kept" "1 false" "$RC $(dbq '"EXAKIT_SRC_MGBAD" in d["connections"]' | tr A-Z a-z)"
+has "...the adapter's vague words come with what they can mean" "check the user and password, the access list and the database's role" "$OUT"
+
+run remove mg --dry-run
+lacks "removing one: the shared adapter is not in its plan" "MONGODB_ADAPTER" "$OUT"
+run remove mg
+check "...removed, the scripts kept for the other source" "0 1 1" \
+    "$RC $(dbq 'd["scripts"].count("EXAKIT_VS.MONGODB_ADAPTER")') $(dbq 'd["scripts"].count("EXAKIT_VS.MONGODB_SCAN")')"
+run remove mgt --dry-run
+has "the last one out plans to drop the shared adapter" "adapter script EXAKIT_VS.MONGODB_ADAPTER (no other mongodb source uses it)" "$OUT"
+has "...and the scan UDF" "import script EXAKIT_VS.MONGODB_SCAN (no other mongodb source uses it)" "$OUT"
+run remove mgt
+check "...and drops both" "[]" "$(dbq '[s for s in d["scripts"] if "MONGODB" in s]')"
+
+check "the Rust container is pinned for both CPUs, size and SHA-256" "aarch64 x86_64" "$(python3 - "$ROOT" <<'PYR'
+import json, re, sys
+c = json.load(open(sys.argv[1] + "/setup/virtual-schemas/profiles/rust-native/profile.json"))["slc"]["custom"]
+print(" ".join(sorted(a for a, p in c["arch"].items() if re.fullmatch(r"[0-9a-f]{64}", p["sha256"]) and p["size"] > 0
+                      and p["url"].startswith("https://github.com/exasol-labs/language-container-rs/releases/download/"))))
+PYR
+)"
+VSRUN="$(sed -n '/^_exakit_vs_run() {/,/^}/p' "$ROOT/setup/lib/virtual-schemas.sh")"
+VSRUST="$(sed -n '/^_exakit_vs_install_rust() {/,/^}/p' "$ROOT/setup/lib/virtual-schemas.sh")"
+has "bash: exit 23 installs the Rust container, then retries" "23) _exakit_vs_install_rust || break ;;" "$VSRUN"
+has "...it checks size and SHA-256 before installing" 'verify_sha256 "$_evr_dir/$_evr_asset" "$_evr_sha"' "$VSRUST"
+has "PowerShell: its twin" "if (-not (Install-ExakitVsRust)) { break }" "$(cat "$ROOT/setup/lib/virtual-schemas.ps1")"
 
 printf '\n== a private CA for Oracle: a wallet inside the connection ==\n'
 # Measured against RDS Oracle 19c over TCPS: ojdbc 23 reads a trust-only PEM

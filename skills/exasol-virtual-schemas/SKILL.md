@@ -1,6 +1,6 @@
 ---
 name: exasol-virtual-schemas
-description: Query an external database - PostgreSQL, MySQL, SQL Server, Oracle, Snowflake or BigQuery - or JSON, CSV and Parquet files in an Amazon S3 bucket or an Azure Blob Storage container from the local Exasol database through a virtual schema, with exakit connect and exakit source. Covers giving inputs unattended, passing the credential safely (never as an argument), reading the plan, the "localhost inside the database is not this computer" trap, the failure classes and their fixes (auth, TLS, unreachable, no DNS, no Java, S3 access denied or wrong region, Azure SAS permissions), the EDML mapping that turns S3 objects and Azure blobs into tables, which Azure credential to use (a container SAS over the account key), reauth after a password change, disconnect versus remove, and how BigQuery's key file is kept and who could read it. Triggers — "connect my Postgres to Exasol", "query MySQL from Exasol", "virtual schema", "federate a remote database", "exakit connect", "exakit source", "my source password changed", "the virtual schema stopped working", "remove a connected source", "join local tables with a remote database", "connect Snowflake", "connect SQL Server", "connect Oracle", "connect BigQuery", "query BigQuery from Exasol", "BigQuery service account key", "query files in S3", "connect an S3 bucket", "JSON files in S3 as a table", "EDML mapping", "query files in Azure Blob Storage", "connect an Azure storage container", "Azure SAS token".
+description: Query an external database - PostgreSQL, MySQL, SQL Server, Oracle, Snowflake, BigQuery or MongoDB - or JSON, CSV and Parquet files in an Amazon S3 bucket or an Azure Blob Storage container from the local Exasol database through a virtual schema, with exakit connect and exakit source. Covers giving inputs unattended, passing the credential safely (never as an argument), reading the plan, the "localhost inside the database is not this computer" trap, the failure classes and their fixes (auth, TLS, unreachable, no DNS, no Java, S3 access denied or wrong region, Azure SAS permissions), the EDML mapping that turns S3 objects and Azure blobs into tables, which Azure credential to use (a container SAS over the account key), reauth after a password change, disconnect versus remove, and how BigQuery's key file is kept and who could read it. Triggers — "connect my Postgres to Exasol", "query MySQL from Exasol", "virtual schema", "federate a remote database", "exakit connect", "exakit source", "my source password changed", "the virtual schema stopped working", "remove a connected source", "join local tables with a remote database", "connect Snowflake", "connect SQL Server", "connect Oracle", "connect BigQuery", "query BigQuery from Exasol", "BigQuery service account key", "connect MongoDB", "query a MongoDB collection from Exasol", "MongoDB Atlas", "query files in S3", "connect an S3 bucket", "JSON files in S3 as a table", "EDML mapping", "query files in Azure Blob Storage", "connect an Azure storage container", "Azure SAS token".
 ---
 
 # Virtual schemas — query a remote database from local Exasol
@@ -19,6 +19,7 @@ database runs every query, even after `exakit` exits.
 | Snowflake | `snowflake` (`sf`) | candidate |
 | Amazon S3 (JSON, CSV, Parquet files) | `s3` (`aws-s3`) | candidate |
 | Azure Blob Storage (JSON, CSV, Parquet files) | `azure-blob` (`azure`, `abs`) | candidate |
+| MongoDB (one collection per source) | `mongodb` (`mongo`, `atlas`) | candidate |
 | BigQuery | `bigquery` (`bq`) | candidate |
 
 `candidate` means defined and tested against a simulated database, not yet
@@ -184,6 +185,9 @@ little work — keep remote queries selective.
 | Azure `AuthenticationFailed` | wrong key, an expired SAS - or a SAS made for another container (a SAS is signed for one container, so a wrong container name reads the same) | check the container name; else `exakit source reauth <name>` |
 | Azure `AuthorizationPermissionMismatch` (`access-denied`) | the SAS lacks a permission | a new SAS with `rl`, then reauth |
 | Azure `ContainerNotFound` | no container by that name (seen with an account key) | check the name, remove and connect again |
+| 23 | the Rust language container (MongoDB) is not installed | `exakit connect` offers to install it (pinned, checksum-verified, one restart); unattended, run the connect on a terminal once |
+| MongoDB "error while reading collection metadata" | a wrong password, this computer's IP not in the Atlas access list, or the server unreachable - the adapter does not say which | check the password (`reauth` tries it first), the access list (`curl -s https://checkip.amazonaws.com`), the URI |
+| MongoDB "collection ... does not exist" | no such collection - or the account may not read that database (reported the same way) | check the name and the account's role |
 | `E-VSD-102: Schema auto inference ... failed - caused by ...` | a CSV/Parquet mapping without fields is read at connect to infer columns; the cause after "caused by" is the real failure | act on the cause |
 
 A failed **first** connect leaves nothing behind — re-run it with corrected
@@ -216,6 +220,30 @@ Both preview, then ask; `--yes` answers for a script that was told to. Neither
 touches remote data or the source's accounts, and neither revokes anything at
 the source. Ask the user before removing: queries and views on `VS_<NAME>`
 stop working.
+
+## MongoDB: a collection as tables
+
+```bash
+exakit connect mongodb --name movies --set "uri=mongodb+srv://cluster0.abc12.mongodb.net/?authSource=admin" \
+  --set database=sample_mflix --set collection=movies --set user=reader --password-file ~/keys/mongo.pw
+```
+
+- **One source per collection.** Its root table carries the scalar fields;
+  every nested object and array becomes a child table joined by `"_parent"`
+  (sample_mflix.movies: 12 tables - `MOVIES`, `MOVIES_genres_arr`,
+  `MOVIES_imdb`, ...). Column names keep MongoDB's case: quote them
+  (`"title"`). The schema is inferred from a bounded sample.
+- **The URI carries no credentials** (a `user:password@` URI is refused): the
+  user and password go into the CONNECTION, hidden. Atlas `mongodb+srv://`
+  works from inside the database. Atlas only answers addresses in the
+  project's IP access list - the user's public IP must be there.
+- **First use installs the Rust language container** (exasol-labs, pinned per
+  CPU, checksum-verified) after asking - one database restart. The adapter and
+  its scan UDF (`EXAKIT_VS.MONGODB_ADAPTER`, `MONGODB_SCAN`) keep the names the
+  library exports, so all MongoDB sources share them; the last source removed
+  drops them.
+- The account needs only `read` on the database. `reauth` tries a new password
+  on a throwaway schema first and keeps the old one if it is refused.
 
 ## BigQuery
 

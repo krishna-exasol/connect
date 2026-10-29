@@ -145,6 +145,57 @@ function Confirm-ExakitVs {
 # Install-ExakitVsJava - the Java language container, with consent: about 250
 # MiB and one restart, through the exakit command's own stop/start so add-on
 # services come back. Twin of _exakit_vs_install_java.
+# Install-ExakitVsRust - the Rust language container a native adapter
+# (Profile D) runs in, with consent: the exasol-labs build pinned for this CPU
+# in profiles\rust-native, size- and SHA-256-checked, registered as the RUST
+# alias, then one restart. Twin of _exakit_vs_install_rust.
+function Install-ExakitVsRust {
+    $defs = Get-ExakitVsDefs
+    $custom = (Get-Content -Raw -LiteralPath (Join-ExakitCorePath $defs "profiles" "rust-native" "profile.json") | ConvertFrom-Json).slc.custom
+    $arch = "x86_64"
+    if ("$env:PROCESSOR_ARCHITECTURE" -eq "ARM64") { $arch = "aarch64" }
+    $pin = $custom.arch.$arch
+    if (-not $pin) { Write-Host "  There is no Rust language container build for this CPU ($arch)." -ForegroundColor Red; return $false }
+    Info "This source runs a native adapter inside the database, and its Rust language container is not installed."
+    Info ("Installing it downloads {0} {1} (about {2} MiB, checksum-pinned) and restarts the database once (add-on services restart with it)." -f $custom.upstream, $custom.version, [int]([double]$pin.size / 1048576))
+    if (-not (Confirm-ExakitVs "Install the Rust language container now?")) {
+        Info "Nothing was installed. Run the same exakit connect again when you are ready."
+        return $false
+    }
+    $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("exakit-rust-" + [guid]::NewGuid().ToString("N"))
+    $file = Join-Path $dir $pin.asset
+    try {
+        Get-ExakitFile -Url $pin.url -Dest $file
+        $size = (Get-Item -LiteralPath $file).Length
+        if ("$size" -ne "$($pin.size)") {
+            Write-Host ("  The Rust language container download is {0} bytes, not the pinned {1}; nothing was installed." -f $size, $pin.size) -ForegroundColor Red
+            return $false
+        }
+        if ((Get-ExakitSha256 -Path $file) -ne "$($pin.sha256)") {
+            Write-Host "  The Rust language container download does not match its pinned checksum; nothing was installed." -ForegroundColor Red
+            return $false
+        }
+        $slcArgs = @("slc", "custom", "install", "--source", $file, "--alias", "RUST", "--language", "rust", "--no-restart")
+        $flag = Get-PersonalAutoApproveFlag "slc"
+        if ($flag) { $slcArgs += $flag }
+        if ((Invoke-ExakitLogged (Get-PersonalCli) @slcArgs) -ne 0) {
+            Write-Host ("  {0} The Rust language container did not install. Details: exakit logs" -f $script:UiCross) -ForegroundColor Red
+            return $false
+        }
+    } finally {
+        Remove-Item -Recurse -Force -LiteralPath $dir -ErrorAction SilentlyContinue
+    }
+    $exakit = Join-Path $script:BinDir "exakit.cmd"
+    $previousStop = $env:EXAKIT_STOP_ADDONS
+    try {
+        $env:EXAKIT_STOP_ADDONS = "1"
+        & $exakit stop *> $null
+    } finally { $env:EXAKIT_STOP_ADDONS = $previousStop }
+    & $exakit start | Out-Host
+    Ok "Rust language container installed"
+    return $true
+}
+
 function Install-ExakitVsJava {
     Info "Virtual schemas run Java inside the database, and its Java language container is not installed."
     Info "Installing it downloads about 250 MiB and restarts the database once (add-on services restart with it)."
@@ -185,6 +236,8 @@ function Invoke-ExakitVsRun {
             if (-not (Repair-PersonalSlcDns)) { Write-Host "  DNS could not be repaired. Restart the database (exakit stop, exakit start) and try again." -ForegroundColor Red; break }
         } elseif ($run.Code -eq 21) {
             if (-not (Install-ExakitVsJava)) { break }
+        } elseif ($run.Code -eq 23) {
+            if (-not (Install-ExakitVsRust)) { break }
         } else { break }
     }
     return $run.Code

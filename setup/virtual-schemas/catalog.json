@@ -109,6 +109,18 @@
       "profile": "java-document-files",
       "tier": "GA",
       "status": "candidate"
+    },
+    {
+      "id": "mongodb",
+      "name": "MongoDB",
+      "aliases": [
+        "mongo",
+        "atlas",
+        "mongodb-atlas"
+      ],
+      "profile": "rust-native",
+      "tier": "GA",
+      "status": "candidate"
     }
   ]
 }

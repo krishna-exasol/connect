@@ -130,8 +130,49 @@ _exakit_vs_install_java() {
     ok "Java language container installed"
 }
 
+# _exakit_vs_install_rust — the Rust language container a native adapter
+# (Profile D) runs in, with consent: the exasol-labs build pinned for this CPU
+# in profiles/rust-native, size- and SHA-256-checked, registered as the RUST
+# alias, then one database restart through the kit's own stop/start. Twin of
+# Install-ExakitVsRust.
+_exakit_vs_install_rust() {
+    _evr_pin="$(run_python_any - "$(exakit_vs_defs)/profiles/rust-native/profile.json" "$(uname -m)" <<'PY'
+import json, sys
+c = json.load(open(sys.argv[1]))["slc"]["custom"]
+arch = {"arm64": "aarch64", "aarch64": "aarch64", "x86_64": "x86_64", "amd64": "x86_64"}.get(sys.argv[2].lower(), "")
+p = c["arch"].get(arch)
+print("|".join([p["url"], p["sha256"], str(p["size"]), p["asset"], c["version"], c["upstream"]]) if p else "")
+PY
+)"
+    [ -n "$_evr_pin" ] || { error "There is no Rust language container build for this CPU ($(uname -m))."; return 1; }
+    IFS='|' read -r _evr_url _evr_sha _evr_size _evr_asset _evr_version _evr_upstream <<EOF
+$_evr_pin
+EOF
+    info "This source runs a native adapter inside the database, and its Rust language container is not installed."
+    info "Installing it downloads $_evr_upstream $_evr_version (about $((_evr_size / 1048576)) MiB, checksum-pinned) and restarts the database once (add-on services restart with it)."
+    if ! _exakit_vs_confirm "Install the Rust language container now?"; then
+        info "Nothing was installed. Run the same exakit connect again when you are ready."
+        return 1
+    fi
+    _evr_dir="$(mktemp -d "${TMPDIR:-/tmp}/exakit-rust.XXXXXX")" || return 1
+    fetch "$_evr_url" "$_evr_dir/$_evr_asset"
+    _evr_got="$(wc -c < "$_evr_dir/$_evr_asset" | tr -d ' ')"
+    [ "$_evr_got" = "$_evr_size" ] || { rm -rf "$_evr_dir"; error "The Rust language container download is $_evr_got bytes, not the pinned $_evr_size; nothing was installed."; return 1; }
+    verify_sha256 "$_evr_dir/$_evr_asset" "$_evr_sha"
+    if ! run_logged "$(personal_cli)" slc custom install --source "$_evr_dir/$_evr_asset" --alias RUST --language rust \
+            --no-restart $(personal_auto_approve_flag slc); then
+        rm -rf "$_evr_dir"
+        error "The Rust language container did not install. Details: exakit logs"
+        return 1
+    fi
+    rm -rf "$_evr_dir"
+    EXAKIT_STOP_ADDONS=1 "$EXAKIT_BIN_DIR/exakit" stop >/dev/null 2>&1 || true
+    "$EXAKIT_BIN_DIR/exakit" start || { error "The database did not come back after installing Rust. Run: exakit start"; return 1; }
+    ok "Rust language container installed"
+}
+
 # _exakit_vs_run <secret-or-empty> <engine args...> — run the engine once,
-# repairing DNS (exit 20) or installing Java (exit 21) and retrying once.
+# repairing DNS (exit 20) or installing Java (exit 21) or Rust (exit 23) and retrying once.
 _exakit_vs_run() {
     _evx_secret="$1"; shift
     _evx_out="$(mktemp "${TMPDIR:-/tmp}/exakit-vs.XXXXXX")" || return 1
@@ -150,6 +191,7 @@ _exakit_vs_run() {
             20) info "Giving the database's language containers the deployment's DNS, then trying again"
                 personal_slc_dns_repair || { error "DNS could not be repaired. Restart the database (exakit stop, exakit start) and try again."; break; } ;;
             21) _exakit_vs_install_java || break ;;
+            23) _exakit_vs_install_rust || break ;;
             *)  break ;;
         esac
     done
@@ -211,7 +253,7 @@ $2"; EXAKIT_VS_GIVEN="$EXAKIT_VS_GIVEN ${2%%=*}"; shift ;;
     _cc_tty="$(_exakit_prompt_tty)"
     if [ -z "$_cc_source" ]; then
         [ -n "$_cc_tty" ] || reject "Name the source to connect, e.g. exakit connect postgresql (see: exakit source catalog)."
-        _cc_source="$(prompt_text "Which source? (name or alias, e.g. postgresql, mysql, mssql, oracle, snowflake, s3, azure)" "")"
+        _cc_source="$(prompt_text "Which source? (name or alias, e.g. postgresql, mysql, mssql, oracle, snowflake, bigquery, mongodb, s3, azure)" "")"
     fi
     _cc_resolved="$(exakit_vs_engine resolve "$_cc_source" 2>/dev/null | sed -n 's/^RESULT {"connector": "\(.*\)"}$/\1/p')"
     if [ -z "$_cc_resolved" ]; then

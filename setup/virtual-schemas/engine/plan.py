@@ -11,6 +11,7 @@ import base64
 import difflib
 import json
 import os
+import platform
 import re
 
 import document
@@ -29,7 +30,29 @@ KINDS = {
     "aws-key-id": document.KEY_ID,
     "azure-account": document.AZURE_ACCOUNT,
     "azure-container": document.AZURE_CONTAINER,
+    # Host list, path and options only: the credentials go into the CONNECTION.
+    "mongodb-uri": re.compile(r"^mongodb(\+srv)?://[A-Za-z0-9.,:\[\]_-]+(/[A-Za-z0-9._~%&=?,:/+-]*)?$"),
+    "mongo-name": re.compile(r"^[^\x00-\x1f'\"\\$/\s]{1,120}$"),
 }
+
+
+def machine_arch():
+    """The CPU architecture the database runs on - Exasol Personal runs on the
+    host's (an arm64 Mac runs an aarch64 VM). EXAKIT_VS_ARCH overrides it."""
+    arch = (os.environ.get("EXAKIT_VS_ARCH") or platform.machine()).lower()
+    return {"arm64": "aarch64", "aarch64": "aarch64", "amd64": "x86_64", "x86_64": "x86_64"}.get(arch, arch)
+
+
+def resolve_arch(pin):
+    """A pin with per-architecture assets, as the one for this machine."""
+    if not pin or "arch" not in pin:
+        return pin
+    arch = machine_arch()
+    if arch not in pin["arch"]:
+        raise PlanError("this connector has no build for %s (only %s)" % (arch, ", ".join(sorted(pin["arch"]))))
+    flat = {k: v for k, v in pin.items() if k != "arch"}
+    flat.update(pin["arch"][arch])
+    return flat
 
 
 # Inside the database, loopback is the database's own runtime. Measured on
@@ -68,7 +91,10 @@ class Definitions(object):
         raise PlanError("unknown connector %s" % connector_id)
 
     def connector(self, connector_id):
-        return self._load("connectors", connector_id, "connector.json")
+        doc = self._load("connectors", connector_id, "connector.json")
+        if doc.get("adapter") and "arch" in doc["adapter"]:
+            doc["adapter"] = resolve_arch(doc["adapter"])
+        return doc
 
     def profile(self, profile_id):
         return self._load("profiles", profile_id, "profile.json")
@@ -98,10 +124,13 @@ class Definitions(object):
                         or [e["id"] for e in self.entries()])
 
 
-def objects(name):
+def objects(name, connector=None):
     upper = name.upper()
+    # A native adapter's entry point is bound to its script name, so its
+    # sources share one script under that name (Profile D).
+    script = (connector or {}).get("shared_adapter") or "ADAPTER_%s" % upper
     return {"connection": "EXAKIT_SRC_%s" % upper, "schema": "VS_%s" % upper,
-            "script_schema": "EXAKIT_VS", "script": "ADAPTER_%s" % upper}
+            "script_schema": "EXAKIT_VS", "script": script}
 
 
 def validate_inputs(connector, given):
@@ -147,6 +176,10 @@ def validate_inputs(connector, given):
             except document.DocumentError as error:
                 problems.append(str(error))
                 continue
+        elif kind == "mongodb-uri" and "@" in raw.split("://", 1)[-1].split("/", 1)[0]:
+            problems.append("the MongoDB URI carries credentials (user:password@): give the user with --set user=... "
+                            "and the password on standard input, so the database keeps it hidden")
+            continue
         elif kind == "s3-bucket" and "." in raw:
             problems.append("bucket %s has dots: its HTTPS name does not match the S3 certificate, and the kit "
                             "reads only over verified HTTPS" % raw)
@@ -227,7 +260,8 @@ def describe(defs, connector_id, name, values, runtime, cache, store):
     """The plan, as data: what is downloaded, staged, created - before any of it happens."""
     connector = defs.connector(connector_id)
     entry = defs.entry(connector_id)
-    names = objects(name)
+    names = objects(name, connector)
+    profile = defs.profile(connector["profile"])
     downloads = []
     for role in ("adapter", "driver"):
         pin = connector.get(role)
@@ -235,7 +269,11 @@ def describe(defs, connector_id, name, values, runtime, cache, store):
             continue
         downloads.append({"role": role, "asset": pin["asset"], "version": pin["version"], "bytes": pin["size"],
                           "cached": cache.has(pin), "license": pin["license"]})
-    steps = ["verify Java and its DNS in the database (resolve %s)" % (source_host(connector, values) or "the source")]
+    if profile["slc"]["language"] == "rust":
+        steps = ["verify the Rust language container in the database (exakit connect installs it with your "
+                 "consent: %s %s, one restart)" % (profile["slc"]["custom"]["upstream"], profile["slc"]["custom"]["version"])]
+    else:
+        steps = ["verify Java and its DNS in the database (resolve %s)" % (source_host(connector, values) or "the source")]
     if connector.get("etl"):
         steps.append("register loader driver %s" % connector["etl"]["drivername"])
     if values.get("ca"):
@@ -263,6 +301,13 @@ def describe(defs, connector_id, name, values, runtime, cache, store):
                   % (names["script_schema"], names["script"], names["script_schema"], connector["import_script"]),
                   "create virtual schema %s" % names["schema"],
                   "verify every table with a bounded read"]
+    elif connector.get("shared_adapter"):
+        steps += ["create CONNECTION %s" % names["connection"],
+                  "create adapter script %s.%s and its scan UDF %s.%s (shared by every %s source)"
+                  % (names["script_schema"], names["script"], names["script_schema"], connector["import_script"],
+                     connector["name"]),
+                  "create virtual schema %s" % names["schema"],
+                  "verify metadata and one bounded read"]
     else:
         steps += ["create CONNECTION %s" % names["connection"],
                   "create adapter script %s.%s" % (names["script_schema"], names["script"]),
