@@ -715,6 +715,39 @@ lacks "...and does not offer tls=require, which Snowflake does not have" "tls=re
 has "...MySQL keeps the ca advice" "give the CA as PEM with --set ca=<file>" "$(printf '%s\n' "$E6" | sed -n 3p)"
 check "...and the error is filed as TLS, so the remedy is shown (measured: Snowflake fell to 'see the log')" "tls" "$(printf '%s\n' "$E6" | sed -n 4p)"
 
+printf '\n== Snowflake: the loader trusts the container'"'"'s CA store ==\n'
+# Measured on Exasol Personal 2.3.0 against a real account: the JDBC loader's
+# Java trusts nothing ("trustAnchors parameter must be non-empty"), and the
+# Snowflake driver reads trust only from the JVM's default store. With the
+# kit's exakit.loader.TrustStoreDriver as the loader's main class, the same
+# import reached Snowflake's sign-in. The fake fails a Snowflake read unless
+# that main class and its jar are registered (loader_cacerts false).
+SF_SET="--set account=myorg-acct1 --set database=SALES --set warehouse=COMPUTE_WH --set user=READER"
+SFLOADER="$EXA/jdbc/SNOWFLAKE_JDBC_DRIVER"
+db '{"loader_cacerts": false, "sources": {"myorg-acct1.snowflakecomputing.com": {"tables": ["ORDERS"]}}}'
+run_secret "$SECRET" connect snowflake --name sf $SF_SET --secret-stdin
+check "Snowflake on a loader without a CA store: exit 0" "0" "$RC"
+has "...the loader is registered trusting the container's CA store" "registered for IMPORT FROM JDBC (trusting the language container's CA store)" "$OUT"
+has "...its main class is the kit's, which hands over to the Snowflake driver" "DRIVERMAIN=exakit.loader.TrustStoreDriver" "$(cat "$SFLOADER/settings.cfg")"
+has "...the Snowflake driver stays on the loader's classpath" "JAR=snowflake-jdbc-4.4.0.jar" "$(cat "$SFLOADER/settings.cfg")"
+has "...with the kit's jar beside it" "JAR=exakit-loader.jar" "$(cat "$SFLOADER/settings.cfg")"
+check "...which is staged there" "yes" "$([ -f "$SFLOADER/exakit-loader.jar" ] && echo yes || echo no)"
+check "...built once in the database, the build script dropped" "1 no" \
+    "$(dbq 'd.get("tls_builds", 0)') $(dbq '"EXAKIT_VS.EXAKIT_TLS_BUILD" in d["scripts"]' | tr A-Z a-z | sed 's/true/yes/;s/false/no/')"
+run_secret "$SECRET" connect snowflake --name sf2 $SF_SET --secret-stdin
+check "a second Snowflake source: exit 0, the cached jar is reused, not rebuilt" "0 1" "$RC $(dbq 'd.get("tls_builds", 0)')"
+run remove sf
+check "removing one keeps the loader for the other" "yes yes" \
+    "$([ -f "$SFLOADER/exakit-loader.jar" ] && echo yes || echo no) $([ -f "$SFLOADER/settings.cfg" ] && echo yes || echo no)"
+run remove sf2
+check "...the last one out removes the loader's jar and settings" "no no" \
+    "$([ -f "$SFLOADER/exakit-loader.jar" ] && echo yes || echo no) $([ -f "$SFLOADER/settings.cfg" ] && echo yes || echo no)"
+LOADERSRC="$ROOT/setup/virtual-schemas/java/exakit/loader/TrustStoreDriver.java"
+check "the loader class ships as ASCII source, no binary" "0" "$(LC_ALL=C grep -c '[^[:print:][:space:]]' "$LOADERSRC")"
+check "...defines no trust manager and disables nothing: it only names the CA store" "0" \
+    "$(grep -c -E 'TrustManager|checkServerTrusted|HostnameVerifier|setDefault|insecure' "$LOADERSRC")"
+has "...and never overrides a trust store someone already set" 'System.getProperty("javax.net.ssl.trustStore") == null' "$(cat "$LOADERSRC")"
+
 printf '\n== a private CA for Oracle: a wallet inside the connection ==\n'
 # Measured against RDS Oracle 19c over TCPS: ojdbc 23 reads a trust-only PEM
 # wallet from wallet_location=data:;base64,... - in both the loader and the

@@ -9,6 +9,9 @@ database and inspect it afterwards:
                 a host ending in .invalid answers "dns ..." (no such name)
     unreachable host names whose TCP probe fails
     clock_skew  seconds the database clock is off this computer's (negative: behind)
+    loader_cacerts false -> the JDBC loader trusts nothing (Exasol Personal, measured):
+                a Snowflake import fails unless its loader's main class is the kit's
+                exakit.loader.TrustStoreDriver with exakit-loader.jar beside it
     sources     {host: {"tables": [...], "fail": null|"auth"|"tls"|"tls-validity"|"unreachable"|"denied",
                         "secret": "<the credential the source accepts>"}}
                 a document source (S3) is keyed by <bucket>.s3.<region>.amazonaws.com
@@ -158,6 +161,26 @@ def _inferred(error, source):
                      % (source, source, cause))
 
 
+def _loader_trust(doc, connection):
+    # Measured on Exasol Personal 2.3.0 (loader_cacerts false): the loader's
+    # Java trusts nothing, unless the kit's main class points it at the
+    # container's CA store. Only drivers that read the default store care.
+    con = doc["connections"].get(connection)
+    if doc.get("loader_cacerts") is not False or not con or not con["url"].startswith("jdbc:snowflake:"):
+        return
+    folder = os.path.join(os.environ["FAKE_VS_EXA"], "jdbc")
+    for name in (os.listdir(folder) if os.path.isdir(folder) else []):
+        cfg = os.path.join(folder, name, "settings.cfg")
+        text = open(cfg).read() if os.path.isfile(cfg) else ""
+        if "PREFIX=jdbc:snowflake:" in text and "DRIVERMAIN=exakit.loader.TrustStoreDriver" in text and \
+                os.path.isfile(os.path.join(folder, name, "exakit-loader.jar")):
+            return
+    raise Exception("ETL-5402: JDBC-Client-Error: Connecting to '%s' as user='%s' failed: JDBC driver encountered "
+                    "communication error. Message: Exception encountered for HTTP request: (internal_error) Unexpected "
+                    "error: java.security.InvalidAlgorithmParameterException: the trustAnchors parameter must be "
+                    "non-empty." % (con["url"], con["user"]))
+
+
 def _source_for(doc, connection):
     con = doc["connections"].get(connection)
     if not con:
@@ -235,13 +258,17 @@ class Fake(object):
             if doc.get("tls_compiler") is False:
                 return [{"NAME": "ERROR", "B64": "no Java compiler in the database's Java container"}]
             import base64
-            return [{"NAME": "exakit/tls/PemTrustManager.class", "B64": base64.b64encode(b"\xca\xfe\xba\xbe-stand-in").decode()}]
+            src = sql.replace("''", "'")
+            name = "%s/%s.class" % (re.search(r"package ([\w.]+);", src).group(1).replace(".", "/"),
+                                    re.search(r"public (?:final )?class (\w+)", src).group(1))
+            return [{"NAME": name, "B64": base64.b64encode(b"\xca\xfe\xba\xbe-stand-in").decode()}]
         m = re.search(r"FROM EXA_DBA_VIRTUAL_TABLES WHERE TABLE_SCHEMA = '([^']+)'", sql)
         if m:
             vs = doc["virtual"].get(m.group(1))
             return [{"TABLE_NAME": t} for t in (vs["tables"] if vs else [])]
         m = re.match(r"SELECT \* FROM \(IMPORT FROM JDBC AT \"([^\"]+)\" STATEMENT '", sql)
         if m:
+            _loader_trust(doc, m.group(1))
             _source_for(doc, m.group(1))
             return [{"1": 1}]
         m = re.match(r'SELECT \* FROM "([^"]+)"\."([^"]+)" LIMIT 1', sql)
@@ -249,6 +276,8 @@ class Fake(object):
             vs = doc["virtual"].get(m.group(1))
             if vs is None:
                 raise Exception("schema %s not found" % m.group(1))
+            # A JDBC adapter pushes the read down as IMPORT FROM JDBC: the loader runs it.
+            _loader_trust(doc, vs["connection"])
             src = _source_for(doc, vs["connection"])
             return [] if m.group(2) in src.get("empty", []) else [{"X": 1}]
         raise Exception("fake: unexpected query: %s" % sql[:80])

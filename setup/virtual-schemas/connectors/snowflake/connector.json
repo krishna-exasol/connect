@@ -23,7 +23,8 @@
     "drivername": "SNOWFLAKE_JDBC_DRIVER",
     "prefix": "jdbc:snowflake:",
     "main": "net.snowflake.client.api.driver.SnowflakeDriver",
-    "nosecurity": true
+    "nosecurity": true,
+    "trust_store": "container"
   },
   "inputs": [
     {
@@ -76,6 +77,7 @@
   },
   "notes": [
     "JDBC_QUERY_RESULT_FORMAT=JSON is mandatory with driver 4.x.",
-    "Authenticates with a programmatic access token as the password; TLS with certificate, host name and OCSP checks is always on."
+    "Authenticates with a programmatic access token as the password; TLS with certificate, host name and revocation checks is always on.",
+    "The driver trusts only the JVM's default CA store, and the JDBC loader on Exasol Personal has none (measured: 'the trustAnchors parameter must be non-empty'). So the loader's main class is the kit's exakit.loader.TrustStoreDriver: it points the loader's JVM at the language container's own CA store, then hands every call to the Snowflake driver. Nothing is disabled; measured live, the loader then reached Snowflake's sign-in."
   ]
 }

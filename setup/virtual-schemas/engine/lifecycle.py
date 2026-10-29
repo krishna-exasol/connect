@@ -356,9 +356,19 @@ class Engine(object):
             jars.append(self.runtime.bucket_sql(cid, folder, tlshelper.JAR_NAME))
         self.emit("OK", "Adapter %s and driver %s verified and staged" % (adapter_pin["version"], driver_pin["version"]))
         etl = connector.get("etl")
+        loader_helper = None
+        if etl and etl.get("trust_store") == "container":
+            # The driver trusts only the JVM's default store, which the loader
+            # lacks; the kit's main class points it at the container's own.
+            try:
+                loader_helper = tlshelper.jar(self.db(), self.defs.root, self.cache.root, "loader")
+            except tlshelper.HelperError as error:
+                raise Failure(str(error), EXIT["failed"])
         if etl:
             loader = self.runtime.loader_dir(etl["drivername"])
-            settings = artifacts.settings_cfg(etl, driver_pin["asset"], [tlshelper.JAR_NAME] if helper else [])
+            extra = ([tlshelper.JAR_NAME] if helper else []) + ([tlshelper.LOADER_JAR] if loader_helper else [])
+            settings = artifacts.settings_cfg(dict(etl, main=tlshelper.LOADER_MAIN) if loader_helper else etl,
+                                              driver_pin["asset"], extra)
             cfg = os.path.join(loader, "settings.cfg")
             if os.path.isfile(cfg):
                 with open(cfg, encoding="utf-8") as handle:
@@ -377,13 +387,16 @@ class Engine(object):
                 created["files"].append(os.path.join(loader, driver_pin["asset"]))
             if made_cfg:
                 created["files"].append(cfg)
-            if helper:
-                dest = os.path.join(loader, tlshelper.JAR_NAME)
-                made = artifacts.stage_file(helper, dest)
-                self.store.add_consumer(dest, artifacts.sha256_file(helper), name, made)
+            for built, jar_name in ((helper, tlshelper.JAR_NAME), (loader_helper, tlshelper.LOADER_JAR)):
+                if not built:
+                    continue
+                dest = os.path.join(loader, jar_name)
+                made = artifacts.stage_file(built, dest)
+                self.store.add_consumer(dest, artifacts.sha256_file(built), name, made)
                 if made:
                     created["files"].append(dest)
-            self.emit("OK", "Loader driver %s registered for IMPORT FROM JDBC" % etl["drivername"])
+            self.emit("OK", "Loader driver %s registered for IMPORT FROM JDBC%s"
+                      % (etl["drivername"], " (trusting the language container's CA store)" if loader_helper else ""))
         return jars
 
     # --- SQL ------------------------------------------------------------------------
