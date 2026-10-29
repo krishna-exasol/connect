@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+**Re-running the installer without a terminal no longer reports a failed
+data-load step.** With every bundled dataset already loaded, the data-load
+table pre-ticks the local-file row so Enter still does something; with no
+terminal that default stood, the loader asked for a path nobody could give,
+and the install ended with "one step did not complete". Without a person at
+the table that row is now dropped and the run says how to name a file
+unattended (`EXAKIT_DATA_FILE`). Same on Windows.
+
 **The database-password prompt hides input from the first keystroke.** It
 printed itself and only then turned terminal echo off, so a password pasted or
 typed by a password manager the moment the prompt appeared was echoed in clear

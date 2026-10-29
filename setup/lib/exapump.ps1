@@ -2889,6 +2889,46 @@ function Clear-ExakitDbReachable {
     $script:ExakitDbReachable = $null
 }
 
+# Get-ExakitDbClockSkew - how far the database's clock is from this computer's,
+# in whole seconds (negative: the database is behind), or $null when the
+# database cannot be asked. A sleeping laptop can leave the database's VM clock
+# behind, and the first symptom is a remote source's certificate that is "not
+# yet valid" by it. POSIX_TIME() is the epoch whatever the session time zone;
+# the local reads either side of the query bound the round trip.
+# twin: exakit_db_clock_skew in setup/lib/exapump.sh.
+$script:ExakitClockSkewLimit = 120
+if ($env:EXAKIT_CLOCK_SKEW_LIMIT -match '^[0-9]+$') { $script:ExakitClockSkewLimit = [int]$env:EXAKIT_CLOCK_SKEW_LIMIT }
+function Get-ExakitDbClockSkew {
+    if (-not (Get-ExakitManifestValue "components.exapump.profile")) { return $null }
+    $before = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    # Invoke-Exapump, not Invoke-ExakitBounded: exapump.exe can exit non-zero
+    # on a statement that ran (see Test-ExapumpSucceeded), and the bounded
+    # runner discards the output of any non-zero exit.
+    $result = Invoke-Exapump @("sql", "-p", $script:ExapumpProfile, "SELECT 'EXAKIT_CLOCK=' || FLOOR(POSIX_TIME()) AS T")
+    $after = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    if (-not $result.Success -or "$($result.Output)" -notmatch 'EXAKIT_CLOCK=([0-9]+)') { return $null }
+    return [long]$Matches[1] - [long][Math]::Floor(($before + $after) / 2)
+}
+
+# Format-ExakitClockSkew <seconds> - "32 min behind", "1 h 25 min ahead of".
+# twin: exakit_clock_skew_words in setup/lib/exapump.sh.
+function Format-ExakitClockSkew {
+    param([long]$Seconds)
+    $dir = "ahead of"
+    if ($Seconds -lt 0) { $Seconds = -$Seconds; $dir = "behind" }
+    $minutes = [long][Math]::Floor(($Seconds + 30) / 60)
+    if ($minutes -ge 60) { return "$([long][Math]::Floor($minutes / 60)) h $($minutes % 60) min $dir" }
+    return "$minutes min $dir"
+}
+
+# Test-ExakitClockSkewed <seconds> - true when the skew is past the limit.
+# twin: exakit_clock_skewed in setup/lib/exapump.sh.
+function Test-ExakitClockSkewed {
+    param($Seconds)
+    if ($null -eq $Seconds) { return $false }
+    return ([Math]::Abs([long]$Seconds) -ge $script:ExakitClockSkewLimit)
+}
+
 # Test-ExakitTablePresent <table> [schema] - does the table exist in the given
 # schema (default STARTER_KIT / $EXAKIT_SCHEMA)?
 function Test-ExakitTablePresent {
@@ -3591,6 +3631,15 @@ function Select-ExakitDataLoad {
         -GroupParent $groupParent -GroupFirst $script:ExakitTableGroupFirst `
         -GroupLast $script:ExakitTableGroupLast -GroupMode "all")
     if ($selection -contains $script:ExakitTableRowSkip) { return @("none") }
+    # With nothing pending the local-file row is pre-ticked so Enter does
+    # something, but only a person can answer the question it asks. With no
+    # terminal the default stood and asked for a path nobody could give. Twin
+    # of the same check in exakit_data_load_select.
+    if ((-not $script:ExakitTableConfirmed) -and $script:ExakitTableRowLocal -eq 1 -and
+        $selection.Count -eq 1 -and $selection[0] -eq $script:ExakitTableRowLocal) {
+        Info "Every bundled dataset is already loaded. To load a file of your own without a terminal, name it with EXAKIT_DATA_FILE."
+        return @("none")
+    }
     $chosen = New-Object 'System.Collections.Generic.List[string]'
     foreach ($row in $selection) {
         if ($row -lt 1 -or $row -gt $script:ExakitTableIds.Count) { continue }
