@@ -80,6 +80,17 @@ try {
     } else {
         $script:Fail++; Write-Host ("  FAIL invalid rejected: expected rejected, got {0}" -f ($invalid -join ","))
     }
+
+    Write-Host "every dataset already loaded, no console - nothing is asked, nothing fails:"
+    # Twin of the same block in the bash test: the pre-ticked local-file row
+    # must not stand when nobody is there to name a file.
+    function Get-ExakitPendingDatasets { return @() }
+    $script:UiFancy = $false
+    $infoSeen = New-Object System.Collections.ArrayList
+    function Info([string]$M) { [void]$infoSeen.Add($M) }
+    $chosen = @(Select-ExakitDataLoad -FinalLabel "Skip" 6> $null)
+    Check "selection is none, not local" "none" $chosen
+    Check "...and says how to load a file unattended" "True" (($infoSeen -join " ").Contains("name it with EXAKIT_DATA_FILE"))
 }
 finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue

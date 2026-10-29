@@ -3481,6 +3481,17 @@ exakit_data_load_select() {
             return 0
             ;;
     esac
+    # With nothing pending the local-file row is pre-ticked so Enter does
+    # something, but only a person can answer the question it asks. With no
+    # terminal (an agent re-running the installer) that default stood, asked
+    # for a path nobody could give, and reported the install as failed.
+    # EXAKIT_DATA_FILE, the unattended answer, returned above.
+    if [ "${EXAKIT_TABLE_CONFIRMED:-0}" != 1 ] && [ "$EXAKIT_TABLE_ROW_LOCAL" = 1 ] && \
+       [ "$EXAKIT_TABLE_SELECTION" = "$EXAKIT_TABLE_ROW_LOCAL" ]; then
+        info "Every bundled dataset is already loaded. To load a file of your own without a terminal, name it with EXAKIT_DATA_FILE."
+        EXAKIT_DATA_LOAD_SELECTION="none"
+        return 0
+    fi
     for _dls_row in $(printf '%s' "$EXAKIT_TABLE_SELECTION" | tr ',' ' '); do
         _dls_id="$(printf '%s\n' "$EXAKIT_TABLE_IDS" | sed -n "${_dls_row}p")"
         [ -n "$_dls_id" ] || continue
