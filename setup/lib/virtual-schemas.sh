@@ -72,8 +72,10 @@ _exakit_vs_render() {
     done < "$1"
 }
 
-# _exakit_vs_read_secret <label> <password-file> — a secret, from the file the
-# caller named, else a hidden prompt, else stdin. Never from an argument.
+# _exakit_vs_read_secret <label> <password-file> [kind] — a secret, from the
+# file the caller named, else a hidden prompt, else stdin. Never from an
+# argument. A secret-file credential (a key file) is asked for by its path on
+# a terminal - nobody pastes a JSON key into a hidden prompt.
 _exakit_vs_read_secret() {
     if [ -n "$2" ]; then
         [ -r "$2" ] || { error "Cannot read $2"; return 1; }
@@ -82,10 +84,24 @@ _exakit_vs_read_secret() {
     fi
     _evs_tty="$(_exakit_prompt_tty)"
     if [ -n "$_evs_tty" ] && [ -r /dev/tty ]; then
+        if [ "${3:-}" = "secret-file" ]; then
+            _evs_path="$(prompt_text "$1 - path to the file" "")"
+            case "$_evs_path" in "~/"*) _evs_path="$HOME/${_evs_path#\~/}" ;; esac
+            [ -n "$_evs_path" ] && [ -r "$_evs_path" ] || { error "Cannot read ${_evs_path:-the file}"; return 1; }
+            cat "$_evs_path"
+            return 0
+        fi
         exakit_read_hidden "$1" || { error "The terminal cannot hide input; give the credential with --password-file."; return 1; }
         return 0
     fi
     cat
+}
+
+# _exakit_vs_secret_kind <connector> — the kind of its credential input
+# (secret or secret-file), empty when it has none.
+_exakit_vs_secret_kind() {
+    run_python_any -c 'import json,sys; c=json.load(open(sys.argv[1])); print(next((s["kind"] for s in c["inputs"] if s["kind"] in ("secret","secret-file")), ""))' \
+        "$(exakit_vs_defs)/connectors/$1/connector.json" 2>/dev/null
 }
 
 # _exakit_vs_confirm <question> — yes on a terminal answer y, or --yes.
@@ -238,7 +254,7 @@ EOF
         "$(exakit_vs_defs)/connectors/$_cc_resolved/connector.json" 2>/dev/null)"
     _cc_secret=""
     if [ -n "$_cc_label" ]; then
-        _cc_secret="$(_exakit_vs_read_secret "$_cc_label" "$_cc_pwfile")" || exit 2
+        _cc_secret="$(_exakit_vs_read_secret "$_cc_label" "$_cc_pwfile" "$(_exakit_vs_secret_kind "$_cc_resolved")")" || exit 2
         [ -n "$_cc_secret" ] || reject "No $(printf '%s' "$_cc_label" | tr 'A-Z' 'a-z') was given (pipe it on standard input or use --password-file)."
     fi
     if [ -n "$_cc_secret" ]; then
@@ -333,8 +349,9 @@ print("  " + "\n  ".join(["drops: " + ", ".join(p["drop"])] + (["keeps: " + ", "
                 if [ "$_cs_json" = 1 ]; then cat "$_cs_out"; else _exakit_vs_render "$_cs_out"; fi
                 rm -f "$_cs_out"; exit "$_cs_rc"
             fi
+            _cs_conn="$(sed -n 's/^RESULT .*"connector": "\([a-z0-9-]*\)".*/\1/p' "$_cs_out" | head -n 1)"
             rm -f "$_cs_out"
-            _cs_secret="$(_exakit_vs_read_secret "New credential for $_cs_name" "$_cs_pwfile")" || exit 2
+            _cs_secret="$(_exakit_vs_read_secret "New credential for $_cs_name" "$_cs_pwfile" "$(_exakit_vs_secret_kind "$_cs_conn")")" || exit 2
             [ -n "$_cs_secret" ] || reject "No credential was given."
             set -- "$@" reauth "$_cs_name" --secret-stdin
             if [ "$_cs_json" = 1 ]; then printf '%s' "$_cs_secret" | exakit_vs_engine "$@"; exit $?; fi
