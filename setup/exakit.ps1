@@ -3427,7 +3427,7 @@ function Invoke-CmdConnect {
     $interactive = Test-ExakitInteractive
     if (-not $source) {
         if (-not $interactive) { Deny-ExakitInput "Name the source to connect, e.g. exakit connect postgresql (see: exakit source catalog)." }
-        $source = Read-ExakitPrompt "Which source? (name or alias, e.g. postgresql, mysql, mssql, oracle, snowflake, bigquery, databricks, mongodb, s3, azure)" ""
+        $source = Read-ExakitPrompt "Which source? (name or alias, e.g. postgresql, mysql, mssql, oracle, snowflake, bigquery, databricks, mongodb, lakehouse, s3, azure)" ""
     }
     $resolved = Invoke-ExakitVsEngine -Arguments @("resolve", $source)
     if ($resolved.Code -ne 0) { [void](Show-ExakitVsLines -Lines $resolved.Lines); exit $resolved.Code }

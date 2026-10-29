@@ -123,6 +123,19 @@
       "status": "candidate"
     },
     {
+      "id": "lakehouse",
+      "name": "Lakehouse (Iceberg on AWS Glue)",
+      "aliases": [
+        "iceberg",
+        "glue",
+        "aws-glue",
+        "lakehouse-iceberg"
+      ],
+      "profile": "rust-native",
+      "tier": "GA",
+      "status": "candidate"
+    },
+    {
       "id": "mongodb",
       "name": "MongoDB",
       "aliases": [

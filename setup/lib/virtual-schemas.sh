@@ -253,7 +253,7 @@ $2"; EXAKIT_VS_GIVEN="$EXAKIT_VS_GIVEN ${2%%=*}"; shift ;;
     _cc_tty="$(_exakit_prompt_tty)"
     if [ -z "$_cc_source" ]; then
         [ -n "$_cc_tty" ] || reject "Name the source to connect, e.g. exakit connect postgresql (see: exakit source catalog)."
-        _cc_source="$(prompt_text "Which source? (name or alias, e.g. postgresql, mysql, mssql, oracle, snowflake, bigquery, databricks, mongodb, s3, azure)" "")"
+        _cc_source="$(prompt_text "Which source? (name or alias, e.g. postgresql, mysql, mssql, oracle, snowflake, bigquery, databricks, mongodb, lakehouse, s3, azure)" "")"
     fi
     _cc_resolved="$(exakit_vs_engine resolve "$_cc_source" 2>/dev/null | sed -n 's/^RESULT {"connector": "\(.*\)"}$/\1/p')"
     if [ -z "$_cc_resolved" ]; then

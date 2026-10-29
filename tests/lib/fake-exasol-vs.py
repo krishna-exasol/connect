@@ -21,6 +21,9 @@ database and inspect it afterwards:
     A Databricks source (jdbc:databricks:) also takes "no_columns" (Unity
     Catalog answers without columns, as the samples catalog does) and fails
     "tls" in the adapter's REST call in the kit's words
+    A lakehouse catalog on AWS Glue is keyed by glue.<region>.amazonaws.com and
+    takes "databases" ({name: [tables]}), "readable" (the databases the key may
+    list; default all) and "key_id" (the access key it accepts)
     sources     {host: {"tables": [...], "fail": null|"auth"|"tls"|"tls-validity"|"unreachable"|"denied",
                         "secret": "<the credential the source accepts>"}}
                 a document source (S3) is keyed by <bucket>.s3.<region>.amazonaws.com
@@ -246,12 +249,38 @@ def _databricks_source(doc, con, via):
     return src
 
 
+def _glue_source(doc, con, namespace=None):
+    # Measured (lakehouse-engine-rs 0.57.3, CATALOG_KIND GLUE): a key AWS does
+    # not know, and a database the key may not list - which, under a scoped
+    # policy, is also how a database that does not exist reads.
+    host = _host(con["url"])
+    src = doc["sources"].get(host)
+    if src is None:
+        raise Exception("VM error: F-UDF-CL-RUST-9001: UDF error: Glue GetTables failed: dispatch failure: "
+                        "error trying to connect: dns error")
+    cred = json.loads(con["secret"] or "{}")
+    database = namespace or src.get("_last_namespace", "")
+    if src.get("key_id") and cred.get("access_key") != src["key_id"]:
+        raise Exception("VM error: F-UDF-CL-RUST-9001: UDF error: Glue GetTables failed for database '%s': "
+                        "UnrecognizedClientException: The security token included in the request is invalid."
+                        % database)
+    if database not in src.get("readable", src.get("databases", {})):
+        raise Exception("VM error: F-UDF-CL-RUST-9001: UDF error: Glue GetTables failed for database '%s': "
+                        "AccessDeniedException: User: arn:aws:iam::123456789012:user/reader is not authorized to "
+                        "perform: glue:GetTables on resource: arn:aws:glue:%s:123456789012:database/%s because no "
+                        "identity-based policy allows the glue:GetTables action"
+                        % (database, host.split(".")[1], database))
+    return {"tables": [t.upper() for t in src["databases"].get(database, [])]}
+
+
 def _source_for(doc, connection, via="adapter"):
     con = doc["connections"].get(connection)
     if not con:
         raise Exception("connection %s not found" % connection)
     if con["url"].startswith("jdbc:databricks:"):
         return _databricks_source(doc, con, via)
+    if con["url"].startswith("https://glue."):
+        return _glue_source(doc, con, doc.get("namespaces", {}).get(connection))
     if con["url"].startswith("jdbc:bigquery:"):
         return _bigquery_source(doc, con)
     if con["url"].startswith("mongodb"):
@@ -412,6 +441,13 @@ class Fake(object):
             if src.get("collections") is not None and coll not in src["collections"]:
                 raise Exception("VM error: F-UDF-CL-RUST-9001: UDF error: MongoDB collection '%s' does not exist" % coll)
             doc["virtual"][m.group(1)] = {"connection": m.group(2), "tables": list(src.get("tables", []))}
+            return
+        m = re.match(r'CREATE VIRTUAL SCHEMA "([^"]+)" USING .* CATALOG_CONNECTION = \'([^\']+)\' '
+                     r'CATALOG_KIND = \'GLUE\' NAMESPACE = \'([^\']+)\'', sql)
+        if m:
+            src = _glue_source(doc, doc["connections"][m.group(2)], m.group(3))
+            doc.setdefault("namespaces", {})[m.group(2)] = m.group(3)
+            doc["virtual"][m.group(1)] = {"connection": m.group(2), "tables": src["tables"]}
             return
         m = re.match(r'CREATE VIRTUAL SCHEMA "([^"]+)" USING .* CONNECTION_NAME = \'([^\']+)\'', sql)
         if m:

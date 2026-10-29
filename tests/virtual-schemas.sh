@@ -37,20 +37,31 @@ NEWSECRET='n3w-T0ken-value'
 # Small stand-in artifacts with real digests, pinned into the copied
 # definitions and placed in the cache, so nothing is downloaded.
 python3 - "$DEFS" "$HOME_K" <<'PY'
-import hashlib, io, json, os, sys, zipfile
+import hashlib, io, json, os, sys, tarfile, zipfile
 defs, home = sys.argv[1:3]
 def seed(pin, data):
     pin["size"], pin["sha256"] = len(data), hashlib.sha256(data).hexdigest()
     folder = os.path.join(home, "cache", "virtual-schemas", pin["sha256"])
     os.makedirs(folder, exist_ok=True)
     open(os.path.join(folder, pin["asset"]), "wb").write(data)
+def targz(member, data):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as archive:
+        info = tarfile.TarInfo(member); info.size = len(data)
+        archive.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
 for cid in ("postgresql", "mysql", "sqlserver", "oracle", "snowflake", "bigquery", "s3", "azure-blob", "mongodb",
-            "databricks"):
+            "databricks", "lakehouse"):
     path = os.path.join(defs, "connectors", cid, "connector.json")
     doc = json.load(open(path))
     if "arch" in doc["adapter"]:
         for arch, pin in doc["adapter"]["arch"].items():
-            seed(pin, ("adapter-%s-%s" % (cid, arch)).encode())
+            data = ("adapter-%s-%s" % (cid, arch)).encode()
+            if doc["adapter"].get("bundle") == "tar.gz":
+                # A release archive: the pinned member inside it is pinned too.
+                pin["member_size"], pin["member_sha256"] = len(data), hashlib.sha256(data).hexdigest()
+                data = targz(doc["adapter"]["member"], data)
+            seed(pin, data)
     else:
         seed(doc["adapter"], ("adapter-" + cid).encode())
     if doc.get("trust"):
@@ -1037,6 +1048,145 @@ t = json.load(open(sys.argv[1] + "/setup/virtual-schemas/connectors/databricks/c
 print("ok" if re.fullmatch(r"[0-9a-f]{64}", t["sha256"]) and t["size"] > 100000
       and t["url"] == "https://curl.se/ca/%s" % t["asset"] else "bad")
 PYB
+)"
+
+printf '\n== Lakehouse (Profile D): Iceberg on AWS Glue, four shared scripts ==\n'
+# Measured on Exasol Personal 2.3.0 (lakehouse-engine-rs 0.57.3, aarch64, Glue
+# in ap-south-1): the engine shares MongoDB's Rust container; the adapter calls
+# LAKEHOUSE_SCAN and LAKEHOUSE_DISTRIBUTE_FILES by name in its own schema; a key
+# AWS does not know and a database the key may not list are refused by name.
+LK_KEY_ID="AKIAIOSFODNN7EXAMPLE"
+LK_FILE="$WORK/lake-key.json"
+printf '{"AccessKey": {"UserName": "reader", "AccessKeyId": "%s", "Status": "Active", "SecretAccessKey": "%s"}}' \
+    "$LK_KEY_ID" "$SECRET-0123456789abcdefghijklmnop" > "$LK_FILE"
+LK_SET="--set region=ap-south-1 --set database=sales_lake"
+lkdb() { db '{"sources": {"glue.ap-south-1.amazonaws.com": {"key_id": "'"$LK_KEY_ID"'", "databases": {"sales_lake": ["customers", "orders"], "other_lake": ["events"], "locked": ["x"]}, "readable": ["sales_lake", "other_lake"]}}'"${1:-}"'}'; }
+lkdb
+run plan lakehouse --name lake $LK_SET
+check "plan: exit 0" "0" "$RC"
+has "...this machine's engine archive" "lakehouse-engine" "$OUT"
+has "...the shared scripts by name" "EXAKIT_VS.LAKEHOUSE_SCAN, EXAKIT_VS.LAKEHOUSE_DISTRIBUTE_FILES, EXAKIT_VS.LAKEHOUSE_VERSION" "$OUT"
+run plan lakehouse --name lake --set region=ap-south-1 --set database=sales.eu
+check "a dotted database (the engine refuses one) is refused here, exit 2" "2" "$RC"
+OUT="$(EXAKIT_VS_ARCH=x86_64 eng plan lakehouse --name lake $LK_SET 2>&1)"
+has "...the x86_64 archive on x86_64" '"asset": "lakehouse-engine.tar.gz"' "$OUT"
+
+lkdb ', "rust": false'
+OUT="$(eng connect lakehouse --name lake $LK_SET --secret-stdin < "$LK_FILE" 2>&1)"; RC=$?
+check "without the Rust container: exit 23, nothing created" "23 {} {}" "$RC $(dbq 'd["connections"]') $(dbq 'd["virtual"]')"
+
+lkdb
+OUT="$(eng connect lakehouse --name lake $LK_SET --secret-stdin < "$LK_FILE" 2>&1)"; RC=$?
+check "connect with the create-access-key JSON on stdin: exit 0" "0" "$RC"
+has "...the database's tables" "Virtual schema VS_LAKE: 2 table(s); a bounded read succeeded" "$OUT"
+LKCON="$(dbq 'd["connections"]["EXAKIT_SRC_LAKE"]')"
+check "...the CONNECTION: the Glue endpoint, no user" "[\"https://glue.ap-south-1.amazonaws.com\", \"\"]" \
+    "$(dbq '[d["connections"]["EXAKIT_SRC_LAKE"]["url"], d["connections"]["EXAKIT_SRC_LAKE"]["user"]]')"
+check "...its password: the engine's JSON fields, nothing else" '["access_key", "region", "secret_key"]' \
+    "$(dbq 'sorted(__import__("json").loads(d["connections"]["EXAKIT_SRC_LAKE"]["secret"]))')"
+LKSO="$EXA/bucketfs/bfsdefault/default/exakit/vs/lakehouse/0.57.3/liblakehouse_engine.so"
+check "...only the .so is staged from the archive, as pinned" "yes no" \
+    "$([ -f "$LKSO" ] && echo yes || echo no) $(ls "$EXA/bucketfs/bfsdefault/default/exakit/vs/lakehouse/0.57.3/" | grep -c 'tar.gz' | sed 's/^0$/no/;s/^[1-9].*/yes/')"
+has "...the adapter keeps the name the engine exports" 'CREATE OR REPLACE RUST ADAPTER SCRIPT "EXAKIT_VS"."LAKEHOUSE_ADAPTER" AS' \
+    "$(dbq '[x for x in d["statements"] if "RUST ADAPTER SCRIPT" in x][-1]')"
+has "...and loads the staged .so" '%udf_object /buckets/bfsdefault/default/exakit/vs/lakehouse/0.57.3/liblakehouse_engine.so' \
+    "$(dbq '[x for x in d["statements"] if "RUST ADAPTER SCRIPT" in x][-1]')"
+has "...the scan script with the engine's signature" 'CREATE OR REPLACE RUST SCALAR SCRIPT "EXAKIT_VS"."LAKEHOUSE_SCAN"(common VARCHAR(2000000), files VARCHAR(2000000)) EMITS (...) AS' \
+    "$(dbq '[x for x in d["statements"] if "LAKEHOUSE_SCAN" in x][-1]')"
+LKLUA="$(dbq '[x for x in d["statements"] if "LAKEHOUSE_DISTRIBUTE_FILES" in x][-1]')"
+has "...the distributor in Lua" 'CREATE OR REPLACE LUA SET SCRIPT "EXAKIT_VS"."LAKEHOUSE_DISTRIBUTE_FILES"(files VARCHAR(2000000)) EMITS (files VARCHAR(2000000)) AS' "$LKLUA"
+check "...with no closing / (everything after AS is Lua)" "no" "$(printf '%s' "$LKLUA" | grep -q -x '/' && echo yes || echo no)"
+has "...the version script" '"EXAKIT_VS"."LAKEHOUSE_VERSION"() RETURNS VARCHAR(100) AS' "$(dbq '[x for x in d["statements"] if "LAKEHOUSE_VERSION" in x][-1]')"
+has "...the virtual schema names the catalog the engine's way" "CATALOG_CONNECTION = 'EXAKIT_SRC_LAKE' CATALOG_KIND = 'GLUE' NAMESPACE = 'sales_lake'" \
+    "$(dbq '[x for x in d["statements"] if x.startswith("CREATE VIRTUAL SCHEMA \"VS_LAKE\"")][-1]')"
+lacks "...the secret key is not printed" "$SECRET" "$OUT"
+
+OUT="$(eng connect lakehouse --name lake2 --set region=ap-south-1 --set database=other_lake --secret-stdin < "$LK_FILE" 2>&1)"; RC=$?
+check "a second lakehouse source: exit 0, the four scripts shared, not doubled" "0 1 1 1 1" \
+    "$RC $(dbq 'd["scripts"].count("EXAKIT_VS.LAKEHOUSE_ADAPTER")') $(dbq 'd["scripts"].count("EXAKIT_VS.LAKEHOUSE_SCAN")') $(dbq 'd["scripts"].count("EXAKIT_VS.LAKEHOUSE_DISTRIBUTE_FILES")') $(dbq 'd["scripts"].count("EXAKIT_VS.LAKEHOUSE_VERSION")')"
+
+OUT="$(eng connect lakehouse --name lakeno --set region=ap-south-1 --set database=locked --secret-stdin < "$LK_FILE" 2>&1)"; RC=$?
+check "a database the key may not list: exit 1, the shared scripts kept, nothing of its own" "1 1 false" \
+    "$RC $(dbq 'd["scripts"].count("EXAKIT_VS.LAKEHOUSE_SCAN")') $(dbq '"EXAKIT_SRC_LAKENO" in d["connections"]' | tr A-Z a-z)"
+has "...filed as access denied, with what the key needs" "glue:GetDatabase, GetTables, GetTable and GetPartitions" "$OUT"
+
+run_secret "$LK_KEY_ID" connect lakehouse --name lakebad $LK_SET --secret-stdin
+check "a bare key id as the secret: refused as input, exit 2" "2" "$RC"
+OUT="$(printf '{"AccessKey": {"AccessKeyId": "AKIAZZZZZZZZZZZZZZZZ", "SecretAccessKey": "%s"}}' "$SECRET-0123456789abcdefghijklmnop" \
+    | eng connect lakehouse --name lakebad $LK_SET --secret-stdin 2>&1)"; RC=$?
+check "a key AWS does not know: exit 1, nothing kept" "1 false" "$RC $(dbq '"EXAKIT_SRC_LAKEBAD" in d["connections"]' | tr A-Z a-z)"
+has "...filed as a rejected credential" "the source rejected the credentials" "$OUT"
+
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["sources"]["glue.ap-south-1.amazonaws.com"]["key_id"]="AKIANEWNEWNEWNEWNEW1"; json.dump(d, open(sys.argv[1],"w"))' "$STATE"
+OUT="$(eng reauth lake --secret-stdin < "$LK_FILE" 2>&1)"; RC=$?
+check "reauth with the key AWS now refuses: exit 1, the old CONNECTION kept" "1 $LK_KEY_ID" \
+    "$RC $(dbq '__import__("json").loads(d["connections"]["EXAKIT_SRC_LAKE"]["secret"])["access_key"]')"
+check "...nothing pending left behind" "[] []" \
+    "$(dbq '[c for c in d["connections"] if c.endswith("_PENDING")]') $(dbq '[v for v in d["virtual"] if v.endswith("_PENDING")]')"
+OUT="$(printf '{"AccessKey": {"AccessKeyId": "AKIANEWNEWNEWNEWNEW1", "SecretAccessKey": "%s"}}' "$NEWSECRET-0123456789abcdefghijk" \
+    | eng reauth lake --secret-stdin 2>&1)"; RC=$?
+check "reauth with the new key: exit 0, replaced" "0 AKIANEWNEWNEWNEWNEW1" \
+    "$RC $(dbq '__import__("json").loads(d["connections"]["EXAKIT_SRC_LAKE"]["secret"])["access_key"]')"
+
+run remove lake --dry-run
+lacks "removing one: the shared adapter is not in its plan" "LAKEHOUSE_ADAPTER" "$OUT"
+run remove lake
+check "...removed, the scripts and the .so kept for the other source" "0 1 yes" \
+    "$RC $(dbq 'd["scripts"].count("EXAKIT_VS.LAKEHOUSE_SCAN")') $([ -f "$LKSO" ] && echo yes || echo no)"
+run remove lake2 --dry-run
+for s in LAKEHOUSE_SCAN LAKEHOUSE_DISTRIBUTE_FILES LAKEHOUSE_VERSION; do
+    has "the last one out plans to drop $s" "script EXAKIT_VS.$s (no other lakehouse source uses it)" "$OUT"
+done
+LKN="$(dbq 'len(d["statements"])')"
+run remove lake2
+# Dropped by name: the last source out also drops EXAKIT_VS, which would hide
+# a script left behind whenever another kind of source keeps that schema.
+check "...and drops the three scripts by name, the adapter, and the .so" "3 1 no" \
+    "$(dbq 'len([x for x in d["statements"]['"$LKN"':] if x.startswith("DROP SCRIPT \"EXAKIT_VS\".\"LAKEHOUSE_")])') $(dbq 'len([x for x in d["statements"]['"$LKN"':] if x == "DROP ADAPTER SCRIPT \"EXAKIT_VS\".\"LAKEHOUSE_ADAPTER\""])') $([ -f "$LKSO" ] && echo yes || echo no)"
+LKN="$(dbq 'len(d["statements"])')"
+OUT="$(eng connect lakehouse --name lakefirst --set region=ap-south-1 --set database=locked --secret-stdin < "$LK_FILE" 2>&1)"; RC=$?
+check "a refused FIRST lakehouse source: exit 1, the three scripts it created dropped by name" "1 3" \
+    "$RC $(dbq 'len([x for x in d["statements"]['"$LKN"':] if x.startswith("DROP SCRIPT \"EXAKIT_VS\".\"LAKEHOUSE_")])')"
+
+ART="$(python3 - "$ROOT" "$WORK" <<'PYA'
+import hashlib, io, os, sys, tarfile
+sys.path.insert(0, sys.argv[1] + "/setup/virtual-schemas/engine")
+import artifacts
+work = sys.argv[2]
+def make(path, entries):
+    with tarfile.open(path, "w:gz") as a:
+        for name, data, kind in entries:
+            info = tarfile.TarInfo(name)
+            if kind == "link":
+                info.type = tarfile.SYMTYPE; info.linkname = "/etc/passwd"; a.addfile(info)
+            else:
+                info.size = len(data); a.addfile(info, io.BytesIO(data))
+good = b"engine"
+make(work + "/a.tgz", [("udf/liblakehouse_engine.so", good, "file"), ("udf/other", b"x", "file")])
+make(work + "/b.tgz", [("udf/liblakehouse_engine.so", b"", "link")])
+sha = hashlib.sha256(good).hexdigest()
+for label, src, size, digest in (("ok", "a.tgz", len(good), sha), ("tampered", "a.tgz", len(good), "0" * 64),
+                                 ("link", "b.tgz", 0, sha), ("missing", "a.tgz", 1, sha)):
+    member = "udf/liblakehouse_engine.so" if label != "missing" else "udf/nope.so"
+    dest = "%s/out-%s/liblakehouse_engine.so" % (work, label)
+    try:
+        artifacts.stage_tar_member(os.path.join(work, src), member, size, digest, dest)
+        print(label, "staged", sorted(os.listdir(os.path.dirname(dest))))
+    except artifacts.ArtifactError as e:
+        print(label, "refused", sorted(os.listdir(os.path.dirname(dest))) if os.path.isdir(os.path.dirname(dest)) else [])
+PYA
+)"
+check "a tar member: staged when it matches its pin, nothing else extracted" "ok staged ['liblakehouse_engine.so']" "$(printf '%s\n' "$ART" | sed -n 1p)"
+check "...a member that does not match is refused, nothing left behind" "tampered refused []" "$(printf '%s\n' "$ART" | sed -n 2p)"
+check "...a link in its place is refused" "link refused []" "$(printf '%s\n' "$ART" | sed -n 3p)"
+check "...an archive without it is refused" "missing refused []" "$(printf '%s\n' "$ART" | sed -n 4p)"
+check "the engine is pinned for both CPUs: archive and .so, size and SHA-256" "aarch64 x86_64" "$(python3 - "$ROOT" <<'PYP'
+import json, re, sys
+a = json.load(open(sys.argv[1] + "/setup/virtual-schemas/connectors/lakehouse/connector.json"))["adapter"]
+print(" ".join(sorted(k for k, p in a["arch"].items() if all(re.fullmatch(r"[0-9a-f]{64}", p[f]) for f in ("sha256", "member_sha256"))
+                      and p["size"] > 0 and p["member_size"] > 0
+                      and p["url"].startswith("https://github.com/exasol-labs/lakehouse-engine-rs/releases/download/v%s/" % a["version"]))))
+PYP
 )"
 
 printf '\n== a private CA for Oracle: a wallet inside the connection ==\n'
