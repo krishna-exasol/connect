@@ -123,8 +123,12 @@ Write-Host ""
 Write-Host "== exakit source: the name before the credential, (none) for no checks =="
 # Invoke-CmdSource ends with `exit`, so it runs in a child PowerShell with
 # the engine and the secret prompt replaced by recorders.
+# The engine's canned answer travels in a file: Windows PowerShell 5.1 does not
+# escape the double quotes of a JSON argument to a native program, so the
+# child would get it split into several (measured on CI: exit 2, "takes one name").
 $child = @'
-param($cli, $record, $code, $result)
+param($cli, $record, $code, $resultFile)
+$result = Get-Content -Raw -LiteralPath $resultFile
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($cli, [ref]$null, [ref]$null)
 foreach ($def in @($ast.FindAll({ param($n) ($n -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and $n.Name -eq "Invoke-CmdSource" }, $true))) {
     . ([scriptblock]::Create($def.Extent.Text))
@@ -149,28 +153,33 @@ foreach ($def in @($lib.FindAll({ param($n) ($n -is [System.Management.Automatio
 Invoke-CmdSource -Arguments $args
 '@
 $childFile = Join-Path $work "source-child.ps1"; Set-Content -LiteralPath $childFile -Value $child -Encoding ASCII
+function Canned([string]$Text) {
+    $f = Join-Path $work ("canned-" + [guid]::NewGuid().ToString("N") + ".txt")
+    Set-Content -LiteralPath $f -Value $Text -Encoding ASCII -NoNewline
+    return $f
+}
 $pwsh = (Get-Process -Id $PID).Path
 $record = Join-Path $work "source-calls.txt"
 $ErrorActionPreference = "Continue"
-$out = & $pwsh -NoProfile -File $childFile (J @("setup", "exakit.ps1")) $record 4 "FAIL no source named nosuch (see: exakit source list)" reauth nosuch 2>&1
+$out = & $pwsh -NoProfile -File $childFile (J @("setup", "exakit.ps1")) $record 4 (Canned "FAIL no source named nosuch (see: exakit source list)") reauth nosuch 2>&1
 $childCode = $LASTEXITCODE
 $ErrorActionPreference = "Stop"
 Check "reauth of a missing source: exit 4" 4 $childCode
 Check "...asked the engine for the name and never for the credential" "show nosuch" ((Get-Content -LiteralPath $record) -join "|")
 Remove-Item -LiteralPath $record
 $ErrorActionPreference = "Continue"
-$out = & $pwsh -NoProfile -File $childFile (J @("setup", "exakit.ps1")) $record 0 'RESULT {"checks": []}' check --all 2>&1
+$out = & $pwsh -NoProfile -File $childFile (J @("setup", "exakit.ps1")) $record 0 (Canned 'RESULT {"checks": []}') check --all 2>&1
 $ErrorActionPreference = "Stop"
 Check "check --all with no sources says (none)" $true ((@($out) -join "`n").Contains("(none)"))
 $drop = 'RESULT {"name": "sales", "drop": ["CONNECTION EXAKIT_SRC_SALES"], "keep": [], "delete_files": ["a.jar"], "keep_files": ["b.jar"], "note": "n"}'
 $ErrorActionPreference = "Continue"
-$out = & $pwsh -NoProfile -File $childFile (J @("setup", "exakit.ps1")) $record 0 $drop disconnect sales 2>&1
+$out = & $pwsh -NoProfile -File $childFile (J @("setup", "exakit.ps1")) $record 0 (Canned $drop) disconnect sales 2>&1
 $childCode = $LASTEXITCODE
 $ErrorActionPreference = "Stop"
 Check "disconnect without --yes and no console: exit 5, not 0" 5 $childCode
 Check "...after showing what it would drop" $true ((@($out) -join "`n").Contains("drops: CONNECTION EXAKIT_SRC_SALES"))
 $ErrorActionPreference = "Continue"
-$out = & $pwsh -NoProfile -File $childFile (J @("setup", "exakit.ps1")) $record 0 $drop remove sales --yes 2>&1
+$out = & $pwsh -NoProfile -File $childFile (J @("setup", "exakit.ps1")) $record 0 (Canned $drop) remove sales --yes 2>&1
 $childCode = $LASTEXITCODE
 $ErrorActionPreference = "Stop"
 Check "remove --yes: exit 0, and says it is done" "0 True" ("$childCode " + (@($out) -join "`n").Contains("sales removed"))

@@ -32,9 +32,12 @@ function Test-ExakitVsAvailable {
 }
 
 # Invoke-ExakitVsEngine - the engine with this installation's context. The
-# secret, when there is one, goes to its stdin as UTF-8 (Windows PowerShell
-# 5.1 otherwise pipes to native programs in ASCII and turns every non-ASCII
-# character into '?'). Returns @{ Code; Lines }.
+# secret, when there is one, goes to its stdin base64-encoded (and
+# --secret-stdin becomes --secret-stdin-base64): Windows PowerShell 5.1
+# re-encodes what it pipes to a native program - measured on CI, a
+# byte-order mark added and every non-ASCII character turned into '?' even
+# with $OutputEncoding set to UTF-8 - and plain ASCII survives every code
+# page. Returns @{ Code; Lines }.
 function Invoke-ExakitVsEngine {
     param([string[]]$Arguments = @(), [string]$Secret = "")
     $defs = Get-ExakitVsDefs
@@ -51,7 +54,11 @@ function Invoke-ExakitVsEngine {
         $value = "" + (Get-ExakitManifestValue $pair[1])
         if ($value) { $argv += @($pair[0], $value) }
     }
-    $argv += $Arguments
+    if ($Secret) {
+        $argv += @($Arguments | ForEach-Object { if ($_ -eq "--secret-stdin") { "--secret-stdin-base64" } else { $_ } })
+    } else {
+        $argv += $Arguments
+    }
     $errFile = [System.IO.Path]::GetTempFileName()
     $previous = $ErrorActionPreference
     $previousEncoding = $OutputEncoding
@@ -59,7 +66,9 @@ function Invoke-ExakitVsEngine {
         $ErrorActionPreference = "Continue"
         if ($Secret) {
             $OutputEncoding = New-Object System.Text.UTF8Encoding($false)
-            $lines = @($Secret | & $python @argv 2> $errFile)
+            $encoded = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Secret))
+            $lines = @($encoded | & $python @argv 2> $errFile)
+            $encoded = $null
         } else {
             $lines = @(& $python @argv 2> $errFile)
         }
