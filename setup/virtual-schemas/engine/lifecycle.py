@@ -10,6 +10,10 @@ Object names for a source <name>:
     CONNECTION       EXAKIT_SRC_<NAME>      the credential, readable only through SQL privileges
     virtual schema   VS_<NAME>              the tables a user queries
     adapter script   EXAKIT_VS.ADAPTER_<NAME>
+A document-files source (profile B) also has a mapping staged in the kit's
+bucket folder under mappings/<name>/, and shares its connector's import script
+(EXAKIT_VS.<import_script>, a name the adapter fixes) with the other sources of
+that connector; the last of them out drops it.
 The EXAKIT_VS schema also holds the DNS probe, and is dropped with the last source.
 """
 
@@ -19,6 +23,7 @@ import re
 import time
 
 import artifacts
+import document
 import plan as planner
 import sources
 import sql
@@ -32,7 +37,8 @@ EXIT = {"ok": 0, "failed": 1, "input": 2, "conflict": 3, "missing": 4, "gated": 
 
 # Status recorded for a failure kind (sql.classify).
 STATUS_FOR = {"auth": "auth-failed", "tls": "tls-failed", "unreachable": "unreachable", "nohost": "unreachable",
-              "dns": "dns-failed", "nojava": "failed", "error": "failed"}
+              "dns": "dns-failed", "nojava": "failed", "error": "failed", "denied": "access-denied",
+              "region": "failed", "nobucket": "failed", "clock": "failed"}
 
 REMEDY_FOR = {
     "auth": "the source rejected the credentials: exakit source reauth {name}",
@@ -41,9 +47,22 @@ REMEDY_FOR = {
     "nohost": "the host name no longer resolves: check it (a private name may need a VPN), then: exakit source check {name}",
     "dns": "Java in the database could not resolve the host name; restart the database with exakit start (it repairs DNS), then: exakit source check {name}",
     "nojava": "the Java language container is not installed: exakit connect installs it, or run: exasol slc install java",
+    "denied": "the account signs in but may not read this data: grant it what the message names ({access}), then: exakit source check {name}",
+    "region": "the bucket is in another region: exakit source disconnect {name} --yes, then exakit connect <connector> --name {name} --set region=<the bucket's region> with the credential again",
+    "nobucket": "the {store} does not exist under that name: check it, then remove and connect again",
+    "clock": "the database clock is too far from the store's for a signed request; restart the database (exakit stop, then exakit start), then: exakit source check {name}",
     "error": "see the log: exakit logs",
 }
 
+
+
+def remedy_for(kind, name, connector):
+    """The fix for a failure class, in the words of the connector's store."""
+    text = REMEDY_FOR.get(kind, REMEDY_FOR["error"]).format(
+        name=name, access=connector.get("access", "read access"), store=connector.get("store", "bucket"))
+    if kind == "auth" and connector.get("auth_hint"):
+        text += "; %s" % connector["auth_hint"]
+    return text
 
 # Seconds the database clock may be off this computer's before it is named.
 # Measured on Exasol Personal (macOS): the VM's clock does not catch up after
@@ -69,6 +88,7 @@ def tls_remedy(message, connector, clock=None):
     is past CLOCK_LIMIT, so a validity failure names the cause, not a guess."""
     text = str(message)
     has_ca = any(spec["kind"] == "ca-file" for spec in connector["inputs"])
+    has_tls = any(spec["name"] == "tls" for spec in connector["inputs"])
     if re.search(r"trustAnchors parameter must be non-empty", text, re.I):
         # Measured on Exasol Personal 2.3.0: the JDBC loader runs the language
         # container's Java outside it, and that Java's cacerts is an absolute
@@ -77,7 +97,9 @@ def tls_remedy(message, connector, clock=None):
                 "verify any certificate without one given to it" +
                 ("; give the CA as PEM with --set ca=<file> - for a public CA too, its root certificate"
                  if has_ca else "; this connector cannot take a CA yet - tls=require encrypts without verifying, "
-                 "only if the user accepts that"))
+                 "only if the user accepts that" if has_tls else
+                 "; this connector always verifies and its driver reads trust only from that store, so it cannot "
+                 "connect on this database until the loader has one"))
     if re.search(r"validity check failed|NotYetValid|not yet valid|CertificateExpired|has expired", text, re.I):
         if clock:
             return ("the database clock is %s this computer, so the certificate is outside its validity dates "
@@ -107,6 +129,7 @@ class Engine(object):
         self.store = sources.Store(args.kit_home)
         self.cache = artifacts.Cache(args.kit_home, log=lambda text: emit("INFO", text))
         self.profile = self.defs.profile("java-jdbc")
+        # Every profile stages into the same bucket folder (profile.json).
         self.runtime = artifacts.Runtime(args.deployment_dir or "", self.profile["bucket"])
         self._db = None
 
@@ -239,6 +262,32 @@ class Engine(object):
                 created["files"].append(path)
         return relative
 
+    def stage_mapping(self, values, name, created):
+        """The EDML files, copied into mappings/<name>/ in the kit's bucket
+        folder; the MAPPING property that names that folder for the adapter
+        (a bucket path, without /buckets - measured)."""
+        try:
+            files = document.mapping_files(values["mapping"])
+        except (document.DocumentError, OSError) as error:
+            raise Failure(str(error), EXIT["input"])
+        folder = self.runtime.bucket_dir("mappings", name)
+        if os.path.isdir(folder):
+            # Left by an earlier connect of this name: the mapping given now is the one that counts.
+            for stale in os.listdir(folder):
+                if not any(stale == n for n, _ in files) and stale.endswith(".json"):
+                    os.remove(os.path.join(folder, stale))
+        for file_name, text in files:
+            path = os.path.join(folder, file_name)
+            os.makedirs(folder, exist_ok=True)
+            with open(path, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(text)
+            self.store.add_consumer(path, hashlib.sha256(text.encode("utf-8")).hexdigest(), name, True)
+            if path not in created["files"]:
+                created["files"].append(path)
+        self.emit("OK", "Mapping staged: %d file%s from %s" % (len(files), "" if len(files) == 1 else "s",
+                                                                values["mapping"]))
+        return self.runtime.bucket_sql("mappings", name)[len("/buckets"):]
+
     def require_route(self, connector, values, name):
         host = planner.source_host(connector, values)
         if not host:
@@ -262,7 +311,7 @@ class Engine(object):
         if not self.runtime.available():
             raise Failure("the deployment's runtime directory is missing (%s)" % self.runtime.exa, EXIT["failed"])
         cid = connector["id"]
-        adapter_pin, driver_pin = connector["adapter"], connector["driver"]
+        adapter_pin, driver_pin = connector["adapter"], connector.get("driver")
         jars = []
         adapter_src = self.cache.fetch(adapter_pin)
         dest = self.runtime.bucket_dir(cid, adapter_pin["version"], adapter_pin["asset"])
@@ -272,6 +321,10 @@ class Engine(object):
             created["files"].append(dest)
             self.store.save_journal(name, dict(self.store.journal(name) or {}, created=created))
         jars.append(self.runtime.bucket_sql(cid, adapter_pin["version"], adapter_pin["asset"]))
+        if not driver_pin:
+            # A document-files adapter carries its store's SDK; nothing else to stage.
+            self.emit("OK", "Adapter %s verified and staged" % adapter_pin["version"])
+            return jars
         driver_src = self.cache.fetch(driver_pin)
         if driver_pin.get("bundle") == "zip":
             bundle_dir = self.runtime.bucket_dir(cid, "driver-" + driver_pin["version"])
@@ -303,9 +356,19 @@ class Engine(object):
             jars.append(self.runtime.bucket_sql(cid, folder, tlshelper.JAR_NAME))
         self.emit("OK", "Adapter %s and driver %s verified and staged" % (adapter_pin["version"], driver_pin["version"]))
         etl = connector.get("etl")
+        loader_helper = None
+        if etl and etl.get("trust_store") == "container":
+            # The driver trusts only the JVM's default store, which the loader
+            # lacks; the kit's main class points it at the container's own.
+            try:
+                loader_helper = tlshelper.jar(self.db(), self.defs.root, self.cache.root, "loader")
+            except tlshelper.HelperError as error:
+                raise Failure(str(error), EXIT["failed"])
         if etl:
             loader = self.runtime.loader_dir(etl["drivername"])
-            settings = artifacts.settings_cfg(etl, driver_pin["asset"], [tlshelper.JAR_NAME] if helper else [])
+            extra = ([tlshelper.JAR_NAME] if helper else []) + ([tlshelper.LOADER_JAR] if loader_helper else [])
+            settings = artifacts.settings_cfg(dict(etl, main=tlshelper.LOADER_MAIN) if loader_helper else etl,
+                                              driver_pin["asset"], extra)
             cfg = os.path.join(loader, "settings.cfg")
             if os.path.isfile(cfg):
                 with open(cfg, encoding="utf-8") as handle:
@@ -324,35 +387,70 @@ class Engine(object):
                 created["files"].append(os.path.join(loader, driver_pin["asset"]))
             if made_cfg:
                 created["files"].append(cfg)
-            if helper:
-                dest = os.path.join(loader, tlshelper.JAR_NAME)
-                made = artifacts.stage_file(helper, dest)
-                self.store.add_consumer(dest, artifacts.sha256_file(helper), name, made)
+            for built, jar_name in ((helper, tlshelper.JAR_NAME), (loader_helper, tlshelper.LOADER_JAR)):
+                if not built:
+                    continue
+                dest = os.path.join(loader, jar_name)
+                made = artifacts.stage_file(built, dest)
+                self.store.add_consumer(dest, artifacts.sha256_file(built), name, made)
                 if made:
                     created["files"].append(dest)
-            self.emit("OK", "Loader driver %s registered for IMPORT FROM JDBC" % etl["drivername"])
+            self.emit("OK", "Loader driver %s registered for IMPORT FROM JDBC%s"
+                      % (etl["drivername"], " (trusting the language container's CA store)" if loader_helper else ""))
         return jars
 
     # --- SQL ------------------------------------------------------------------------
-    def create_connection(self, names, url, user, secret, replace=False):
+    def create_connection(self, names, url, user, secret, replace=False, hidden=()):
         verb = "CREATE OR REPLACE CONNECTION" if replace else "CREATE CONNECTION"
         statement = "%s %s TO %s" % (verb, sql.ident(names["connection"]), sql.literal(url))
         if user is not None:
             statement += " USER %s IDENTIFIED BY %s" % (sql.literal(user), sql.literal(secret))
-        self.db().execute(statement, secrets=[secret])
+        self.db().execute(statement, secrets=[secret] + list(hidden))
 
-    def adapter_sql(self, names, jars):
+    def credential(self, connector, values, secret):
+        """(url, user, secret, hidden, notes) for the CONNECTION: a JDBC URL with
+        the user's password, or - for a document source - an empty URL and
+        user with the credential JSON as the secret."""
+        if connector.get("credential"):
+            try:
+                text, hidden, notes = document.credential(connector["credential"], values, secret)
+            except document.DocumentError as error:
+                failure = Failure(str(error), EXIT["input"])
+                failure.complete = True  # the credential's own problem, named; nothing ran
+                raise failure
+            return "", "", text, hidden, notes
+        return None, values.get("user"), secret, [], []
+
+    def adapter_sql(self, names, jars, profile=None):
+        script = (profile or self.profile)["adapter_script"]
         lines = ["CREATE OR REPLACE JAVA ADAPTER SCRIPT %s.%s AS"
                  % (sql.ident(names["script_schema"]), sql.ident(names["script"])),
-                 "  %%scriptclass %s;" % self.profile["adapter_script"]["scriptclass"]]
-        lines += ["  %%env %s;" % env for env in self.profile["adapter_script"].get("env", [])]
+                 "  %%scriptclass %s;" % script["scriptclass"]]
+        lines += ["  %%env %s;" % env for env in script.get("env", [])]
         lines += ["  %%jar %s;" % jar for jar in jars]
         return "\n".join(lines) + "\n/"
 
-    def vs_sql(self, connector, names, values):
+    def import_sql(self, connector, names, jars, profile):
+        """The document adapter's import UDF: the name, parameters and EMITS(...)
+        its adapter calls (from the adapter's user guide)."""
+        script = profile["import_script"]
+        lines = ["CREATE OR REPLACE JAVA SET SCRIPT %s.%s(DATA_LOADER VARCHAR(2000000), "
+                 "SCHEMA_MAPPING_REQUEST VARCHAR(2000000), CONNECTION_NAME VARCHAR(500)) EMITS(...) AS"
+                 % (sql.ident(names["script_schema"]), sql.ident(connector["import_script"])),
+                 "  %%scriptclass %s;" % script["scriptclass"]]
+        lines += ["  %%env %s;" % env for env in script.get("env", [])]
+        lines += ["  %%jar %s;" % jar for jar in jars]
+        return "\n".join(lines) + "\n/"
+
+    def import_script_users(self, connector_id, besides):
+        """Other sources of this connector, which share its import script."""
+        return [n for n in self.store.names() if n != besides and self.store.config(n).get("connector") == connector_id]
+
+    def vs_sql(self, connector, names, values, extra=None):
         props = ["CONNECTION_NAME = %s" % sql.literal(names["connection"])]
+        fields = dict(values, **(extra or {}))
         for key, template in connector["vs_properties"].items():
-            props.append("%s = %s" % (key, sql.literal(template.format(**values))))
+            props.append("%s = %s" % (key, sql.literal(template.format(**fields))))
         return "CREATE VIRTUAL SCHEMA %s USING %s.%s WITH %s" % (
             sql.ident(names["schema"]), sql.ident(names["script_schema"]), sql.ident(names["script"]),
             " ".join(props))
@@ -369,12 +467,40 @@ class Engine(object):
         self.db().query("SELECT * FROM %s.%s LIMIT 1" % (sql.ident(schema), sql.ident(tables[0])))
         return True
 
+    # A document source's tables each read their own objects, so each is read;
+    # beyond this many, the rest wait for a query.
+    READ_ALL_LIMIT = 25
+
+    def read_each(self, schema, tables):
+        """A document source: one row from every table. Measured on S3: a source
+        glob that matches no object reads as an empty table, not an error -
+        those tables are returned so the user hears of them."""
+        empty = []
+        for table in tables[:self.READ_ALL_LIMIT]:
+            rows = self.db().query("SELECT * FROM %s.%s LIMIT 1" % (sql.ident(schema), sql.ident(table)))
+            if not rows:
+                empty.append(table)
+        return empty
+
+    def verify(self, connector, schema):
+        """(tables, read, evidence words, empty tables) for a connected source."""
+        tables = self.tables(schema)
+        if connector.get("credential") and tables:
+            empty = self.read_each(schema, tables)
+            read = len(tables) > len(empty)
+            if empty:
+                self.emit("WARN", "No rows in %s: their mapping's source matches no objects, or they are empty - "
+                                  "check the \"source\" in the mapping" % ", ".join(empty))
+            return tables, read, "a bounded read of each table", empty
+        return tables, self.bounded_read(schema, tables), "a bounded read", []
+
     # --- operations -----------------------------------------------------------------
     def connect(self, connector_id, name, given, secret, dry_run=False, plan_only=False):
         if not sources.NAME.match(name or ""):
             raise Failure("the source name must be lower case letters, digits and _ (start with a letter, at most 40), "
                           "e.g. sales", EXIT["input"])
         connector = self.defs.connector(connector_id)
+        profile = self.defs.profile(connector["profile"])
         entry = self.defs.entry(connector_id)
         if entry["status"] == "gated":
             raise Failure("%s is not available yet: %s" % (entry["name"], entry["gate"]), EXIT["gated"])
@@ -423,25 +549,38 @@ class Engine(object):
                         if self.exists(kind, label):
                             raise Failure("%s %s already exists in the database and is not a source the kit set up; "
                                           "it was left unchanged" % (kind, label), EXIT["conflict"])
+                # Checked first: a malformed credential is named here, not as a
+                # Java stack from inside the database after files were staged.
+                url, user, conn_secret, hidden, notes = self.credential(connector, values, secret)
                 self.warn_clock()
                 self.require_route(connector, values, name)
                 ca_pem = self.choose_ca(connector, values)
                 jars = self.stage(connector, name, created)
                 truststore = self.stage_truststore(connector, name, ca_pem, created)
-                url = planner.jdbc_url(connector, values, {"ca_pem": ca_pem, "truststore": truststore})
-                self.create_connection(names, url, values.get("user"), secret, replace=reconnect)
+                mapping_path = None
+                if values.get("mapping") and not reconnect:
+                    mapping_path = self.stage_mapping(values, name, created)
+                if url is None:
+                    url = planner.jdbc_url(connector, values, {"ca_pem": ca_pem, "truststore": truststore})
+                self.create_connection(names, url, user, conn_secret, replace=reconnect, hidden=hidden)
                 if not reconnect:
                     made("connection")
                 self.emit("OK", "Connection %s created (the credential lives only in the database)" % names["connection"])
                 if not reconnect:
-                    self.db().execute(self.adapter_sql(names, jars))
+                    self.db().execute(self.adapter_sql(names, jars, profile))
                     made("script")
-                    self.db().execute(self.vs_sql(connector, names, values))
+                    if connector.get("import_script"):
+                        if not self.exists("script", names["script_schema"], connector["import_script"]):
+                            created["import_script"] = connector["import_script"]
+                            self.store.save_journal(name, journal)
+                        self.db().execute(self.import_sql(connector, names, jars, profile))
+                    self.db().execute(self.vs_sql(connector, names, values, {"mapping_path": mapping_path}))
                     made("schema")
-                tables = self.tables(names["schema"])
-                read = self.bounded_read(names["schema"], tables)
+                tables, read, how, empty = self.verify(connector, names["schema"])
+                for note in notes:
+                    self.emit("INFO", note.replace("<name>", name))
                 if read:
-                    self.emit("OK", "Virtual schema %s: %d table(s); a bounded read succeeded" % (names["schema"], len(tables)))
+                    self.emit("OK", "Virtual schema %s: %d table(s); %s succeeded" % (names["schema"], len(tables), how))
                 else:
                     self.emit("WARN", "Virtual schema %s connected, but the source shows no tables for this scope"
                               % names["schema"])
@@ -462,14 +601,20 @@ class Engine(object):
                 # A first connect has no source record yet, so the lifecycle
                 # commands do not apply: nothing was left behind, and the fix is
                 # the same command with corrected input.
-                remedy = REMEDY_FOR.get(kind, REMEDY_FOR["error"]).format(name=name)
+                remedy = remedy_for(kind, name, connector)
                 if getattr(error, "complete", False):
                     raise error
                 specific = tls_remedy(error, connector, self.clock()) if kind == "tls" else None
                 if specific:
                     remedy = "the source's certificate did not verify; nothing was kept - %s, then connect again" % specific
-                elif not reconnect and kind in ("auth", "tls", "unreachable", "nohost"):
-                    remedy = {"auth": "the source rejected the credentials; nothing was kept - correct them and run the same exakit connect again",
+                elif not reconnect and kind in ("auth", "tls", "unreachable", "nohost", "denied", "region", "nobucket",
+                                                "clock"):
+                    remedy = {"denied": "the account signs in but may not read this data; nothing was kept - grant it what the message names (%s), then connect again" % connector.get("access", "read access"),
+                              "region": "the bucket is in another region; nothing was kept - connect again with --set region=<the bucket's region>",
+                              "nobucket": "nothing was kept - check the %s name, then connect again" % connector.get("store", "bucket"),
+                              "clock": "the database clock is too far from the store's for a signed request; nothing was kept - restart the database (exakit stop, then exakit start), then connect again",
+                              "auth": "the source rejected the credentials; nothing was kept - correct them and run the same exakit connect again"
+                                      + ("; %s" % connector["auth_hint"] if connector.get("auth_hint") else ""),
                               "tls": "the source's certificate or host name did not verify; nothing was kept - fix the server certificate or choose tls=require knowingly, then connect again",
                               "unreachable": "the source did not answer from inside the database; nothing was kept - check host, port, firewall and VPN (a source on this computer must listen beyond 127.0.0.1), then connect again",
                               "nohost": "nothing was kept - check the spelling (a private name may need a VPN), then connect again"}[kind]
@@ -478,8 +623,9 @@ class Engine(object):
                     # check); only the driver's raw text needs it restated.
                     raise Failure("%s; %s" % (error, remedy.split("; ", 1)[-1]), code, kind)
                 raise Failure("%s (%s)" % (error, remedy), code, kind)
-            pins = {"adapter": connector["adapter"]["sha256"], "driver": connector["driver"]["sha256"],
-                    "adapter_version": connector["adapter"]["version"], "driver_version": connector["driver"]["version"]}
+            driver = connector.get("driver") or {}
+            pins = {"adapter": connector["adapter"]["sha256"], "driver": driver.get("sha256"),
+                    "adapter_version": connector["adapter"]["version"], "driver_version": driver.get("version")}
             record = {"schema_version": 1, "id": name, "connector": connector_id,
                       "profile": connector["profile"], "inputs": values, "objects": names,
                       "created_at": self.store.config(name).get("created_at") if reconnect else sources.now()}
@@ -492,7 +638,8 @@ class Engine(object):
             self.store.save_config(name, record)
             self.store.save_status(name, {"status": "ready", "pins": pins, "tables": len(tables),
                                           "last_check": {"at": sources.now(), "outcome": "ok",
-                                                         "evidence": "metadata and a bounded read" if read else "metadata"}})
+                                                         "evidence": ("metadata and %s" % how) if read else "metadata",
+                                                         "empty_tables": empty}})
             self.store.clear_journal(name)
         return {"name": name, "connector": connector_id, "objects": names, "tables": len(tables), "status": "ready"}
 
@@ -524,6 +671,13 @@ class Engine(object):
                         db.execute(statement)
                     except sql.DbError as error:
                         self.emit("WARN", "could not undo %s: %s" % (flag, error))
+                if flag == "script" and created.get("import_script"):
+                    # Made by this attempt, so no other source shares it yet.
+                    try:
+                        db.execute("DROP SCRIPT %s.%s" % (sql.ident(names["script_schema"]),
+                                                          sql.ident(created["import_script"])))
+                    except sql.DbError as error:
+                        self.emit("WARN", "could not undo the import script: %s" % error)
         if not self.store.exists(name):
             for path in self.store.release(name):
                 if path in created["files"] and os.path.isfile(path):
@@ -545,12 +699,11 @@ class Engine(object):
         try:
             self.warn_clock()
             self.require_route(connector, config["inputs"], name)
-            tables = self.tables(names["schema"])
-            read = self.bounded_read(names["schema"], tables)
+            tables, read, how, empty = self.verify(connector, names["schema"])
         except (Failure, sql.DbError) as error:
             kind = getattr(error, "kind", "error")
             status = self.record_check(name, "failed", str(error), kind)
-            remedy = REMEDY_FOR.get(kind, REMEDY_FOR["error"]).format(name=name)
+            remedy = remedy_for(kind, name, connector)
             specific = tls_remedy(error, connector, self.clock()) if kind == "tls" else None
             if specific:
                 remedy = "%s; then: exakit source check %s" % (specific.replace(
@@ -561,9 +714,12 @@ class Engine(object):
             self.emit("FAIL", "%s is %s: %s" % (name, status, error))
             self.emit("INFO", "Fix: %s" % remedy)
             return {"name": name, "status": status, "kind": kind, "error": str(error), "remedy": remedy}
-        evidence = "metadata and a bounded read (%d tables)" % len(tables) if read else "metadata only (no tables in scope)"
+        evidence = "metadata and %s (%d tables)" % (how, len(tables)) if read else "metadata only (no tables in scope)"
         self.record_check(name, "ok", evidence)
-        return {"name": name, "status": "ready", "evidence": evidence}
+        result = {"name": name, "status": "ready", "evidence": evidence}
+        if empty:
+            result["empty_tables"] = empty
+        return result
 
     def reauth(self, name, secret):
         config = self.store.config(name)
@@ -573,19 +729,27 @@ class Engine(object):
         if not secret:
             raise Failure("reauth needs the new credential on standard input", EXIT["input"])
         connector = self.defs.connector(config["connector"])
-        url = planner.jdbc_url(connector, config["inputs"], {"ca_pem": config.get("tls_ca"),
-                                                             "truststore": config.get("tls_truststore")})
+        inputs = dict(config["inputs"])
+        if connector.get("credential") and secret.lstrip().startswith("{"):
+            # A new credential file names its own key; the recorded key ID is the old one.
+            inputs.pop("access_key_id", None)
+        url, user, secret, hidden, notes = self.credential(connector, inputs, secret)
+        if url is None:
+            url = planner.jdbc_url(connector, inputs, {"ca_pem": config.get("tls_ca"),
+                                                       "truststore": config.get("tls_truststore")})
         with self.store.lock():
             # Tried before it replaces anything: a typo here must not break a
             # source that still works. The new credential goes into a pending
             # CONNECTION, one trivial statement runs through the loader with
             # it, and only an accepted credential replaces the old one.
-            self.try_credential(connector, config["objects"], url, config["inputs"].get("user"), secret)
+            self.try_credential(connector, config["objects"], url, user, secret)
             try:
-                self.create_connection(config["objects"], url, config["inputs"].get("user"), secret, replace=True)
+                self.create_connection(config["objects"], url, user, secret, replace=True, hidden=hidden)
             except sql.DbError as error:
                 raise Failure("the credential could not be replaced: %s" % error, EXIT["failed"])
         self.emit("OK", "Credential replaced in %s" % config["objects"]["connection"])
+        for note in notes:
+            self.emit("INFO", note.replace("<name>", name))
         return self.check(name)
 
     def try_credential(self, connector, names, url, user, secret):
@@ -640,9 +804,14 @@ class Engine(object):
         registry = self.store.registry().get("artifacts", {})
         mine = [path for path, entry in registry.items() if name in entry.get("consumers", [])]
         reclaim = [path for path in mine if registry[path].get("owned") and registry[path].get("consumers") == [name]]
+        connector = self.defs.connector(config["connector"])
+        shared = connector.get("import_script")
+        last = shared and not self.import_script_users(config["connector"], name)
         plan = {"name": name, "drop": ["virtual schema %s" % names["schema"],
-                                       "adapter script %s.%s" % (names["script_schema"], names["script"]),
-                                       "CONNECTION %s" % names["connection"]],
+                                       "adapter script %s.%s" % (names["script_schema"], names["script"])] +
+                                      (["import script %s.%s (no other %s source uses it)"
+                                        % (names["script_schema"], shared, config["connector"])] if last else []) +
+                                      ["CONNECTION %s" % names["connection"]],
                 "delete_files": reclaim, "keep_files": [p for p in mine if p not in reclaim],
                 "note": "remote data and source accounts are never touched"}
         if dry_run:
@@ -658,6 +827,8 @@ class Engine(object):
                 db.execute("DROP %sVIRTUAL SCHEMA %s CASCADE" % (force, sql.ident(names["schema"])))
             if self.exists("script", names["script_schema"], names["script"]):
                 db.execute("DROP ADAPTER SCRIPT %s.%s" % (sql.ident(names["script_schema"]), sql.ident(names["script"])))
+            if last and self.exists("script", names["script_schema"], shared):
+                db.execute("DROP SCRIPT %s.%s" % (sql.ident(names["script_schema"]), sql.ident(shared)))
             if connection_present:
                 db.execute("DROP CONNECTION %s" % sql.ident(names["connection"]))
             # A reauth killed mid-try can leave its pending credential behind.
@@ -728,5 +899,9 @@ class Engine(object):
             if status_filter and row["status"] != status_filter:
                 continue
             check = row.get("last_check") or {}
-            rows.append(dict(row, remedy=REMEDY_FOR.get(check.get("kind") or "error", REMEDY_FOR["error"]).format(name=row["name"])))
+            try:
+                connector = self.defs.connector(row["connector"])
+            except (OSError, ValueError):
+                connector = {}
+            rows.append(dict(row, remedy=remedy_for(check.get("kind") or "error", row["name"], connector)))
         return rows

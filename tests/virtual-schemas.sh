@@ -44,11 +44,13 @@ def seed(pin, data):
     folder = os.path.join(home, "cache", "virtual-schemas", pin["sha256"])
     os.makedirs(folder, exist_ok=True)
     open(os.path.join(folder, pin["asset"]), "wb").write(data)
-for cid in ("postgresql", "mysql", "sqlserver", "oracle", "snowflake", "bigquery"):
+for cid in ("postgresql", "mysql", "sqlserver", "oracle", "snowflake", "bigquery", "s3", "azure-blob"):
     path = os.path.join(defs, "connectors", cid, "connector.json")
     doc = json.load(open(path))
     seed(doc["adapter"], ("adapter-" + cid).encode())
-    if doc["driver"].get("bundle") == "zip":
+    if not doc.get("driver"):
+        pass
+    elif doc["driver"].get("bundle") == "zip":
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w") as z:
             z.writestr("GoogleBigQueryJDBC42.jar", b"a"); z.writestr("dep.jar", b"b"); z.writestr("EULA.txt", b"c")
@@ -62,7 +64,7 @@ STATE="$WORK/db.json"
 db() { printf '%s\n' "$1" > "$STATE"; }
 dbq() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); v=eval(sys.argv[2], {"d": d}); print(json.dumps(v) if not isinstance(v, str) else v)' "$STATE" "$1"; }
 eng() {
-    EXAKIT_VS_FAKE_DB="$ROOT/tests/lib/fake-exasol-vs.py" FAKE_VS_STATE="$STATE" \
+    EXAKIT_VS_FAKE_DB="$ROOT/tests/lib/fake-exasol-vs.py" FAKE_VS_STATE="$STATE" FAKE_VS_EXA="$EXA" \
         python3 "$ROOT/setup/virtual-schemas/engine/cli.py" --defs "$DEFS" --kit-home "$HOME_K" \
         --deployment-dir "$DEPLOY" --dsn 127.0.0.1:8563 --user sys --password-file /nonexistent "$@"
 }
@@ -117,6 +119,8 @@ samples = {"host": "db.example.com", "database": "sales", "schema": "public", "u
            "account": "myorg-acct1", "warehouse": "COMPUTE_WH", "project": "my-proj", "dataset": "analytics"}
 for entry in defs.entries():
     c = defs.connector(entry["id"])
+    if c.get("credential"):
+        continue    # a document source has no JDBC URL (its own section below)
     given = {s["name"]: samples[s["name"]] for s in c["inputs"] if s["name"] in samples}
     tls = next((s for s in c["inputs"] if s["name"] == "tls"), None)
     for mode in (tls["choices"] if tls else [None]):
@@ -698,12 +702,51 @@ load = lambda c: json.load(open(sys.argv[1] + "/setup/virtual-schemas/connectors
 text = "ETL-5402: ... Error: (internal_error) Unexpected error: java.security.InvalidAlgorithmParameterException: the trustAnchors parameter must be non-empty."
 print(lifecycle.tls_remedy(text, load("sqlserver")))
 print(lifecycle.tls_remedy(text, load("snowflake")))
+print(lifecycle.tls_remedy(text, load("mysql")))
+import sql
+print(sql.classify(text))
 PYE
 )"
 has "the loader's empty CA store (measured, Exasol Personal) is explained, with --set ca where it exists" \
     "has no CA store of its own (an Exasol Personal issue)" "$(printf '%s\n' "$E6" | sed -n 1p)"
 has "...for SQL Server now: give the CA" "give the CA as PEM with --set ca=<file>" "$(printf '%s\n' "$E6" | sed -n 1p)"
-has "...for a connector without ca yet: says so, and what require would mean" "cannot take a CA yet - tls=require encrypts without verifying" "$(printf '%s\n' "$E6" | sed -n 2p)"
+has "...for Snowflake (no ca, no tls choice): says it cannot connect here, offers no require" "always verifies and its driver reads trust only from that store" "$(printf '%s\n' "$E6" | sed -n 2p)"
+lacks "...and does not offer tls=require, which Snowflake does not have" "tls=require" "$(printf '%s\n' "$E6" | sed -n 2p)"
+has "...MySQL keeps the ca advice" "give the CA as PEM with --set ca=<file>" "$(printf '%s\n' "$E6" | sed -n 3p)"
+check "...and the error is filed as TLS, so the remedy is shown (measured: Snowflake fell to 'see the log')" "tls" "$(printf '%s\n' "$E6" | sed -n 4p)"
+
+printf '\n== Snowflake: the loader trusts the container'"'"'s CA store ==\n'
+# Measured on Exasol Personal 2.3.0 against a real account: the JDBC loader's
+# Java trusts nothing ("trustAnchors parameter must be non-empty"), and the
+# Snowflake driver reads trust only from the JVM's default store. With the
+# kit's exakit.loader.TrustStoreDriver as the loader's main class, the same
+# import reached Snowflake's sign-in. The fake fails a Snowflake read unless
+# that main class and its jar are registered (loader_cacerts false).
+SF_SET="--set account=myorg-acct1 --set database=SALES --set warehouse=COMPUTE_WH --set user=READER"
+SFLOADER="$EXA/jdbc/SNOWFLAKE_JDBC_DRIVER"
+db '{"loader_cacerts": false, "sources": {"myorg-acct1.snowflakecomputing.com": {"tables": ["ORDERS"]}}}'
+run_secret "$SECRET" connect snowflake --name sf $SF_SET --secret-stdin
+check "Snowflake on a loader without a CA store: exit 0" "0" "$RC"
+has "...the loader is registered trusting the container's CA store" "registered for IMPORT FROM JDBC (trusting the language container's CA store)" "$OUT"
+has "...its main class is the kit's, which hands over to the Snowflake driver" "DRIVERMAIN=exakit.loader.TrustStoreDriver" "$(cat "$SFLOADER/settings.cfg")"
+has "...the Snowflake driver stays on the loader's classpath" "JAR=snowflake-jdbc-4.4.0.jar" "$(cat "$SFLOADER/settings.cfg")"
+has "...with the kit's jar beside it" "JAR=exakit-loader.jar" "$(cat "$SFLOADER/settings.cfg")"
+check "...which is staged there" "yes" "$([ -f "$SFLOADER/exakit-loader.jar" ] && echo yes || echo no)"
+check "...built once in the database, the build script dropped" "1 no" \
+    "$(dbq 'd.get("tls_builds", 0)') $(dbq '"EXAKIT_VS.EXAKIT_TLS_BUILD" in d["scripts"]' | tr A-Z a-z | sed 's/true/yes/;s/false/no/')"
+run_secret "$SECRET" connect snowflake --name sf2 $SF_SET --secret-stdin
+check "a second Snowflake source: exit 0, the cached jar is reused, not rebuilt" "0 1" "$RC $(dbq 'd.get("tls_builds", 0)')"
+run remove sf
+check "removing one keeps the loader for the other" "yes yes" \
+    "$([ -f "$SFLOADER/exakit-loader.jar" ] && echo yes || echo no) $([ -f "$SFLOADER/settings.cfg" ] && echo yes || echo no)"
+run remove sf2
+check "...the last one out removes the loader's jar and settings" "no no" \
+    "$([ -f "$SFLOADER/exakit-loader.jar" ] && echo yes || echo no) $([ -f "$SFLOADER/settings.cfg" ] && echo yes || echo no)"
+LOADERSRC="$ROOT/setup/virtual-schemas/java/exakit/loader/TrustStoreDriver.java"
+check "the loader class ships as ASCII source, no binary" "0" "$(LC_ALL=C grep -c '[^[:print:][:space:]]' "$LOADERSRC")"
+check "...defines no trust manager and disables nothing: it only names the CA store" "0" \
+    "$(grep -c -E 'TrustManager|checkServerTrusted|HostnameVerifier|setDefault|insecure' "$LOADERSRC")"
+has "...and never overrides a trust store someone already set" 'System.getProperty("javax.net.ssl.trustStore") == null' "$(cat "$LOADERSRC")"
 
 printf '\n== a private CA for Oracle: a wallet inside the connection ==\n'
 # Measured against RDS Oracle 19c over TCPS: ojdbc 23 reads a trust-only PEM
@@ -725,6 +768,237 @@ run_secret "$NEWSECRET" reauth ora --secret-stdin
 has "reauth keeps the wallet in the URL" "wallet_location=data:;base64," "$(dbq 'd["connections"]["EXAKIT_SRC_ORA"]["url"]')"
 run remove ora; check "...and remove is clean" "0" "$RC"
 
+printf '\n== Profile B: S3 document files ==\n'
+# Measured against a real bucket (Exasol Personal 2.3.0, adapter 5.0.0): the
+# adapter and its import UDF come from one JAR, the CONNECTION holds JSON, the
+# mapping is read from the bucket path, and each failure below is the text S3
+# returned. The fake reads the staged mapping exactly where the adapter would.
+MAPS="$WORK/edml"; mkdir -p "$MAPS"
+for t in orders:data/orders/*.jsonl customers:data/customers/customers.csv events:data/events/event-*.json; do
+    printf '{"$schema": "https://schemas.exasol.com/edml-2.1.0.json", "source": "%s", "destinationTable": "%s"}\n' \
+        "${t#*:}" "$(printf '%s' "${t%%:*}" | tr 'a-z' 'A-Z')" > "$MAPS/${t%%:*}.json"
+done
+printf 'not a mapping\n' > "$MAPS/README.txt"
+KEYID="AKIAEXAMPLEKEYID0001"; AWSSECRET="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+S3_SET="--set bucket=docs-bucket --set region=ap-south-1 --set mapping=$MAPS"
+S3HOST="docs-bucket.s3.ap-south-1.amazonaws.com"
+db '{"sources": {"'"$S3HOST"'": {"secret": "'"$AWSSECRET"'", "region": "ap-south-1"}}}'
+run plan s3 --name docs $S3_SET
+check "plan: exit 0" "0" "$RC"
+has "...stages the mapping, naming its tables" '3 mapped tables: CUSTOMERS, EVENTS, ORDERS' "$OUT"
+has "...names the shared import script" 'import script EXAKIT_VS.IMPORT_FROM_S3_DOCUMENT_FILES' "$OUT"
+check "...downloads the adapter and nothing else (no JDBC driver)" "1" "$(printf '%s' "$OUT" | grep -c '"role":')"
+run plan s3 --name docs --set bucket=my.dotted.bucket --set region=ap-south-1 --set mapping=$MAPS
+has "a dotted bucket is refused: its HTTPS name fails the certificate" "does not match the S3 certificate" "$OUT"
+run plan s3 --name docs --set bucket=docs-bucket --set region=cn-north-1 --set mapping=$MAPS
+has "a China region is refused, by name" "China regions use other endpoints" "$OUT"
+BADMAP="$WORK/badmap"; mkdir -p "$BADMAP"
+printf '{"$schema": "https://schemas.exasol.com/edml-2.1.0.json", "source": "s3://docs-bucket/a.json", "destinationTable": "A"}\n' > "$BADMAP/a.json"
+printf '{"$schema": "https://schemas.exasol.com/edml-2.1.0.json", "source": "b/*.json", "destinationTable": "a"}\n' > "$BADMAP/b.json"
+printf '{"source": "c.json", "destinationTable": "C D"}\n' > "$BADMAP/c.json"
+run plan s3 --name docs --set bucket=docs-bucket --set region=ap-south-1 --set mapping=$BADMAP
+check "a bad mapping is refused before anything happens, exit 2" "2" "$RC"
+has "...a source with s3:// is named" 'is the key inside the bucket, without s3://' "$OUT"
+has "...two files mapping one table are named" 'a.json and b.json both map to table A' "$OUT"
+has "...and a missing \$schema and a bad table name" 'c.json needs "$schema"' "$OUT"
+has "...and a bad table name" 'c.json needs a "destinationTable" that is a plain SQL name' "$OUT"
+run plan s3 --name docs $S3_SET --set access_key_id=not-a-key
+has "a malformed access key ID is refused" "not a valid aws-key-id" "$OUT"
+
+run_secret "$AWSSECRET" connect s3 --name docs $S3_SET --set access_key_id=$KEYID --secret-stdin
+check "connect with the secret key on stdin: exit 0" "0" "$RC"
+has "...every table is read" 'Virtual schema VS_DOCS: 3 table(s); a bounded read of each table succeeded' "$OUT"
+check "...the CONNECTION holds the adapter's JSON, with bucket and region" \
+    '{"awsAccessKeyId": "AKIAEXAMPLEKEYID0001", "awsSecretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "awsRegion": "ap-south-1", "s3Bucket": "docs-bucket"}' \
+    "$(dbq 'd["connections"]["EXAKIT_SRC_DOCS"]["secret"]')"
+check "...with no URL and no user" '["", ""]' "$(dbq '[d["connections"]["EXAKIT_SRC_DOCS"]["url"], d["connections"]["EXAKIT_SRC_DOCS"]["user"]]')"
+lacks "...the secret key never reaches the output" "$AWSSECRET" "$OUT"
+lacks "...nor the source's records" "$AWSSECRET" "$(cat "$HOME_K"/virtual-schemas/sources/docs/*.json 2>/dev/null) $(cat "$HOME_K"/virtual-schemas/*.json 2>/dev/null)"
+STAGED="$EXA/bucketfs/bfsdefault/default/exakit/vs/mappings/docs"
+check "...the mapping's .json files are staged in the kit's bucket folder, nothing else" "customers.json events.json orders.json" \
+    "$(ls "$STAGED" | tr '\n' ' ' | sed 's/ $//')"
+check "...and the virtual schema has the mapping's tables" '["CUSTOMERS", "EVENTS", "ORDERS"]' "$(dbq 'd["virtual"]["VS_DOCS"]["tables"]')"
+VSQL="$(dbq '[x for x in d["statements"] if x.startswith("CREATE VIRTUAL SCHEMA")][-1]')"
+has "...MAPPING names the bucket path the adapter reads (no /buckets)" "MAPPING = '/bfsdefault/default/exakit/vs/mappings/docs'" "$VSQL"
+IMPORT="$(dbq '[x for x in d["statements"] if "IMPORT_FROM_S3_DOCUMENT_FILES" in x][-1]')"
+has "...the import script has the adapter's signature" 'CREATE OR REPLACE JAVA SET SCRIPT "EXAKIT_VS"."IMPORT_FROM_S3_DOCUMENT_FILES"(DATA_LOADER VARCHAR(2000000), SCHEMA_MAPPING_REQUEST VARCHAR(2000000), CONNECTION_NAME VARCHAR(500)) EMITS(...) AS' "$IMPORT"
+has "...runs the adapter's own UDF class from the same JAR" '%scriptclass com.exasol.adapter.document.UdfEntryPoint;' "$IMPORT"
+check "...with telemetry off, after %scriptclass (the measured order)" "yes" \
+    "$(printf '%s\n' "$IMPORT" | awk '/%scriptclass/{c=NR} /%env EXASOL_TELEMETRY_DISABLE=1;/{e=NR} END{print (c && e && c < e) ? "yes" : "no"}')"
+ADQ="$(dbq '[x for x in d["statements"] if x.startswith("CREATE OR REPLACE JAVA ADAPTER SCRIPT \"EXAKIT_VS\".\"ADAPTER_DOCS\"")][-1]')"
+has "...and the adapter script too" '%env EXASOL_TELEMETRY_DISABLE=1;' "$ADQ"
+check "...no loader driver was registered" "" "$(ls "$EXA/jdbc" | grep -v java.security)"
+
+printf '%s' '{"AccessKey": {"UserName": "reader", "AccessKeyId": "AKIAEXAMPLEKEYID0001", "Status": "Active", "SecretAccessKey": "'"$AWSSECRET"'"}}' > "$WORK/s3key.json"
+OUT="$(eng connect s3 --name docs2 $S3_SET --secret-stdin < "$WORK/s3key.json" 2>&1)"; RC=$?
+check "a second source from the JSON aws iam create-access-key prints: exit 0" "0" "$RC"
+check "...both share the one import script" "1" "$(dbq 'd["scripts"].count("EXAKIT_VS.IMPORT_FROM_S3_DOCUMENT_FILES")')"
+run remove docs --dry-run
+lacks "removing one: the shared import script is not in its plan" "IMPORT_FROM_S3_DOCUMENT_FILES" "$OUT"
+run remove docs
+check "...removed, exit 0" "0" "$RC"
+has "...and the other source keeps the import script" "EXAKIT_VS.IMPORT_FROM_S3_DOCUMENT_FILES" "$(dbq 'd["scripts"]')"
+check "...its staged mapping is gone" "no" "$([ -d "$STAGED" ] && echo yes || echo no)"
+run remove docs2 --dry-run
+has "the last one out plans to drop the import script" "import script EXAKIT_VS.IMPORT_FROM_S3_DOCUMENT_FILES (no other s3 source uses it)" "$OUT"
+run remove docs2
+check "...and does" "[]" "$(dbq '[s for s in d["scripts"] if "IMPORT_FROM" in s]')"
+
+db '{"sources": {"'"$S3HOST"'": {"secret": "'"$AWSSECRET"'", "empty": ["EVENTS"]}}}'
+run_secret "$AWSSECRET" connect s3 --name docs $S3_SET --set access_key_id=$KEYID --secret-stdin
+check "a table whose glob matches nothing still connects: exit 0" "0" "$RC"
+has "...and is named, with where to look" 'No rows in EVENTS: their mapping'"'"'s source matches no objects' "$OUT"
+run check docs
+check "check names it too" '["EVENTS"]' "$(eng --json check docs 2>/dev/null | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin).get("empty_tables")))')"
+run remove docs
+
+for case in "wrong secret|auth|rejected the credentials; nothing was kept" \
+            "denied|denied|s3:ListBucket on the mapped prefixes" \
+            "wrong region|region|connect again with --set region=<the bucket's region>"; do
+    label="${case%%|*}"; rest="${case#*|}"; fail_kind="${rest%%|*}"; expect="${rest#*|}"
+    case "$fail_kind" in
+        auth) db '{"sources": {"'"$S3HOST"'": {"secret": "something-else-entirely-0000000000000000"}}}' ;;
+        denied) db '{"sources": {"'"$S3HOST"'": {"fail": "denied"}}}' ;;
+        region) db '{"sources": {"docs-bucket.s3.eu-central-1.amazonaws.com": {}}}' ;;
+    esac
+    run_secret "$AWSSECRET" connect s3 --name docs $S3_SET --set access_key_id=$KEYID --secret-stdin
+    check "S3 $label: exit 1" "1" "$RC"
+    has "...the fix is named" "$expect" "$OUT"
+    check "...and nothing was kept: no connection, import script or mapping" '[{}, []] no' \
+        "$(dbq '[d["connections"], [s for s in d["scripts"] if "IMPORT_FROM" in s]]') $([ -d "$STAGED" ] && echo yes || echo no)"
+done
+has "the SDK's own words reach the user, not the UDF wrapper" "AccessDeniedException: User: arn:aws:iam::1:user/reader is not authorized" \
+    "$(db '{"sources": {"'"$S3HOST"'": {"fail": "denied"}}}'; run_secret "$AWSSECRET" connect s3 --name docs $S3_SET --set access_key_id=$KEYID --secret-stdin; printf '%s' "$OUT")"
+
+db '{"sources": {"'"$S3HOST"'": {"secret": "'"$AWSSECRET"'"}}}'
+run_secret "$AWSSECRET" connect s3 --name docs $S3_SET --set access_key_id=ASIAEXAMPLEKEYID0001 --secret-stdin
+check "a temporary key without its session token is refused, exit 2" "2" "$RC"
+has "...saying what to give" "need their session token" "$OUT"
+printf '%s' '{"Credentials": {"AccessKeyId": "ASIAEXAMPLEKEYID0001", "SecretAccessKey": "'"$AWSSECRET"'", "SessionToken": "FwoGZXIvYXdzEXAMPLETOKEN", "Expiration": "2026-10-29T01:00:00Z"}}' > "$WORK/sts.json"
+OUT="$(eng connect s3 --name docs $S3_SET --secret-stdin < "$WORK/sts.json" 2>&1)"; RC=$?
+check "the JSON aws sts prints connects: exit 0" "0" "$RC"
+has "...the token travels in the CONNECTION" '"awsSessionToken": "FwoGZXIvYXdzEXAMPLETOKEN"' "$(dbq 'd["connections"]["EXAKIT_SRC_DOCS"]["secret"]')"
+has "...and the user hears that it expires, with the reauth" "temporary credentials expire" "$OUT"
+lacks "...the token is not printed" "FwoGZXIvYXdzEXAMPLETOKEN" "$OUT"
+NEWAWS="AnotherSecretKeyValue0000000000000000000"
+db "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["sources"][sys.argv[2]]["secret"]=sys.argv[3]; print(json.dumps(d))' "$STATE" "$S3HOST" "$NEWAWS")"
+printf '%s' '{"AccessKey": {"AccessKeyId": "AKIAEXAMPLEKEYID0002", "SecretAccessKey": "'"$NEWAWS"'"}}' > "$WORK/s3key2.json"
+OUT="$(eng reauth docs --secret-stdin < "$WORK/s3key2.json" 2>&1)"; RC=$?
+check "reauth with a new key file: exit 0" "0" "$RC"
+has "...the CONNECTION holds the new key, the bucket and region kept" '{"awsAccessKeyId": "AKIAEXAMPLEKEYID0002", "awsSecretAccessKey": "AnotherSecretKeyValue0000000000000000000", "awsRegion": "ap-south-1", "s3Bucket": "docs-bucket"}' \
+    "$(dbq 'd["connections"]["EXAKIT_SRC_DOCS"]["secret"]')"
+run remove docs
+
+printf '\n== Profile B: Azure Blob Storage document files ==\n'
+# Measured against a real storage account (Exasol Personal 2.3.0, adapter
+# 3.1.0): a container SAS with read + list works through the adapter's
+# connection string, as does the account key; each failure below is the text
+# Azure returned. The CSV mapping has no fields, so CREATE reads the container
+# to infer them - and a failure there arrives wrapped in E-VSD-102.
+AZACCT="docsacct"; AZHOST="$AZACCT.blob.core.windows.net"
+AZKEY="$(printf 'QUFB%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21)QQ=="
+AZSIG="abcSig%2Bdef%3D"
+AZSAS="sv=2022-11-02&spr=https&se=2099-01-01T00%3A00Z&sr=c&sp=rl&sig=$AZSIG"
+AZ_SET="--set account=$AZACCT --set container=vs-test --set mapping=$MAPS"
+azdb() { db '{"sources": {"'"$AZHOST"'": {"key": "'"$AZKEY"'", "sas": {"vs-test": "'"$AZSIG"'"}, "containers": ["vs-test", "vs-private"]'"${1:-}"'}}}'; }
+AZSTAGED="$EXA/bucketfs/bfsdefault/default/exakit/vs/mappings/azdocs"
+azgone() { check "...and nothing was kept: no connection, import script or mapping" '[{}, []] no' \
+    "$(dbq '[d["connections"], [s for s in d["scripts"] if "IMPORT_FROM" in s]]') $([ -d "$AZSTAGED" ] && echo yes || echo no)"; }
+
+azdb
+run plan azure --name azdocs $AZ_SET
+check "plan: 'azure' finds the connector, exit 0" "0" "$RC"
+has "...it is azure-blob" '"connector": "azure-blob"' "$OUT"
+has "...resolves the account's blob endpoint first" "resolve $AZHOST" "$OUT"
+has "...names the adapter's import script" 'import script EXAKIT_VS.IMPORT_FROM_AZURE_BLOB_STORAGE_DOCUMENT_FILES' "$OUT"
+run plan azure-blob --name azdocs --set account=My_Account --set container=vs-test --set mapping=$MAPS
+has "an account name that cannot exist is refused" "account='My_Account' is not a valid azure-account" "$OUT"
+run plan azure-blob --name azdocs --set account=$AZACCT --set container=vs--test --set mapping=$MAPS
+has "...and a container name" "container='vs--test' is not a valid azure-container" "$OUT"
+
+run_secret "$AZSAS" connect azure-blob --name azdocs $AZ_SET --secret-stdin
+check "connect with a container SAS on stdin: exit 0" "0" "$RC"
+has "...every table is read" 'Virtual schema VS_AZDOCS: 3 table(s); a bounded read of each table succeeded' "$OUT"
+check "...the CONNECTION holds the adapter's JSON: a connection string the kit built, and the container" \
+    '{"absStorageAccountConnectionString": "BlobEndpoint=https://docsacct.blob.core.windows.net/;SharedAccessSignature='"$AZSAS"'", "absContainerName": "vs-test"}' \
+    "$(dbq 'd["connections"]["EXAKIT_SRC_AZDOCS"]["secret"]')"
+check "...with no URL and no user" '["", ""]' "$(dbq '[d["connections"]["EXAKIT_SRC_AZDOCS"]["url"], d["connections"]["EXAKIT_SRC_AZDOCS"]["user"]]')"
+lacks "...the SAS signature never reaches the output" "$AZSIG" "$OUT"
+lacks "...nor the source's records" "$AZSIG" "$(cat "$HOME_K"/virtual-schemas/sources/azdocs/*.json 2>/dev/null) $(cat "$HOME_K"/virtual-schemas/*.json 2>/dev/null)"
+has "...the SAS's expiry is said, with this source's reauth" "this SAS expires at 2099-01-01 00:00 UTC; then give a new one with: exakit source reauth azdocs" "$OUT"
+AZIMPORT="$(dbq '[x for x in d["statements"] if "IMPORT_FROM_AZURE_BLOB_STORAGE_DOCUMENT_FILES" in x][-1]')"
+has "...the import script has the adapter's signature" 'CREATE OR REPLACE JAVA SET SCRIPT "EXAKIT_VS"."IMPORT_FROM_AZURE_BLOB_STORAGE_DOCUMENT_FILES"(DATA_LOADER VARCHAR(2000000), SCHEMA_MAPPING_REQUEST VARCHAR(2000000), CONNECTION_NAME VARCHAR(500)) EMITS(...) AS' "$AZIMPORT"
+has "...from the Azure JAR, telemetry off" '%env EXASOL_TELEMETRY_DISABLE=1;' "$AZIMPORT"
+has "...the JAR is the Azure adapter's" 'azure-blob-storage-3.1.0.jar' "$AZIMPORT"
+check "...the mapping is staged for this source" "customers.json events.json orders.json" "$(ls "$AZSTAGED" | tr '\n' ' ' | sed 's/ $//')"
+
+printf 'DefaultEndpointsProtocol=https;EndpointSuffix=core.windows.net;AccountName=%s;AccountKey=%s;BlobEndpoint=https://%s/;FileEndpoint=https://%s.file.core.windows.net/;QueueEndpoint=https://%s.queue.core.windows.net/;TableEndpoint=https://%s.table.core.windows.net/\n' \
+    "$AZACCT" "$AZKEY" "$AZHOST" "$AZACCT" "$AZACCT" "$AZACCT" > "$WORK/azconn.txt"
+OUT="$(eng connect azure-blob --name azkey $AZ_SET --secret-stdin < "$WORK/azconn.txt" 2>&1)"; RC=$?
+check "the connection string az prints (every endpoint listed) connects: exit 0" "0" "$RC"
+check "...the CONNECTION holds the account key form, HTTPS" \
+    "DefaultEndpointsProtocol=https;AccountName=$AZACCT;AccountKey=$AZKEY;EndpointSuffix=core.windows.net" \
+    "$(dbq '__import__("json").loads(d["connections"]["EXAKIT_SRC_AZKEY"]["secret"])["absStorageAccountConnectionString"]')"
+has "...and the user hears what an account key opens" "an account key opens every container of $AZACCT, for writing too" "$OUT"
+lacks "...the key is not printed" "$AZKEY" "$OUT"
+check "...both sources share one import script" "1" "$(dbq 'd["scripts"].count("EXAKIT_VS.IMPORT_FROM_AZURE_BLOB_STORAGE_DOCUMENT_FILES")')"
+
+# Reauth: a key, then a SAS the kit refuses (kept the key), then the SAS back.
+run_secret "$AZKEY" reauth azdocs --secret-stdin
+check "reauth with the bare account key: exit 0" "0" "$RC"
+has "...the CONNECTION now holds the key" "AccountKey=$AZKEY" "$(dbq 'd["connections"]["EXAKIT_SRC_AZDOCS"]["secret"]')"
+run_secret "${AZSAS/sp=rl/sp=r}" reauth azdocs --secret-stdin
+check "reauth with a SAS that cannot list is refused here, exit 2" "2" "$RC"
+has "...saying which permission is missing" "the SAS lacks list (l) permission" "$OUT"
+lacks "...without sending anyone to the log" "exakit logs" "$OUT"
+has "...and the working key is kept" "AccountKey=$AZKEY" "$(dbq 'd["connections"]["EXAKIT_SRC_AZDOCS"]["secret"]')"
+run remove azkey --dry-run
+lacks "removing one: the shared import script is not in its plan" "IMPORT_FROM_AZURE" "$OUT"
+run remove azkey; run remove azdocs
+check "the last one out drops the import script" "[]" "$(dbq '[s for s in d["scripts"] if "IMPORT_FROM" in s]')"
+
+for case in "a SAS that cannot list|sp=r|the SAS lacks list (l) permission" \
+            "an expired SAS|expired|the SAS expired at 2020-01-01T00:00Z" \
+            "a blob SAS|blob|it needs to cover the container (sr=c)" \
+            "an HTTP connection string|http|the kit reads only over HTTPS" \
+            "another account's connection string|other|is for account otheracct, not docsacct" \
+            "a password-like secret|junk|a SAS token (sv=...&sig=...) or the account key"; do
+    label="${case%%|*}"; rest="${case#*|}"; form="${rest%%|*}"; expect="${rest#*|}"
+    case "$form" in
+        sp=r) cred="${AZSAS/sp=rl/sp=r}" ;;
+        expired) cred="${AZSAS/2099/2020}" ;;
+        blob) cred="${AZSAS/sr=c/sr=b}" ;;
+        http) cred="DefaultEndpointsProtocol=http;AccountName=$AZACCT;AccountKey=$AZKEY" ;;
+        other) cred="DefaultEndpointsProtocol=https;AccountName=otheracct;AccountKey=$AZKEY" ;;
+        junk) cred="hunter2" ;;
+    esac
+    azdb
+    run_secret "$cred" connect azure-blob --name azdocs $AZ_SET --secret-stdin
+    check "$label is refused before anything is created, exit 2" "2" "$RC"
+    has "...naming why" "$expect" "$OUT"
+    check "...and nothing was created" '[{}, {}]' "$(dbq '[d["connections"], d["virtual"]]')"
+done
+
+for case in "wrong key|key|rejected the credentials; nothing was kept|AuthenticationFailed" \
+            "a SAS made for another container|other|a SAS is valid only for the container it was made for|AuthenticationFailed" \
+            "a missing container|missing|check the container name, then connect again|ContainerNotFound" \
+            "a SAS without the permission|denied|a SAS with read (r) and list (l) on this container|AuthorizationPermissionMismatch"; do
+    label="${case%%|*}"; rest="${case#*|}"; form="${rest%%|*}"; rest="${rest#*|}"; expect="${rest%%|*}"; code="${rest#*|}"
+    cred="$AZSAS"; container=vs-test
+    case "$form" in
+        key) azdb; cred="DefaultEndpointsProtocol=https;AccountName=$AZACCT;AccountKey=$(printf 'QkJC%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21)QQ==" ;;
+        other) azdb; container=vs-private ;;
+        missing) azdb; cred="DefaultEndpointsProtocol=https;AccountName=$AZACCT;AccountKey=$AZKEY"; container=nosuch ;;
+        denied) azdb ', "fail": "denied"' ;;
+    esac
+    run_secret "$cred" connect azure-blob --name azdocs --set account=$AZACCT --set container=$container --set mapping=$MAPS --secret-stdin
+    check "Azure $label: exit 1" "1" "$RC"
+    has "...the fix is named" "$expect" "$OUT"
+    has "...Azure's own code is shown, under the adapter's" "E-VSD-102: Schema auto inference for source 'data/customers/customers.csv' failed. - caused by BlobStorageException: $code" "$OUT"
+    lacks "...not the SDK's advice about logging" "Azure-Storage-Log-String-To-Sign" "$OUT"
+    lacks "...nor the mitigations' empty heading" "Known mitigations:" "$OUT"
+    azgone
+done
 printf '\n== a credential arrives byte for byte: UTF-8, a byte-order mark, base64 ==\n'
 # Measured on the Windows CI runner: Windows PowerShell 5.1 piped a secret to
 # Python with a byte-order mark and every non-ASCII character as '?', even

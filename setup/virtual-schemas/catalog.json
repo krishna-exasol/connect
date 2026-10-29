@@ -83,6 +83,33 @@
       "tier": "GA",
       "status": "gated",
       "gate": "The service-account key file must live in storage only this connection can read; that isolation is not qualified on Exasol Personal yet."
+    },
+    {
+      "id": "s3",
+      "name": "Amazon S3",
+      "aliases": [
+        "aws-s3",
+        "s3-files",
+        "s3-documents",
+        "amazon-s3"
+      ],
+      "profile": "java-document-files",
+      "tier": "GA",
+      "status": "candidate"
+    },
+    {
+      "id": "azure-blob",
+      "name": "Azure Blob Storage",
+      "aliases": [
+        "azure",
+        "abs",
+        "azure-storage",
+        "azure-blob-storage",
+        "blob-storage"
+      ],
+      "profile": "java-document-files",
+      "tier": "GA",
+      "status": "candidate"
     }
   ]
 }
