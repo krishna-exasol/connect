@@ -419,11 +419,7 @@ exapump_create_profile() {
         _password="$(cat "$_pwfile")"
     fi
     if [ -z "$_password" ] && (: < /dev/tty) 2>/dev/null; then
-        printf '    %s?%s Database password for user %s (input hidden): ' "${UI_ASK:-}" "${UI_RESET:-}" "$_user"
-        stty -echo < /dev/tty 2>/dev/null
-        read -r _password < /dev/tty
-        stty echo < /dev/tty 2>/dev/null
-        printf '\n'
+        _password="$(exakit_read_hidden "Database password for user $_user")" || _password=""
     fi
     if [ -z "$_password" ]; then
         warn "No database password available — create the profile manually with: exapump profile init $EXAKIT_EXAPUMP_PROFILE"
@@ -2902,9 +2898,14 @@ exakit_bundled_datasets() {
 # ask, and exakit_dataset_loaded is the only caller.
 _EXAKIT_DB_REACHABLE=""
 exakit_db_reachable() {
+    # [limit]: seconds the probe may take, for a caller that must answer (status)
+    # rather than wait on a database that accepts logins and then never replies.
+    # Without it the probe waits as long as the database does: under load a
+    # login alone has been measured at 8s, and the installer must not read that
+    # as "down".
     if [ "$_EXAKIT_DB_REACHABLE" != 1 ]; then
         if [ -n "$(manifest_get components.exapump.profile 2>/dev/null)" ] && \
-           "$(exapump_cli)" sql -p "$EXAKIT_EXAPUMP_PROFILE" "SELECT 1" >/dev/null 2>&1; then
+           _exakit_exapump_sql_within "${1:-}" "SELECT 1" >/dev/null 2>&1; then
             _EXAKIT_DB_REACHABLE=1
         else
             _EXAKIT_DB_REACHABLE=0
@@ -2913,12 +2914,67 @@ exakit_db_reachable() {
     [ "$_EXAKIT_DB_REACHABLE" = 1 ]
 }
 
+# _exakit_exapump_sql_within <limit|""> <sql> — one statement through the kit's
+# profile, cut off after <limit> seconds when one is given.
+_exakit_exapump_sql_within() {
+    if [ -n "$1" ]; then
+        exakit_run_bounded "$1" "$(exapump_cli)" sql -p "$EXAKIT_EXAPUMP_PROFILE" "$2"
+    else
+        "$(exapump_cli)" sql -p "$EXAKIT_EXAPUMP_PROFILE" "$2"
+    fi
+}
+
 # exakit_forget_db_reachable — drop the cached "yes" after the kit itself takes
 # the database down, so a later check re-probes instead of trusting a state that
 # this run has just ended.
 exakit_forget_db_reachable() {
     _EXAKIT_DB_REACHABLE=""
     return 0
+}
+
+# exakit_db_clock_skew — how far the database's clock is from this computer's,
+# in whole seconds (negative: the database is behind). Non-zero, and nothing
+# printed, when the database cannot be asked.
+#
+# MEASURED ON EXASOL PERSONAL (macOS): the database runs in a VM whose clock
+# does not catch up after the Mac sleeps or hibernates - 2 h 26 min behind
+# after a night, 1 h 25 min and 32 min after shorter sleeps. Nothing else says
+# so: queries answer, and the first symptom is a remote source's certificate
+# that is "not yet valid" by the database's clock, or a scheduled job that
+# runs late. A restart resyncs it. POSIX_TIME() is the epoch whatever the
+# session time zone (it agreed with a Java UDF's System.currentTimeMillis to
+# 0.1 s), and the local reads either side of the query bound the round trip.
+# ⇄ twin: Get-ExakitDbClockSkew in setup/lib/exapump.ps1.
+EXAKIT_CLOCK_SKEW_LIMIT="${EXAKIT_CLOCK_SKEW_LIMIT:-120}"
+exakit_db_clock_skew() {
+    [ -n "$(manifest_get components.exapump.profile 2>/dev/null)" ] || return 1
+    _dcs_before="$(date +%s)"
+    _dcs_out="$(exakit_run_bounded "${EXAKIT_CLOCK_SQL_TIMEOUT:-10}" "$(exapump_cli)" sql -p "$EXAKIT_EXAPUMP_PROFILE" \
+        "SELECT 'EXAKIT_CLOCK=' || FLOOR(POSIX_TIME()) AS T" 2>/dev/null)" || return 1
+    _dcs_after="$(date +%s)"
+    _dcs_db="$(printf '%s\n' "$_dcs_out" | sed -n 's/^.*EXAKIT_CLOCK=\([0-9][0-9]*\).*$/\1/p' | head -1)"
+    [ -n "$_dcs_db" ] || return 1
+    printf '%s\n' $(( _dcs_db - (_dcs_before + _dcs_after) / 2 ))
+}
+
+# exakit_clock_skew_words <seconds> — "32 min behind", "1 h 25 min ahead of":
+# the skew as the screen and the hint say it.
+exakit_clock_skew_words() {
+    _csw_s="$1"
+    _csw_dir="ahead of"
+    if [ "$_csw_s" -lt 0 ]; then _csw_s=$(( -_csw_s )); _csw_dir="behind"; fi
+    _csw_m=$(( (_csw_s + 30) / 60 ))
+    if [ "$_csw_m" -ge 60 ]; then
+        printf '%s h %s min %s\n' $(( _csw_m / 60 )) $(( _csw_m % 60 )) "$_csw_dir"
+    else
+        printf '%s min %s\n' "$_csw_m" "$_csw_dir"
+    fi
+}
+
+# exakit_clock_skewed <seconds> — true when the skew is past the limit.
+exakit_clock_skewed() {
+    [ -n "$1" ] || return 1
+    [ "$1" -ge "$EXAKIT_CLOCK_SKEW_LIMIT" ] || [ "$1" -le "-$EXAKIT_CLOCK_SKEW_LIMIT" ]
 }
 
 # exakit_table_present <table> [schema] — does the table exist in the given
@@ -3076,8 +3132,12 @@ exakit_pending_datasets() {
 # Eight round trips to answer "what data is in there?" would be a tax on the
 # command's whole reason to exist.
 exakit_verified_datasets() {
-    exakit_db_reachable || return 1
-    _vd_present="$("$(exapump_cli)" sql -p "$EXAKIT_EXAPUMP_PROFILE" \
+    # [limit]: as exakit_db_reachable. `exakit status` passes one: a database
+    # that completes the TLS handshake and then hangs on every query (measured:
+    # a deadlocked loader) held status forever, and an agent with it.
+    _vd_limit="${1:-}"
+    exakit_db_reachable "$_vd_limit" || return 1
+    _vd_present="$(_exakit_exapump_sql_within "$_vd_limit" \
         "SELECT TABLE_SCHEMA || '.' || TABLE_NAME AS QUALIFIED FROM SYS.EXA_ALL_TABLES" \
         2>/dev/null)" || return 1
     _vd_ids=""
@@ -3481,6 +3541,17 @@ exakit_data_load_select() {
             return 0
             ;;
     esac
+    # With nothing pending the local-file row is pre-ticked so Enter does
+    # something, but only a person can answer the question it asks. With no
+    # terminal (an agent re-running the installer) that default stood, asked
+    # for a path nobody could give, and reported the install as failed.
+    # EXAKIT_DATA_FILE, the unattended answer, returned above.
+    if [ "${EXAKIT_TABLE_CONFIRMED:-0}" != 1 ] && [ "$EXAKIT_TABLE_ROW_LOCAL" = 1 ] && \
+       [ "$EXAKIT_TABLE_SELECTION" = "$EXAKIT_TABLE_ROW_LOCAL" ]; then
+        info "Every bundled dataset is already loaded. To load a file of your own without a terminal, name it with EXAKIT_DATA_FILE."
+        EXAKIT_DATA_LOAD_SELECTION="none"
+        return 0
+    fi
     for _dls_row in $(printf '%s' "$EXAKIT_TABLE_SELECTION" | tr ',' ' '); do
         _dls_id="$(printf '%s\n' "$EXAKIT_TABLE_IDS" | sed -n "${_dls_row}p")"
         [ -n "$_dls_id" ] || continue
