@@ -15,6 +15,11 @@
 
 A secret is read from standard input only (--secret-stdin), never from an
 argument: arguments are visible to every local user through the process table.
+It is read as UTF-8 bytes, a byte-order mark dropped. --secret-stdin-base64
+takes it base64-encoded instead: the Windows bridge sends it so, because
+Windows PowerShell 5.1 re-encodes what it pipes to a native program (measured
+on CI: a byte-order mark added, every non-ASCII character turned into '?'),
+and plain ASCII survives every code page.
 
 Without --json, one "OK|INFO|WARN|FAIL <text>" line per event on stdout for
 the shell to render. With --json, events go to stderr and stdout carries one
@@ -24,8 +29,12 @@ source, 5 gated, 20 Java in the database cannot resolve host names,
 """
 
 import argparse
+import base64
+import binascii
 import json
+import locale
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -54,6 +63,7 @@ def parse(argv):
         cmd.add_argument("--name", required=True)
         cmd.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
         cmd.add_argument("--secret-stdin", action="store_true")
+        cmd.add_argument("--secret-stdin-base64", action="store_true")
         cmd.add_argument("--dry-run", action="store_true")
     sub.add_parser("list")
     sub.add_parser("issues").add_argument("--status", default="")
@@ -64,6 +74,7 @@ def parse(argv):
     cmd = sub.add_parser("reauth")
     cmd.add_argument("name")
     cmd.add_argument("--secret-stdin", action="store_true")
+    cmd.add_argument("--secret-stdin-base64", action="store_true")
     sub.add_parser("refresh").add_argument("name")
     for name in ("disconnect", "remove"):
         cmd = sub.add_parser(name)
@@ -82,10 +93,23 @@ def pairs(items):
     return values
 
 
-def read_secret(enabled):
-    if not enabled:
+def read_secret(args):
+    if args.secret_stdin_base64:
+        raw = sys.stdin.buffer.read()
+        try:
+            # Only the base64 alphabet counts: a byte-order mark or a line
+            # ending the pipe added around it is not part of the secret.
+            data = base64.b64decode(re.sub(rb"[^A-Za-z0-9+/=]", b"", raw), validate=True).decode("utf-8")
+        except (ValueError, binascii.Error):
+            raise lifecycle.Failure("the credential on standard input is not valid base64 UTF-8", lifecycle.EXIT["input"])
+        return data.rstrip("\r\n") or None
+    if not args.secret_stdin:
         return None
-    data = sys.stdin.read()
+    raw = sys.stdin.buffer.read()
+    try:
+        data = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        data = raw.decode(locale.getpreferredencoding(False), errors="replace")
     return data.rstrip("\r\n") or None
 
 
@@ -122,7 +146,7 @@ def main(argv=None):
             engine = lifecycle.Engine(args, emit)
             if args.command in ("plan", "connect"):
                 connector = engine.defs.resolve(args.connector)
-                result = engine.connect(connector, args.name, pairs(args.set), read_secret(args.secret_stdin),
+                result = engine.connect(connector, args.name, pairs(args.set), read_secret(args),
                                         dry_run=args.dry_run, plan_only=args.command == "plan")
             elif args.command == "list":
                 result = {"sources": engine.listing()}
@@ -141,7 +165,7 @@ def main(argv=None):
                 else:
                     raise planner.PlanError("check takes a source name or --all")
             elif args.command == "reauth":
-                result = engine.reauth(args.name, read_secret(args.secret_stdin))
+                result = engine.reauth(args.name, read_secret(args))
                 code = 0 if result.get("status") == "ready" else 1
             elif args.command == "refresh":
                 result = engine.refresh(args.name)

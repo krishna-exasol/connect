@@ -725,6 +725,30 @@ run_secret "$NEWSECRET" reauth ora --secret-stdin
 has "reauth keeps the wallet in the URL" "wallet_location=data:;base64," "$(dbq 'd["connections"]["EXAKIT_SRC_ORA"]["url"]')"
 run remove ora; check "...and remove is clean" "0" "$RC"
 
+printf '\n== a credential arrives byte for byte: UTF-8, a byte-order mark, base64 ==\n'
+# Measured on the Windows CI runner: Windows PowerShell 5.1 piped a secret to
+# Python with a byte-order mark and every non-ASCII character as '?', even
+# with $OutputEncoding set. The bridge now sends it base64 (ASCII survives
+# every code page); stdin is read as UTF-8 bytes, a mark or CRLF dropped.
+U8SECRET="$(printf 'p\303\244ssw\303\266rd-\342\202\254-\346\227\245\346\234\254')"
+ENC_SET="--set host=pg.example.com --set database=sales --set user=reader"
+db '{"sources": {"pg.example.com": {"tables": ["ORDERS"]}}}'
+OUT="$(printf '\357\273\277%s\r\n' "$U8SECRET" | eng connect postgresql --name enc $ENC_SET --secret-stdin 2>&1)"; RC=$?
+check "a UTF-8 secret behind a byte-order mark, ending in CRLF: exit 0" "0" "$RC"
+check "...stored as typed, without the mark or the line ending" "$U8SECRET" "$(dbq 'd["connections"]["EXAKIT_SRC_ENC"]["secret"]')"
+run remove enc
+B64="$(printf '%s' "$U8SECRET" | base64 | tr -d '\n')"
+OUT="$(printf '\357\273\277%s\r\n' "$B64" | eng connect postgresql --name enc $ENC_SET --secret-stdin-base64 2>&1)"; RC=$?
+check "the same secret as base64 (what the Windows bridge sends), mark and CRLF around it: exit 0" "0" "$RC"
+check "...decoded byte for byte" "$U8SECRET" "$(dbq 'd["connections"]["EXAKIT_SRC_ENC"]["secret"]')"
+lacks "...and neither form is printed" "$B64" "$OUT"
+OUT="$(printf '%s' "$B64" | eng reauth enc --secret-stdin-base64 2>&1)"; RC=$?
+check "reauth takes base64 too: exit 0" "0" "$RC"
+run remove enc
+OUT="$(printf 'not*base64' | eng connect postgresql --name enc $ENC_SET --secret-stdin-base64 2>&1)"; RC=$?
+check "invalid base64 is bad input, exit 2, nothing created" "2 {}" "$RC $(dbq 'd["connections"]')"
+has "...and says so" "not valid base64 UTF-8" "$OUT"
+
 printf '\n== the hidden prompt hides from the first keystroke ==\n'
 # Measured: with the prompt printed first and echo turned off after it, input
 # typed the moment the prompt appeared was echoed in clear (expect, typing at
