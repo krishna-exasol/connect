@@ -34,12 +34,12 @@ import tlshelper
 PROBE = "EXAKIT_DNS_PROBE_V2"
 
 EXIT = {"ok": 0, "failed": 1, "input": 2, "conflict": 3, "missing": 4, "gated": 5,
-        "dns": 20, "nojava": 21, "unreachable_db": 22}
+        "dns": 20, "nojava": 21, "unreachable_db": 22, "norust": 23}
 
 # Status recorded for a failure kind (sql.classify).
 STATUS_FOR = {"auth": "auth-failed", "tls": "tls-failed", "unreachable": "unreachable", "nohost": "unreachable",
               "dns": "dns-failed", "nojava": "failed", "error": "failed", "denied": "access-denied",
-              "region": "failed", "nobucket": "failed", "clock": "failed"}
+              "region": "failed", "nobucket": "failed", "clock": "failed", "norust": "failed"}
 
 REMEDY_FOR = {
     "auth": "the source rejected the credentials: exakit source reauth {name}",
@@ -48,6 +48,7 @@ REMEDY_FOR = {
     "nohost": "the host name no longer resolves: check it (a private name may need a VPN), then: exakit source check {name}",
     "dns": "Java in the database could not resolve the host name; restart the database with exakit start (it repairs DNS), then: exakit source check {name}",
     "nojava": "the Java language container is not installed: exakit connect installs it, or run: exasol slc install java",
+    "norust": "the Rust language container is not installed: exakit connect installs it (asked; one restart)",
     "denied": "the account signs in but may not read this data: grant it what the message names ({access}), then: exakit source check {name}",
     "region": "the bucket is in another region: exakit source disconnect {name} --yes, then exakit connect <connector> --name {name} --set region=<the bucket's region> with the credential again",
     "nobucket": "the {store} does not exist under that name: check it, then remove and connect again",
@@ -63,6 +64,8 @@ def remedy_for(kind, name, connector):
         name=name, access=connector.get("access", "read access"), store=connector.get("store", "bucket"))
     if kind == "auth" and connector.get("auth_hint"):
         text += "; %s" % connector["auth_hint"]
+    if kind == "error" and connector.get("error_hint"):
+        text = "%s; %s" % (connector["error_hint"], text)
     return text
 
 # Seconds the database clock may be off this computer's before it is named.
@@ -207,6 +210,19 @@ class Engine(object):
                 raise Failure("Java is not installed in the database (no usable script language container)",
                               EXIT["nojava"], "nojava")
             raise Failure("the DNS probe could not be created: %s" % error, EXIT["failed"])
+
+    def ensure_language(self, profile):
+        """A custom language container (Rust) is known by its alias in
+        SCRIPT_LANGUAGES - measured: RUST=localzmq+protobuf:///.../custom-rust
+        appears once it is installed and the database restarted."""
+        slc = profile.get("slc") or {}
+        if slc.get("language") != "rust":
+            return
+        rows = self.db().query("SELECT SYSTEM_VALUE FROM EXA_PARAMETERS WHERE PARAMETER_NAME = 'SCRIPT_LANGUAGES'")
+        value = (rows[0].get("SYSTEM_VALUE") if rows else "") or ""
+        if not re.search(r"(^|\s)%s=" % re.escape(slc["alias"]), value):
+            raise Failure("the Rust language container is not installed in the database (no %s language alias)"
+                          % slc["alias"], EXIT["norust"], "norust")
 
     def probe(self, host, port):
         """'ok <ip>' | 'dns ...' | 'tcp <ip> ...', from inside the database's Java."""
@@ -492,6 +508,10 @@ class Engine(object):
 
     def adapter_sql(self, names, jars, profile=None):
         script = (profile or self.profile)["adapter_script"]
+        if script.get("language") == "RUST":
+            # The .so's entry point is bound to this script's name (measured).
+            return "CREATE OR REPLACE RUST ADAPTER SCRIPT %s.%s AS\n%%udf_object %s;\n/" % (
+                sql.ident(names["script_schema"]), sql.ident(names["script"]), jars[0])
         lines = ["CREATE OR REPLACE JAVA ADAPTER SCRIPT %s.%s AS"
                  % (sql.ident(names["script_schema"]), sql.ident(names["script"])),
                  "  %%scriptclass %s;" % script["scriptclass"]]
@@ -503,6 +523,10 @@ class Engine(object):
         """The document adapter's import UDF: the name, parameters and EMITS(...)
         its adapter calls (from the adapter's user guide)."""
         script = profile["import_script"]
+        if script.get("language") == "RUST":
+            return "CREATE OR REPLACE RUST %s SCRIPT %s.%s%s AS\n%%udf_object %s;\n/" % (
+                script["type"], sql.ident(names["script_schema"]), sql.ident(connector["import_script"]),
+                script["signature"], jars[0])
         lines = ["CREATE OR REPLACE JAVA SET SCRIPT %s.%s(DATA_LOADER VARCHAR(2000000), "
                  "SCHEMA_MAPPING_REQUEST VARCHAR(2000000), CONNECTION_NAME VARCHAR(500)) EMITS(...) AS"
                  % (sql.ident(names["script_schema"]), sql.ident(connector["import_script"])),
@@ -516,7 +540,7 @@ class Engine(object):
         return [n for n in self.store.names() if n != besides and self.store.config(n).get("connector") == connector_id]
 
     def vs_sql(self, connector, names, values, extra=None):
-        props = ["CONNECTION_NAME = %s" % sql.literal(names["connection"])]
+        props = ["%s = %s" % (connector.get("connection_property", "CONNECTION_NAME"), sql.literal(names["connection"]))]
         fields = dict(values, **(extra or {}))
         for key, template in connector["vs_properties"].items():
             props.append("%s = %s" % (key, sql.literal(template.format(**fields))))
@@ -581,7 +605,7 @@ class Engine(object):
                 # credential is the whole command - the one disconnect names.
                 given = dict(current.get("inputs") or {}, **given)
         values = planner.validate_inputs(connector, given)
-        names = planner.objects(name)
+        names = planner.objects(name, connector)
         description = planner.describe(self.defs, connector_id, name, values, self.runtime, self.cache, self.store)
         if plan_only or dry_run:
             return description
@@ -622,6 +646,7 @@ class Engine(object):
                 # Java stack from inside the database after files were staged.
                 url, user, conn_secret, hidden, notes = self.credential(connector, values, secret)
                 self.warn_clock()
+                self.ensure_language(profile)
                 self.require_route(connector, values, name)
                 ca_pem = self.choose_ca(connector, values)
                 jars = self.stage(connector, name, created)
@@ -644,8 +669,11 @@ class Engine(object):
                 self.emit("OK", "Connection %s created (%s)" % (names["connection"], "it names the key file, not the key"
                                                                      if key_path else "the credential lives only in the database"))
                 if not reconnect:
+                    shared_before = connector.get("shared_adapter") and \
+                        self.exists("script", names["script_schema"], names["script"])
                     self.db().execute(self.adapter_sql(names, jars, profile))
-                    made("script")
+                    if not shared_before:
+                        made("script")
                     if connector.get("import_script"):
                         if not self.exists("script", names["script_schema"], connector["import_script"]):
                             created["import_script"] = connector["import_script"]
@@ -676,6 +704,8 @@ class Engine(object):
                 code = getattr(error, "code", EXIT["failed"])
                 if isinstance(error, sql.DbError):
                     code = EXIT["dns"] if kind == "dns" else EXIT["nojava"] if kind == "nojava" else EXIT["failed"]
+                if kind == "nojava" and (profile.get("slc") or {}).get("language") == "rust":
+                    kind, code = "norust", EXIT["norust"]
                 # A first connect has no source record yet, so the lifecycle
                 # commands do not apply: nothing was left behind, and the fix is
                 # the same command with corrected input.
@@ -826,7 +856,7 @@ class Engine(object):
             # source that still works. The new credential goes into a pending
             # CONNECTION, one trivial statement runs through the loader with
             # it, and only an accepted credential replaces the old one.
-            self.try_credential(connector, config["objects"], url, user, secret)
+            self.try_credential(connector, config["objects"], url, user, secret, inputs)
             try:
                 self.create_connection(config["objects"], url, user, secret, replace=True, hidden=hidden)
             except sql.DbError as error:
@@ -863,8 +893,10 @@ class Engine(object):
         self.emit("OK", "Key file replaced for %s" % name)
         return result
 
-    def try_credential(self, connector, names, url, user, secret):
+    def try_credential(self, connector, names, url, user, secret, values=None):
         if not connector.get("etl"):
+            if connector.get("shared_adapter"):
+                self.try_through_schema(connector, names, url, user, secret, values or {})
             return      # no loader driver to try it through (a VALUES connector)
         pending = dict(names, connection=names["connection"] + "_PENDING")
         try:
@@ -880,6 +912,28 @@ class Engine(object):
                 self.db().execute("DROP CONNECTION IF EXISTS %s" % sql.ident(pending["connection"]))
             except sql.DbError:
                 pass
+        self.emit("OK", "The source accepted the new credential")
+
+    def try_through_schema(self, connector, names, url, user, secret, values):
+        """A native adapter reads metadata when its virtual schema is created
+        (measured: MongoDB with a wrong password fails at CREATE), so a
+        throwaway schema on a pending CONNECTION tries the new credential."""
+        pending = dict(names, connection=names["connection"] + "_PENDING", schema=names["schema"] + "_PENDING")
+        db = self.db()
+        try:
+            self.create_connection(pending, url, user, secret, replace=True)
+            db.execute("DROP VIRTUAL SCHEMA IF EXISTS %s CASCADE" % sql.ident(pending["schema"]))
+            db.execute(self.vs_sql(connector, pending, values), secrets=[secret])
+        except sql.DbError as error:
+            raise Failure("the source refused the new credential, so the previous one was kept: %s" % error,
+                          EXIT["failed"], error.kind)
+        finally:
+            for statement in ("DROP FORCE VIRTUAL SCHEMA IF EXISTS %s CASCADE" % sql.ident(pending["schema"]),
+                              "DROP CONNECTION IF EXISTS %s" % sql.ident(pending["connection"])):
+                try:
+                    db.execute(statement)
+                except sql.DbError:
+                    pass
         self.emit("OK", "The source accepted the new credential")
 
     def refresh(self, name):
@@ -924,8 +978,12 @@ class Engine(object):
         connector = self.defs.connector(config["connector"])
         shared = connector.get("import_script")
         last = shared and not self.import_script_users(config["connector"], name)
-        plan = {"name": name, "drop": ["virtual schema %s" % names["schema"],
-                                       "adapter script %s.%s" % (names["script_schema"], names["script"])] +
+        own_adapter = not connector.get("shared_adapter") or last
+        plan = {"name": name, "drop": ["virtual schema %s" % names["schema"]] +
+                                      (["adapter script %s.%s%s" % (names["script_schema"], names["script"],
+                                                                    " (no other %s source uses it)" % config["connector"]
+                                                                    if connector.get("shared_adapter") else "")]
+                                       if own_adapter else []) +
                                       (["import script %s.%s (no other %s source uses it)"
                                         % (names["script_schema"], shared, config["connector"])] if last else []) +
                                       ["CONNECTION %s" % names["connection"]],
@@ -942,7 +1000,7 @@ class Engine(object):
                 # kit-owned schema only.
                 force = "" if connection_present else "FORCE "
                 db.execute("DROP %sVIRTUAL SCHEMA %s CASCADE" % (force, sql.ident(names["schema"])))
-            if self.exists("script", names["script_schema"], names["script"]):
+            if own_adapter and self.exists("script", names["script_schema"], names["script"]):
                 db.execute("DROP ADAPTER SCRIPT %s.%s" % (sql.ident(names["script_schema"]), sql.ident(names["script"])))
             if last and self.exists("script", names["script_schema"], shared):
                 db.execute("DROP SCRIPT %s.%s" % (sql.ident(names["script_schema"]), sql.ident(shared)))

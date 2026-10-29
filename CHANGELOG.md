@@ -97,6 +97,15 @@ can now finish setup that only the installer can do.**
   `exakit.loader.TrustStoreDriver`, which points it at the language
   container's own CA store and hands over to the Snowflake driver; nothing
   is disabled.
+- MongoDB (Profile D, a native adapter): `exakit connect mongodb` maps one
+  collection to a root table plus a child table per nested object and array,
+  through exasol-labs' exasol-mongodb-vs 0.1.3 in the Rust language container
+  (language-container-rs 0.33.0). Both are pinned per CPU (aarch64, x86_64)
+  and checksum-verified; the container is installed on first use with
+  consent and one restart (exit 23 asks for it). The library's entry points
+  are bound to its script names, so all MongoDB sources share
+  `EXAKIT_VS.MONGODB_ADAPTER` and `MONGODB_SCAN`. A URI with credentials is
+  refused; reauth tries the new password on a throwaway schema first.
 - Windows: the credential reaches the engine base64-encoded, because Windows
   PowerShell 5.1 re-encodes what it pipes to a native program (non-ASCII
   characters arrived as '?').

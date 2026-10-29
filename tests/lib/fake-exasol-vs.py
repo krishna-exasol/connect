@@ -3,6 +3,8 @@
 State lives in the JSON file named by FAKE_VS_STATE, so a test can arrange a
 database and inspect it afterwards:
 
+    rust        false -> no RUST alias in SCRIPT_LANGUAGES, and a RUST script fails
+                like java false (the custom container is not installed)
     java        false -> creating a JAVA script fails like a deployment with no
                 container ("No usable script language container ...")
     dns         false -> the DNS probe answers "nodns ..." (no resolver at all);
@@ -42,7 +44,7 @@ import re
 def _load():
     with open(os.environ["FAKE_VS_STATE"]) as handle:
         doc = json.load(handle)
-    for key, default in (("java", True), ("dns", True), ("unreachable", []), ("sources", {}),
+    for key, default in (("java", True), ("rust", True), ("dns", True), ("unreachable", []), ("sources", {}),
                          ("connections", {}), ("schemas", []), ("scripts", []), ("virtual", {}),
                          ("statements", [])):
         doc.setdefault(key, default)
@@ -216,6 +218,12 @@ def _source_for(doc, connection):
         raise Exception("connection %s not found" % connection)
     if con["url"].startswith("jdbc:bigquery:"):
         return _bigquery_source(doc, con)
+    if con["url"].startswith("mongodb"):
+        src = doc["sources"].get(_host(con["url"]))
+        if src is None or src.get("fail") == "auth" or (src.get("secret") is not None and con["secret"] != src["secret"]):
+            # Measured: a wrong password and an address Atlas refuses read alike.
+            raise Exception("VM error: F-UDF-CL-RUST-9001: UDF error: MongoDB error while reading collection metadata")
+        return src
     if con["url"] == "" and con["secret"].startswith("{"):
         return _document_source(doc, con)
     src = doc["sources"].get(_host(con["url"]))
@@ -283,6 +291,12 @@ class Fake(object):
             return [{"GRANTEE": g, "GRANTED_ROLE": r} for g, r in doc.get("role_privs", [["SYS", "DBA"]])]
         if sql == "SELECT USER_NAME FROM EXA_DBA_USERS":
             return [{"USER_NAME": u} for u in doc.get("users", ["SYS", "MCP_READONLY"])]
+        if sql == "SELECT SYSTEM_VALUE FROM EXA_PARAMETERS WHERE PARAMETER_NAME = 'SCRIPT_LANGUAGES'":
+            # Measured: a custom container appears as its alias once installed.
+            value = "R=builtin_r JAVA=builtin_java PYTHON3=builtin_python3"
+            if doc["rust"]:
+                value += " RUST=localzmq+protobuf:///__builtin__/slc/custom-rust?lang=rust#/exaudf/exaudfclient"
+            return [{"SYSTEM_VALUE": value}]
         if sql == "SELECT POSIX_TIME() AS T":
             # The database clock: this computer's, shifted by clock_skew seconds.
             import time
@@ -324,11 +338,11 @@ class Fake(object):
         if sql == "CREATE SCHEMA EXAKIT_VS":
             doc["schemas"].append("EXAKIT_VS")
             return
-        m = re.match(r"CREATE OR REPLACE JAVA (SCALAR|ADAPTER|SET) SCRIPT (?:\"?)([\w]+)(?:\"?)\.(?:\"?)([\w]+)", sql)
+        m = re.match(r"CREATE OR REPLACE (JAVA|RUST) (SCALAR|ADAPTER|SET) SCRIPT (?:\"?)([\w]+)(?:\"?)\.(?:\"?)([\w]+)", sql)
         if m:
-            if not doc["java"]:
+            if not doc[m.group(1).lower()]:
                 raise Exception("No usable script language container is installed for the requested language.")
-            name = "%s.%s" % (m.group(2), m.group(3))
+            name = "%s.%s" % (m.group(3), m.group(4))
             if name not in doc["scripts"]:
                 doc["scripts"].append(name)
             return
@@ -351,6 +365,18 @@ class Fake(object):
                         raise _inferred(error, mapping["source"])
             doc["virtual"][m.group(1)] = {"connection": m.group(2), "tables": _mapping_tables(m.group(3))}
             return
+        m = re.match(r'CREATE VIRTUAL SCHEMA "([^"]+)" USING .* MONGODB_CONNECTION = \'([^\']+)\' '
+                     r'DATABASE = \'([^\']+)\' COLLECTION = \'([^\']+)\'', sql)
+        if m:
+            # Measured (exasol-mongodb-vs 0.1.3): CREATE reads the collection's
+            # metadata, so a wrong password fails here; a collection the account
+            # may not read is reported as one that does not exist.
+            src = _source_for(doc, m.group(2))
+            coll = "%s.%s" % (m.group(3), m.group(4))
+            if src.get("collections") is not None and coll not in src["collections"]:
+                raise Exception("VM error: F-UDF-CL-RUST-9001: UDF error: MongoDB collection '%s' does not exist" % coll)
+            doc["virtual"][m.group(1)] = {"connection": m.group(2), "tables": list(src.get("tables", []))}
+            return
         m = re.match(r'CREATE VIRTUAL SCHEMA "([^"]+)" USING .* CONNECTION_NAME = \'([^\']+)\'', sql)
         if m:
             src = _source_for(doc, m.group(2))
@@ -363,7 +389,7 @@ class Fake(object):
             if "tables" in src:
                 vs["tables"] = list(src["tables"])
             return
-        m = re.match(r'DROP (FORCE )?VIRTUAL SCHEMA "([^"]+)"', sql)
+        m = re.match(r'DROP (FORCE )?VIRTUAL SCHEMA (?:IF EXISTS )?"([^"]+)"', sql)
         if m:
             vs = doc["virtual"].get(m.group(2))
             if vs and not m.group(1) and vs["connection"] not in doc["connections"]:
