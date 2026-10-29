@@ -185,7 +185,9 @@ function Get-ExakitLoadedDatasets {
     # manifest while the database is down is not mistaken for a verified one.
     $script:ExakitDatasetsSource = "manifest"
     if (Get-Command Get-ExakitVerifiedDatasets -ErrorAction SilentlyContinue) {
-        $verified = Get-ExakitVerifiedDatasets
+        $limit = 20
+        if ($env:EXAKIT_STATUS_SQL_TIMEOUT -match '^[0-9]+$') { $limit = [int]$env:EXAKIT_STATUS_SQL_TIMEOUT }
+        $verified = Get-ExakitVerifiedDatasets -TimeoutSeconds $limit
         if ($null -ne $verified) { $script:ExakitDatasetsSource = "database"; return @($verified) }
     }
     $datasets = Get-ExakitManifestValue "data.datasets"
@@ -261,6 +263,15 @@ function Invoke-CmdStatus {
     $datasets = @(Invoke-ExakitWithSpinner -Quiet:$Json -Label "Checking which datasets are loaded" -Body {
         ,@(Get-ExakitLoadedDatasets)
     })
+    # The database's clock against this computer's: one query. A sleeping
+    # laptop can leave it behind, and nothing else on this screen would show
+    # it. Twin of _cs_skew in cmd_status.
+    $clockSkew = $null
+    if ($running -and (Get-Command Get-ExakitDbClockSkew -ErrorAction SilentlyContinue)) {
+        $clockSkew = Get-ExakitDbClockSkew
+    }
+    # Only asked when the probe above answered, so the helper is loaded.
+    $clockSkewed = ($null -ne $clockSkew) -and (Test-ExakitClockSkewed $clockSkew)
     $pyexasol = Get-ExakitComponentCurrent "pyexasol"
     # Why the last run stopped, read off disk rather than out of this process:
     # the install that failed was a different process, and its reason is the one
@@ -321,6 +332,14 @@ function Invoke-CmdStatus {
                 $remedies["database"] = "exakit start"
             }
         }
+        if ($clockSkewed) {
+            # A RESTART RESYNCS IT, and the remedy is its first half: once the
+            # database is stopped, status names `exakit start`. Not hoisted into
+            # the top-level remedy: the database answers, and stopping it ends
+            # whatever is running. Twin of remedies["clock"] in cmd_status.
+            $remedies["clock"] = "exakit stop"
+            $remedyHints["clock"] = "the database clock is $(Format-ExakitClockSkew $clockSkew) this computer (a laptop that slept or hibernated leaves it behind); remote sources' certificates and scheduled jobs go by it. A restart resyncs it: run the remedy when nothing is running, then exakit start"
+        }
         if ($installing) {
             $remedies["install"] = "exakit status --json"
             $remedyHints["install"] = "the installer is still running (step: $installStep) - poll the remedy until status is running"
@@ -378,6 +397,9 @@ function Invoke-CmdStatus {
             kit_level       = "$(Get-ExakitManifestValue 'kit_level')"
             runtime         = [ordered]@{ type = $type; status = $status }
             running         = $running
+            # Seconds the database's clock is from this computer's (negative:
+            # behind); null when the database could not be asked.
+            clock_skew_seconds = $clockSkew
             services        = $services
             # Per-service addresses, from each module's own UrlFn hook: the JSON
             # key an agent reads for "where is dash-server?" instead of scraping
@@ -492,6 +514,9 @@ function Invoke-CmdStatus {
     if (-not $dsn) { $dsn = "unknown" }
     if ($running) { $reach = "reachable" } else { $reach = "not reachable" }
     Write-StatusPanelRow "Database" "$dsn - $reach"
+    if ($clockSkewed) {
+        Write-StatusPanelRow "Clock" "$(Format-ExakitClockSkew $clockSkew) this computer - restart: exakit stop, then exakit start"
+    }
     # The install state, which the JSON has carried since the poll contract was
     # written and this screen never showed: it said "Start it: exakit start"
     # under a live installer.

@@ -100,6 +100,11 @@ jobs:
         if: matrix.shard == 2
         shell: powershell
         run: powershell -NoProfile -ExecutionPolicy Bypass -File tests/data-load-shapes-ps.ps1
+      # The database clock check: its measurement, words and limit under 5.1.
+      - name: database clock check under 5.1
+        if: matrix.shard == 2
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests/db-clock-skew-ps.ps1
       # The skill layer, executed rather than grepped. tests/skills.sh asserts
       # this half with awk against exakit-common.ps1, which catches a deleted
       # line and nothing else.
