@@ -498,6 +498,26 @@ Write-Host "== a dataset whose marker tables are empty is not loaded =="
 # markers that include ORDERS. Twin of the checks in tests/dataset-load-progress.sh.
 $exapumpPs1 = Get-Content (Join-Path $repo "setup/lib/exapump.ps1") -Raw
 Has "the listing carries the row count"  "TABLE_NAME || '|' || TABLE_ROW_COUNT" $exapumpPs1
+
+# A database that completes the handshake and then never answers: status asks
+# with a limit and gets $null (the manifest stands in), not a wait as long as
+# the hang. Twin of the block in tests/status-soft-components.sh.
+if ($IsWindows -or $env:OS -eq "Windows_NT") {
+    $hang = Join-Path $work "hang-exapump.cmd"
+    Set-Content -LiteralPath $hang -Value "@ping -n 31 127.0.0.1 >nul" -Encoding ASCII
+} else {
+    $hang = Join-Path $work "hang-exapump"
+    Set-Content -LiteralPath $hang -Value "#!/bin/sh`nexec sleep 30" -Encoding ASCII
+    & chmod +x $hang
+}
+$previousBin = $env:EXAKIT_EXAPUMP_BIN
+$env:EXAKIT_EXAPUMP_BIN = $hang
+$started = Get-Date
+$rows = Get-ExakitQualifiedTableRows -TimeoutSeconds 2
+$took = ((Get-Date) - $started).TotalSeconds
+$env:EXAKIT_EXAPUMP_BIN = $previousBin
+Check "a hung database: the bounded listing answers null" $true ($null -eq $rows)
+Check "...within its limit, not the hang's 30s" $true ($took -lt 15)
 Has "...and says when it was answered"   "SELECT 'EXAKIT.LISTING_ANSWERED|1' AS QUALIFIED FROM DUAL UNION ALL" $exapumpPs1
 function Get-ExakitQualifiedTables { return @{ "TPCH.REGION" = $true; "TPCH.NATION" = $true } }
 function Sync-ExakitDatasetFlag { }

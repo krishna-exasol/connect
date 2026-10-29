@@ -1231,6 +1231,25 @@ _exakit_prompt_tty() {
     fi
 }
 
+# exakit_read_hidden <label> — one line from the terminal with echo off, on
+# stdout. Call it in $( ): the trap below is then that subshell's own and never
+# replaces the caller's. Echo goes off BEFORE the prompt is printed - in the
+# other order, whatever arrived the moment the prompt appeared (a paste, a
+# password manager typing) was echoed in clear; measured. The terminal's exact
+# previous state comes back afterwards, on Ctrl-C too. Where echo cannot be
+# turned off nothing is read: a credential is never taken in clear.
+exakit_read_hidden() {
+    _erh_saved="$(stty -g < /dev/tty 2>/dev/null)"
+    stty -echo < /dev/tty 2>/dev/null || return 1
+    trap 'stty "${_erh_saved:-echo}" < /dev/tty 2>/dev/null; printf "\n" > /dev/tty; exit 130' INT TERM
+    printf '    %s?%s %s (input hidden): ' "${UI_ASK:-}" "${UI_RESET:-}" "$1" > /dev/tty
+    IFS= read -r _erh_value < /dev/tty
+    stty "${_erh_saved:-echo}" < /dev/tty 2>/dev/null
+    trap - INT TERM
+    printf '\n' > /dev/tty
+    printf '%s' "$_erh_value"
+}
+
 prompt_text() {
     _question="$1"
     _default="${2:-}"
@@ -2592,7 +2611,7 @@ exakit_runtime_remedy() {
 exakit_loaded_datasets() {
     [ -f "$EXAKIT_MANIFEST" ] || return 0
     if command -v exakit_verified_datasets >/dev/null 2>&1; then
-        _eld_verified="$(exakit_verified_datasets 2>/dev/null)" && {
+        _eld_verified="$(exakit_verified_datasets "${EXAKIT_STATUS_SQL_TIMEOUT:-20}" 2>/dev/null)" && {
             [ -n "$_eld_verified" ] && printf '%s\n' "$_eld_verified"
             return 0
         }

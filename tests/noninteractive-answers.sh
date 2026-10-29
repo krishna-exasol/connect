@@ -92,6 +92,20 @@ EXAKIT_HOME="$WORK/home" exakit_data_load_select "Cancel" </dev/null >/dev/null 
 check "selection is local, no menu drawn" "local" "$EXAKIT_DATA_LOAD_SELECTION"
 unset EXAKIT_DATA_FILE
 
+echo "Every dataset already loaded, no tty — nothing is asked, nothing fails:"
+# The local-file row is pre-ticked when nothing is pending, so Enter does
+# something. With no terminal that default stood: the loader asked for a path
+# nobody could give and the installer's rerun ended "one step did not complete".
+(
+    exakit_pending_datasets() { :; }
+    EXAKIT_DATA_LOAD_SELECTION=""
+    UI_FANCY=0 EXAKIT_HOME="$WORK/home" exakit_data_load_select "Skip" </dev/null > "$WORK/all-loaded.out" 2>&1
+    echo "$EXAKIT_DATA_LOAD_SELECTION" > "$WORK/all-loaded.sel"
+)
+check "selection is none, not local" "none" "$(cat "$WORK/all-loaded.sel")"
+check "...and says how to load a file unattended" "yes" \
+    "$(grep -q 'name it with EXAKIT_DATA_FILE' "$WORK/all-loaded.out" && echo yes || echo no)"
+
 echo "EXAKIT_DATA_FILE — a bad path fails instead of looping (no tty):"
 # Without a tty, prompt_text hands back the same default forever, so a
 # nonexistent EXAKIT_DATA_FILE must make exakit_load_local_file return

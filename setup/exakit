@@ -374,6 +374,13 @@ cmd_status() {
     [ "$_cs_as_total" -gt 0 ] && [ "$_cs_as_on" -eq "$_cs_as_total" ] && _cs_autostart=true
     if [ "$_cs_json" -eq 0 ]; then ui_spin_begin "Checking which datasets are loaded"; fi
     _cs_datasets="$(exakit_loaded_datasets 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
+    # The database's clock against this computer's: one query, 0.1 s. A
+    # sleeping Mac leaves Exasol Personal's clock behind (see
+    # exakit_db_clock_skew), and nothing else on this screen would show it.
+    _cs_skew=""
+    if [ "$_cs_running" -eq 1 ] && command -v exakit_db_clock_skew >/dev/null 2>&1; then
+        _cs_skew="$(exakit_db_clock_skew 2>/dev/null || true)"
+    fi
     if [ "$_cs_json" -eq 0 ]; then ui_spin_end; fi
     _cs_pyx="$(exakit_component_current pyexasol 2>/dev/null || true)"
     # An install in progress is its own state. The step name is in the manifest
@@ -438,11 +445,14 @@ cmd_status() {
         run_python_any - "$(manifest_get kit_level 2>/dev/null)" "${_type:-}" "$_cs_db"             "${_cs_autostart:-false}" "$_cs_datasets" "${_cs_pyx:-}" "$EXAKIT_MANIFEST"             "$(manifest_get steps_completed 2>/dev/null)" "$_cs_services" "$_cs_note" "$_cs_note_at" \
             "$_cs_installing" "$_cs_step" "$_cs_urls" "$(exakit_install_command)" \
             "$_cs_legacy_c" "$_cs_legacy_e" "$_cs_legacy_choice" "$_cs_legacy_restored" "$_cs_legacy_sample" \
-            "$(detect_os 2>/dev/null || true)" "$(detect_wsl_version 2>/dev/null || true)" <<'EXAKIT_SJ_PY'
+            "$(detect_os 2>/dev/null || true)" "$(detect_wsl_version 2>/dev/null || true)" \
+            "$_cs_skew" "$EXAKIT_CLOCK_SKEW_LIMIT" "$(exakit_clock_skew_words "${_cs_skew:-0}" 2>/dev/null)" <<'EXAKIT_SJ_PY'
 import json, sys
 kit, rtype, db, autostart, datasets, pyx, manifest, steps, services, note, note_at, installing, step, urls, install_cmd = sys.argv[1:16]
 legacy_c, legacy_e, legacy_choice, legacy_restored, legacy_sample = (sys.argv[16:21] + [""] * 5)[:5]
 host_platform, wsl_version = (sys.argv[21:23] + [""] * 2)[:2]
+skew, skew_limit, skew_words = (sys.argv[23:26] + [""] * 3)[:3]
+skew = int(skew) if skew.lstrip("-").isdigit() else None
 installing = installing == "1"
 try:
     steps_list = json.loads(steps) if steps else []
@@ -492,6 +502,15 @@ if db.startswith("conflict"):
     # Something else is on the SQL port. `exakit start` cannot help until it is gone.
     remedies["database"] = "exakit start"
     remedy_hints["database"] = "another process is listening on the database port — stop it first, then run the remedy"
+if skew is not None and skew_limit.isdigit() and abs(skew) >= int(skew_limit):
+    # A RESTART RESYNCS IT, and the remedy is its first half: once the database
+    # is stopped, status names `exakit start` as it does for any stopped
+    # database. Not hoisted into the top-level `remedy`: the database answers,
+    # and stopping it ends whatever is running - the user decides when.
+    remedies["clock"] = "exakit stop"
+    remedy_hints["clock"] = ("the database clock is %s this computer (a Mac that slept or hibernated leaves "
+                             "it behind); remote sources' certificates and scheduled jobs go by it. A restart "
+                             "resyncs it: run the remedy when nothing is running, then exakit start" % skew_words)
 if installing:
     remedies["install"] = "exakit status --json"
     remedy_hints["install"] = "the installer is still running (step: %s) — poll the remedy until status is running" % (step or "unknown")
@@ -564,6 +583,10 @@ payload = {
     "platform": host_platform or None,
     "wsl_version": int(wsl_version) if wsl_version.isdigit() else None,
     "running": running,
+    # Seconds the database's clock is from this computer's (negative: behind);
+    # null when the database could not be asked. remedies.clock appears past
+    # the limit.
+    "clock_skew_seconds": skew,
     "services": smap,
     # Per-service addresses, from each module's own `url` hook: the JSON key
     # an agent reads for "where is dash-server?" instead of scraping a screen.
@@ -674,6 +697,9 @@ EXAKIT_SJ_PY
         if [ "$_cs_running" -eq 1 ]; then printf ' · reachable'
         elif [ "$_cs_db" = "conflict" ]; then printf ' · port held by another process (not Exasol) — stop it, then: exakit start'
         else printf ' · not reachable'; fi)")"
+    if exakit_clock_skewed "$_cs_skew" 2>/dev/null; then
+        ui_panel_line "$(_cs_pad 'Clock' "$(exakit_clock_skew_words "$_cs_skew") this computer — restart: exakit stop, then exakit start")"
+    fi
     if [ "$_cs_installing" -eq 1 ]; then
         ui_panel_line "$(_cs_pad 'Install' "in progress · step: $_cs_step — poll: exakit status")"
     elif [ -n "$_cs_step" ]; then
