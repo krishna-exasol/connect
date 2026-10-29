@@ -38,7 +38,8 @@ _KINDS = (
     ("region", r"must be addressed using the specified endpoint|PermanentRedirect|"
                r"AuthorizationHeaderMalformed.*region|the region '[\w-]+' is wrong"),
     ("nobucket", r"NoSuchBucket|The specified bucket does not exist|ContainerNotFound"),
-    ("denied", r"AccessDenied|not authorized to perform|AuthorizationPermissionMismatch|AuthorizationFailure"),
+    ("denied", r"AccessDenied|not authorized to perform|AuthorizationPermissionMismatch|AuthorizationFailure|"
+               r"PERMISSION_DENIED"),
     ("dns", r"UnknownHostException|Name or service not known|nodename nor servname|unable to resolve host"),
     ("tls", r"PKIX|certificate|SSLHandshake|SSL connection|ssl_server_dn_match|TLS|SSLException|"
             r"trustAnchors parameter must be non-empty"),
@@ -48,7 +49,9 @@ _KINDS = (
              r"signature we calculated does not match|InvalidAccessKeyId|Access Key Id you provided does not exist|"
              r"security token included in the request is (invalid|expired)|ExpiredToken|"
              r"Server failed to authenticate the request|AuthenticationFailed|"
-             r"Error getting access token for service account"),
+             r"Error getting access token for service account|"
+             # Databricks: the REST API (adapter) and the JDBC driver (loader).
+             r"Invalid access token|REST API answered HTTP 401"),
     ("unreachable", r"Connection refused|connect timed out|The connection attempt failed|"
                     r"Communications link failure|No route to host|Network is unreachable|"
                     r"Connection timed out|ORA-12541|ORA-12170|TCP/IP connection to the host|"
@@ -120,6 +123,33 @@ def store_cause(text):
     return None
 
 
+def rest_answer(line):
+    """A Lua adapter's failed REST call as the API's own answer. Measured
+    (Databricks 1.0.2): "E-VSDAB-5: HTTP request for URL '<url>' failed with
+    status 403 ('HTTP/1.1 403 Forbidden') and body '{"error_code":403,
+    "message":"Invalid access token. ..."}'" - the URL and JSON say less than
+    the message inside them."""
+    rest = re.match(r"(E-[A-Z]+-\d+): HTTP request for URL '[^']*' failed with status (\d+)\b.*?"
+                    r'"message"\s*:\s*"((?:[^"\\]|\\.)*)"', line)
+    if not rest:
+        return None
+    word = re.search(r'"error_code"\s*:\s*"([A-Z][A-Z_]*)"', line)
+    return "%s: the REST API answered HTTP %s%s: %s" % (rest.group(1), rest.group(2),
+                                                         " " + word.group(1) if word else "", rest.group(3))
+
+
+def thrift_answer(cause):
+    """The Databricks JDBC driver's HTTP failure as its code and message.
+    Measured (3.4.3, a revoked token): "DatabricksSQLException: Error while
+    receiving response from Thrift server. Request {TOpenSessionReq(...)},
+    Error {Failed to flush data to server: HTTP request failed by code: 403,
+    status line: ... Error message: Invalid access token. [ReqId: ...]}"."""
+    found = re.search(r"HTTP request failed by code: (\d+).*?Error message: ([^}]+)", cause.group(2))
+    if not found:
+        return None
+    return "%s: HTTP %s: %s" % (cause.group(1), found.group(1), found.group(2).strip())
+
+
 def _sdk_line(cause):
     status = re.search(r"Status Code: (\d+)", cause.group(2))
     detail = re.sub(r"\s*\((?:Service|SDK Attempt)[^)]*\)", "", cause.group(2)).strip()
@@ -141,6 +171,7 @@ def summarize(text):
     store = store_cause(text)
     if coded:
         line = re.sub(r"\s*Known mitigations:\s*$", "", coded.group(1).strip())
+        line = rest_answer(line) or line
         if store:
             line = "%s - caused by %s" % (line, store)
         return re.sub(r"\s+", " ", line).strip()
@@ -150,7 +181,7 @@ def summarize(text):
     for line in text.splitlines():
         cause = re.match(r"\s*(?:Caused by: )?(?:[\w$]+\.)*([A-Z][\w$]*(?:Exception|Error)): (.+)$", line)
         if cause and "ExaUDF" not in cause.group(1) and not cause.group(2).startswith("F-UDF"):
-            return re.sub(r"\s+", " ", _sdk_line(cause)).strip()
+            return re.sub(r"\s+", " ", thrift_answer(cause) or _sdk_line(cause)).strip()
     # pyexasol's own wrapper: "(\n message => ...\n dsn => ...\n query => ...)".
     # The message field is the error; the fields under it describe the session.
     field = re.search(r"^\s*message\s*=>\s*(.+)$", text, re.M)

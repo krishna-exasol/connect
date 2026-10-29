@@ -5,6 +5,7 @@ database and inspect it afterwards:
 
     rust        false -> no RUST alias in SCRIPT_LANGUAGES, and a RUST script fails
                 like java false (the custom container is not installed)
+    lua         always true: Lua is built into the database
     java        false -> creating a JAVA script fails like a deployment with no
                 container ("No usable script language container ...")
     dns         false -> the DNS probe answers "nodns ..." (no resolver at all);
@@ -16,6 +17,10 @@ database and inspect it afterwards:
     loader_cacerts false -> the JDBC loader trusts nothing (Exasol Personal, measured):
                 a Snowflake import fails unless its loader's main class is the kit's
                 exakit.loader.TrustStoreDriver with exakit-loader.jar beside it
+                (Databricks too)
+    A Databricks source (jdbc:databricks:) also takes "no_columns" (Unity
+    Catalog answers without columns, as the samples catalog does) and fails
+    "tls" in the adapter's REST call in the kit's words
     sources     {host: {"tables": [...], "fail": null|"auth"|"tls"|"tls-validity"|"unreachable"|"denied",
                         "secret": "<the credential the source accepts>"}}
                 a document source (S3) is keyed by <bucket>.s3.<region>.amazonaws.com
@@ -44,7 +49,7 @@ import re
 def _load():
     with open(os.environ["FAKE_VS_STATE"]) as handle:
         doc = json.load(handle)
-    for key, default in (("java", True), ("rust", True), ("dns", True), ("unreachable", []), ("sources", {}),
+    for key, default in (("java", True), ("rust", True), ("lua", True), ("dns", True), ("unreachable", []), ("sources", {}),
                          ("connections", {}), ("schemas", []), ("scripts", []), ("virtual", {}),
                          ("statements", [])):
         doc.setdefault(key, default)
@@ -170,13 +175,14 @@ def _loader_trust(doc, connection):
     # Java trusts nothing, unless the kit's main class points it at the
     # container's CA store. Only drivers that read the default store care.
     con = doc["connections"].get(connection)
-    if doc.get("loader_cacerts") is not False or not con or not con["url"].startswith("jdbc:snowflake:"):
+    prefix = next((p for p in ("jdbc:snowflake:", "jdbc:databricks:") if con and con["url"].startswith(p)), None)
+    if doc.get("loader_cacerts") is not False or not prefix:
         return
     folder = os.path.join(os.environ["FAKE_VS_EXA"], "jdbc")
     for name in (os.listdir(folder) if os.path.isdir(folder) else []):
         cfg = os.path.join(folder, name, "settings.cfg")
         text = open(cfg).read() if os.path.isfile(cfg) else ""
-        if "PREFIX=jdbc:snowflake:" in text and "DRIVERMAIN=exakit.loader.TrustStoreDriver" in text and \
+        if "PREFIX=" + prefix in text and "DRIVERMAIN=exakit.loader.TrustStoreDriver" in text and \
                 os.path.isfile(os.path.join(folder, name, "exakit-loader.jar")):
             return
     raise Exception("ETL-5402: JDBC-Client-Error: Connecting to '%s' as user='%s' failed: JDBC driver encountered "
@@ -212,10 +218,40 @@ def _bigquery_source(doc, con):
     return src
 
 
-def _source_for(doc, connection):
+def _databricks_source(doc, con, via):
+    # Measured (adapter 1.0.2, driver 3.4.3): the adapter reads metadata over
+    # the REST API, the loader reads rows over JDBC; each says a refused token
+    # its own way.
+    host = _host(con["url"])
+    src = doc["sources"].get(host)
+    if src is None:
+        raise Exception("JDBC-Client-Error: Connection failure: connect timed out")
+    if src.get("fail") == "auth" or (src.get("secret") is not None and con["secret"] != src["secret"]):
+        if via == "loader":
+            raise Exception("JDBC-Client-Error: Connecting to '%s' as user='token' failed: Connection failure while "
+                            "using the OSS Databricks JDBC driver.\ncom.databricks.jdbc.exception.DatabricksSQLException: "
+                            "Error while receiving response from Thrift server. Request {TOpenSessionReq(configuration:{})}, "
+                            "Error {Failed to flush data to server: HTTP request failed by code: 403, status line: "
+                            "HTTP/1.1 403 Forbidden. Request ID: r1. Error message: Invalid access token. [ReqId: r1]}"
+                            % con["url"])
+        raise Exception('Lua Error "E-VSDAB-5: HTTP request for URL \'https://%s:443/api/2.1/unity-catalog/tables?'
+                        'catalog_name=c\' failed with status 403 (\'HTTP/1.1 403 Forbidden\') and body '
+                        '\'{"error_code":403,"message":"Invalid access token. [ReqId: r2]"}\'" caught in script' % host)
+    if via == "adapter" and src.get("fail") == "tls":
+        raise Exception('Lua Error "E-VSDAB-6: HTTP request \'GET\' for URL \'https://%s:443/api\' failed with result '
+                        '\'certificate verify failed: certificate has expired (%s)\'" caught in script' % (host, host))
+    if via == "adapter" and src.get("no_columns"):
+        raise Exception('Lua Error "1946:"EXAKIT_VS"."ADAPTER_X"|bad argument #1 for function \'for iterator\' '
+                        '(table expected, got nil)" caught in script')
+    return src
+
+
+def _source_for(doc, connection, via="adapter"):
     con = doc["connections"].get(connection)
     if not con:
         raise Exception("connection %s not found" % connection)
+    if con["url"].startswith("jdbc:databricks:"):
+        return _databricks_source(doc, con, via)
     if con["url"].startswith("jdbc:bigquery:"):
         return _bigquery_source(doc, con)
     if con["url"].startswith("mongodb"):
@@ -321,7 +357,7 @@ class Fake(object):
         m = re.match(r"SELECT \* FROM \(IMPORT FROM JDBC AT \"([^\"]+)\" STATEMENT '", sql)
         if m:
             _loader_trust(doc, m.group(1))
-            _source_for(doc, m.group(1))
+            _source_for(doc, m.group(1), "loader")
             return [{"1": 1}]
         m = re.match(r'SELECT \* FROM "([^"]+)"\."([^"]+)" LIMIT 1', sql)
         if m:
@@ -330,7 +366,7 @@ class Fake(object):
                 raise Exception("schema %s not found" % m.group(1))
             # A JDBC adapter pushes the read down as IMPORT FROM JDBC: the loader runs it.
             _loader_trust(doc, vs["connection"])
-            src = _source_for(doc, vs["connection"])
+            src = _source_for(doc, vs["connection"], "loader")
             return [] if m.group(2) in src.get("empty", []) else [{"X": 1}]
         raise Exception("fake: unexpected query: %s" % sql[:80])
 
@@ -338,7 +374,7 @@ class Fake(object):
         if sql == "CREATE SCHEMA EXAKIT_VS":
             doc["schemas"].append("EXAKIT_VS")
             return
-        m = re.match(r"CREATE OR REPLACE (JAVA|RUST) (SCALAR|ADAPTER|SET) SCRIPT (?:\"?)([\w]+)(?:\"?)\.(?:\"?)([\w]+)", sql)
+        m = re.match(r"CREATE OR REPLACE (JAVA|RUST|LUA) (SCALAR|ADAPTER|SET) SCRIPT (?:\"?)([\w]+)(?:\"?)\.(?:\"?)([\w]+)", sql)
         if m:
             if not doc[m.group(1).lower()]:
                 raise Exception("No usable script language container is installed for the requested language.")

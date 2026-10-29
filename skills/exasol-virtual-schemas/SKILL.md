@@ -1,6 +1,6 @@
 ---
 name: exasol-virtual-schemas
-description: Query an external database - PostgreSQL, MySQL, SQL Server, Oracle, Snowflake, BigQuery or MongoDB - or JSON, CSV and Parquet files in an Amazon S3 bucket or an Azure Blob Storage container from the local Exasol database through a virtual schema, with exakit connect and exakit source. Covers giving inputs unattended, passing the credential safely (never as an argument), reading the plan, the "localhost inside the database is not this computer" trap, the failure classes and their fixes (auth, TLS, unreachable, no DNS, no Java, S3 access denied or wrong region, Azure SAS permissions), the EDML mapping that turns S3 objects and Azure blobs into tables, which Azure credential to use (a container SAS over the account key), reauth after a password change, disconnect versus remove, and how BigQuery's key file is kept and who could read it. Triggers — "connect my Postgres to Exasol", "query MySQL from Exasol", "virtual schema", "federate a remote database", "exakit connect", "exakit source", "my source password changed", "the virtual schema stopped working", "remove a connected source", "join local tables with a remote database", "connect Snowflake", "connect SQL Server", "connect Oracle", "connect BigQuery", "query BigQuery from Exasol", "BigQuery service account key", "connect MongoDB", "query a MongoDB collection from Exasol", "MongoDB Atlas", "query files in S3", "connect an S3 bucket", "JSON files in S3 as a table", "EDML mapping", "query files in Azure Blob Storage", "connect an Azure storage container", "Azure SAS token".
+description: Query an external database - PostgreSQL, MySQL, SQL Server, Oracle, Snowflake, BigQuery, Databricks or MongoDB - or JSON, CSV and Parquet files in an Amazon S3 bucket or an Azure Blob Storage container from the local Exasol database through a virtual schema, with exakit connect and exakit source. Covers giving inputs unattended, passing the credential safely (never as an argument), reading the plan, the "localhost inside the database is not this computer" trap, the failure classes and their fixes (auth, TLS, unreachable, no DNS, no Java, S3 access denied or wrong region, Azure SAS permissions), the EDML mapping that turns S3 objects and Azure blobs into tables, which Azure credential to use (a container SAS over the account key), reauth after a password change, disconnect versus remove, how BigQuery's key file is kept and who could read it, and what the kit adds to the Databricks adapter (certificate checks, no join pushdown). Triggers — "connect my Postgres to Exasol", "query MySQL from Exasol", "virtual schema", "federate a remote database", "exakit connect", "exakit source", "my source password changed", "the virtual schema stopped working", "remove a connected source", "join local tables with a remote database", "connect Snowflake", "connect SQL Server", "connect Oracle", "connect BigQuery", "query BigQuery from Exasol", "BigQuery service account key", "connect Databricks", "query Databricks from Exasol", "Unity Catalog", "Databricks personal access token", "connect MongoDB", "query a MongoDB collection from Exasol", "MongoDB Atlas", "query files in S3", "connect an S3 bucket", "JSON files in S3 as a table", "EDML mapping", "query files in Azure Blob Storage", "connect an Azure storage container", "Azure SAS token".
 ---
 
 # Virtual schemas — query a remote database from local Exasol
@@ -20,6 +20,7 @@ database runs every query, even after `exakit` exits.
 | Amazon S3 (JSON, CSV, Parquet files) | `s3` (`aws-s3`) | candidate |
 | Azure Blob Storage (JSON, CSV, Parquet files) | `azure-blob` (`azure`, `abs`) | candidate |
 | MongoDB (one collection per source) | `mongodb` (`mongo`, `atlas`) | candidate |
+| Databricks (one Unity Catalog schema per source) | `databricks` (`dbx`) | candidate |
 | BigQuery | `bigquery` (`bq`) | candidate |
 
 `candidate` means defined and tested against a simulated database, not yet
@@ -188,6 +189,10 @@ little work — keep remote queries selective.
 | 23 | the Rust language container (MongoDB) is not installed | `exakit connect` offers to install it (pinned, checksum-verified, one restart); unattended, run the connect on a terminal once |
 | MongoDB "error while reading collection metadata" | a wrong password, this computer's IP not in the Atlas access list, or the server unreachable - the adapter does not say which | check the password (`reauth` tries it first), the access list (`curl -s https://checkip.amazonaws.com`), the URI |
 | MongoDB "collection ... does not exist" | no such collection - or the account may not read that database (reported the same way) | check the name and the account's role |
+| Databricks `E-VSDAB-5: the REST API answered HTTP 403: Invalid access token` (`auth-failed`) | the token is wrong, expired or revoked | a new token in Databricks (Settings > Developer > Access tokens), then `exakit source reauth <name>` |
+| Databricks `... HTTP 404 SCHEMA_DOES_NOT_EXIST` / `CATALOG_DOES_NOT_EXIST` | no such catalog or schema - or the token's user may not see it | check the names (Catalog Explorer) and the user's grants |
+| Databricks "for iterator ... got nil" | Unity Catalog answered without columns (the built-in `samples` catalog does); adapter 1.0.2 cannot read that | choose a catalog and schema the workspace owns |
+| Databricks `certificate verify failed: ...` (`tls-failed`) | the kit's check of the REST API's certificate refused it; the words after it say why | an expired certificate by the database's clock: restart the database. Otherwise do not work around it |
 | `E-VSD-102: Schema auto inference ... failed - caused by ...` | a CSV/Parquet mapping without fields is read at connect to infer columns; the cause after "caused by" is the real failure | act on the cause |
 
 A failed **first** connect leaves nothing behind — re-run it with corrected
@@ -244,6 +249,35 @@ exakit connect mongodb --name movies --set "uri=mongodb+srv://cluster0.abc12.mon
   drops them.
 - The account needs only `read` on the database. `reauth` tries a new password
   on a throwaway schema first and keeps the old one if it is refused.
+
+## Databricks: a Unity Catalog schema
+
+```bash
+exakit connect databricks --name lake --set host=dbc-1234abcd-5678.cloud.databricks.com \
+  --set http_path=/sql/1.0/warehouses/abc123def456ghi7 --set catalog=main --set schema=sales \
+  --password-file ~/keys/databricks.pat
+```
+
+- **Inputs from the warehouse's Connection details** (SQL Warehouses > the
+  warehouse > Connection details): the server host name and the HTTP path.
+  The warehouse must be able to start: a stopped serverless one starts on
+  the first query (seconds; a classic one can take minutes).
+- **The credential is a personal access token** (Settings > Developer >
+  Access tokens), held as the CONNECTION's password. OAuth M2M is not
+  offered: the adapter would need the client secret inside the URL. The
+  token's user needs USE CATALOG, USE SCHEMA, SELECT on the tables and CAN
+  USE on the warehouse. Tokens expire: `exakit source reauth <name>`.
+- **What the kit adds - say it if asked about security.** Upstream 1.0.2
+  calls the Unity Catalog REST API with certificate checks off, because the
+  database's Lua cannot load a CA file. The kit keeps upstream's file
+  unchanged and appends a check: the server's chain against a pinned
+  Mozilla CA bundle and the host name against the certificate, before the
+  token is sent. Rows come over JDBC with full TLS checks.
+- **Joins run in Exasol**, not in Databricks: adapter 1.0.2 writes a
+  three-table join that Databricks refuses, so the kit turns join pushdown
+  off. Filters, aggregates, ORDER BY and LIMIT on one table still go down.
+- **The `samples` catalog cannot be read** (its metadata has no columns);
+  copy what you need into a catalog you own.
 
 ## BigQuery
 

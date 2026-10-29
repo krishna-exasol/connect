@@ -44,7 +44,8 @@ def seed(pin, data):
     folder = os.path.join(home, "cache", "virtual-schemas", pin["sha256"])
     os.makedirs(folder, exist_ok=True)
     open(os.path.join(folder, pin["asset"]), "wb").write(data)
-for cid in ("postgresql", "mysql", "sqlserver", "oracle", "snowflake", "bigquery", "s3", "azure-blob", "mongodb"):
+for cid in ("postgresql", "mysql", "sqlserver", "oracle", "snowflake", "bigquery", "s3", "azure-blob", "mongodb",
+            "databricks"):
     path = os.path.join(defs, "connectors", cid, "connector.json")
     doc = json.load(open(path))
     if "arch" in doc["adapter"]:
@@ -52,6 +53,11 @@ for cid in ("postgresql", "mysql", "sqlserver", "oracle", "snowflake", "bigquery
             seed(pin, ("adapter-%s-%s" % (cid, arch)).encode())
     else:
         seed(doc["adapter"], ("adapter-" + cid).encode())
+    if doc.get("trust"):
+        # A CA bundle as curl ships it: comments (UTF-8 names) around PEM blocks.
+        seed(doc["trust"], ("## Bundle of CA Root Certificates\n\nNetLock Arany F\u0151tan\u00fas\u00edtv\u00e1ny\n"
+                            "=====\n-----BEGIN CERTIFICATE-----\nQUJDRA==\n-----END CERTIFICATE-----\n\nSecond\n=====\n"
+                            "-----BEGIN CERTIFICATE-----\nRUZHSA==\n-----END CERTIFICATE-----\n").encode("utf-8"))
     if not doc.get("driver"):
         pass
     elif doc["driver"].get("bundle") == "zip":
@@ -120,7 +126,8 @@ import sys; sys.path.insert(0, sys.argv[1] + "/setup/virtual-schemas/engine")
 import plan
 defs = plan.Definitions(sys.argv[1] + "/setup/virtual-schemas")
 samples = {"host": "db.example.com", "database": "sales", "schema": "public", "user": "reader", "service": "ORCLPDB1",
-           "account": "myorg-acct1", "warehouse": "COMPUTE_WH", "project": "my-proj", "dataset": "analytics"}
+           "account": "myorg-acct1", "warehouse": "COMPUTE_WH", "project": "my-proj", "dataset": "analytics",
+           "http_path": "/sql/1.0/warehouses/abc123def456ghi7", "catalog": "main"}
 for entry in defs.entries():
     c = defs.connector(entry["id"])
     if c.get("credential") or c.get("shared_adapter"):
@@ -139,7 +146,7 @@ for entry in defs.entries():
             print("%s/%s BAD %s" % (c["id"], mode or "-", e))
 PYT
 )"
-check "13 connector/TLS combinations build a URL, properties and a probe host" "13 0" \
+check "14 connector/TLS combinations build a URL, properties and a probe host" "14 0" \
     "$(printf '%s\n' "$TEMPLATES" | grep -c ' ok$') $(printf '%s\n' "$TEMPLATES" | grep -c ' BAD')"
 
 printf '\n== failure classes, from real driver messages ==\n'
@@ -944,6 +951,93 @@ VSRUST="$(sed -n '/^_exakit_vs_install_rust() {/,/^}/p' "$ROOT/setup/lib/virtual
 has "bash: exit 23 installs the Rust container, then retries" "23) _exakit_vs_install_rust || break ;;" "$VSRUN"
 has "...it checks size and SHA-256 before installing" 'verify_sha256 "$_evr_dir/$_evr_asset" "$_evr_sha"' "$VSRUST"
 has "PowerShell: its twin" "if (-not (Install-ExakitVsRust)) { break }" "$(cat "$ROOT/setup/lib/virtual-schemas.ps1")"
+
+printf '\n== Databricks (Profile C): a Lua adapter with the kit'"'"'s certificate check ==\n'
+# Measured on Exasol Personal 2.3.0 (adapter 1.0.2, driver 3.4.3, a real
+# workspace): the database's LuaSec loads no CA file, so upstream calls the
+# REST API unverified; the kit appends a check of the chain (pinned Mozilla
+# bundle, from memory) and the host name. Rows come through the loader, which
+# needs the kit's TrustStoreDriver as for Snowflake.
+DBX_HOST="dbc-1234abcd-5678.cloud.databricks.com"
+DBX_SET="--set host=$DBX_HOST --set http_path=/sql/1.0/warehouses/abc123def456ghi7 --set catalog=workspace --set schema=sales"
+dbxdb() { db '{"loader_cacerts": false, "sources": {"'"$DBX_HOST"'": {"tables": ["CUSTOMER", "ORDERS"], "secret": "'"$SECRET"'"}}}'; }
+# dbxsrc KEY JSON-VALUE: one property of the workspace, the rest of the state kept.
+dbxsrc() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); s=d["sources"][sys.argv[2]]
+s.pop(sys.argv[3], None) if sys.argv[4] == "null" else s.__setitem__(sys.argv[3], json.loads(sys.argv[4])); json.dump(d, open(sys.argv[1], "w"))' "$STATE" "$DBX_HOST" "$1" "$2"; }
+dbxdb
+run plan databricks --name dbx $DBX_SET
+check "plan: exit 0" "0" "$RC"
+has "...the CA bundle is a pinned download of its own" '"role": "trust", "asset": "cacert-2026-10-20.pem"' "$OUT"
+has "...the plan says what the kit adds to the adapter" "plus the kit's check of the REST API's certificate and host name against the pinned CA bundle" "$OUT"
+for bad in "http_path=/sql/1.0/warehouses/abc;UID=x" "catalog=main&x=1" "schema=a#b" "http_path=/api/2.0/x"; do
+    run plan databricks --name dbx $DBX_SET --set "$bad"
+    check "refused with exit 2 (it would reach the REST query or the URL): $bad" "2" "$RC"
+done
+
+run_secret "$SECRET" connect databricks --name dbx $DBX_SET --secret-stdin
+check "connect: exit 0" "0" "$RC"
+has "...two tables" "Virtual schema VS_DBX: 2 table(s); a bounded read succeeded" "$OUT"
+check "...the CONNECTION: the URL with AuthMech=3, USER token, the token as its password" \
+    "[\"jdbc:databricks://$DBX_HOST:443/default;transportMode=http;ssl=1;AuthMech=3;httpPath=/sql/1.0/warehouses/abc123def456ghi7;\", \"token\", true]" \
+    "$(dbq '[d["connections"]["EXAKIT_SRC_DBX"]["url"], d["connections"]["EXAKIT_SRC_DBX"]["user"], d["connections"]["EXAKIT_SRC_DBX"]["secret"] == "'"$SECRET"'"]')"
+DBXA="$(dbq '[x for x in d["statements"] if "LUA ADAPTER SCRIPT" in x][-1]')"
+has "...a Lua adapter script" 'CREATE OR REPLACE LUA ADAPTER SCRIPT "EXAKIT_VS"."ADAPTER_DBX" AS' "$DBXA"
+has "...upstream's preamble first" "table.insert(package.searchers," "$DBXA"
+has "...then the dist file as pinned" "adapter-databricks" "$DBXA"
+has "...then the kit's suffix, replacing only the socket factory" "http_client._create_socket_factory = function(args)" "$DBXA"
+has "...with both certificates of the bundle in it" "QUJDRA==" "$DBXA"
+has "...the second too" "RUZHSA==" "$DBXA"
+lacks "...and none of the bundle's comments" "NetLock" "$DBXA"
+lacks "...the marker is gone" "--@EXAKIT_CA_BUNDLE@" "$DBXA"
+check "...no closing / (everything after AS is Lua)" "no" "$(printf '%s' "$DBXA" | grep -q -x '/' && echo yes || echo no)"
+lacks "...the token is not in the script" "$SECRET" "$DBXA"
+check "...nothing for the adapter is staged in BucketFS" "no" "$([ -d "$EXA/bucketfs/bfsdefault/default/exakit/vs/databricks" ] && echo yes || echo no)"
+DBXCFG="$(cat "$EXA/jdbc/DATABRICKS/settings.cfg")"
+has "...the loader driver is registered with the kit's main class" "DRIVERMAIN=exakit.loader.TrustStoreDriver" "$DBXCFG"
+has "...and the Databricks driver beside it" "JAR=databricks-jdbc-3.4.3.jar" "$DBXCFG"
+has "...joins are kept from the adapter (1.0.2 renders three tables as FROM \`\`)" "EXCLUDED_CAPABILITIES = 'JOIN, JOIN_CONDITION_EQUI" \
+    "$(dbq '[x for x in d["statements"] if x.startswith("CREATE VIRTUAL SCHEMA \"VS_DBX\"")][-1]')"
+lacks "...the token is not printed" "$SECRET" "$OUT"
+
+run_secret "dapi-wrong" connect databricks --name dbxbad $DBX_SET --secret-stdin
+check "a refused token: exit 1, nothing of its own kept" "1 false" "$RC $(dbq '"EXAKIT_SRC_DBXBAD" in d["connections"]' | tr A-Z a-z)"
+has "...the REST API's own answer, not its URL and JSON" "E-VSDAB-5: the REST API answered HTTP 403: Invalid access token." "$OUT"
+has "...filed as a rejected credential, with how to get a new token" "an expired or revoked token is refused the same way" "$OUT"
+
+dbxsrc no_columns true
+run_secret "$SECRET" connect databricks --name dbxs $DBX_SET --secret-stdin
+check "a catalog answered without columns (samples): exit 1" "1" "$RC"
+has "...the adapter's Lua error comes with what it means" "the built-in samples catalog does this" "$OUT"
+
+dbxsrc no_columns null; dbxsrc fail '"tls"'
+run_secret "$SECRET" connect databricks --name dbxt $DBX_SET --secret-stdin
+check "a certificate the suffix refuses: exit 1, filed as TLS" "1" "$RC"
+has "...in the suffix's words" "certificate verify failed: certificate has expired" "$OUT"
+
+dbxsrc fail null
+run_secret "dapi-wrong" reauth dbx --secret-stdin
+check "reauth with a token the source refuses: exit 1, the old one kept" "1 true" \
+    "$RC $(dbq 'd["connections"]["EXAKIT_SRC_DBX"]["secret"] == "'"$SECRET"'"' | tr A-Z a-z)"
+has "...tried through the loader first, in the driver's short words" "DatabricksSQLException: HTTP 403: Invalid access token." "$OUT"
+run_secret "$SECRET" reauth dbx --secret-stdin
+check "reauth with the token it accepts: exit 0" "0" "$RC"
+run remove dbx
+check "remove: the script, schema and connection gone, the loader cleaned up" "false false false no" \
+    "$(dbq '"EXAKIT_VS.ADAPTER_DBX" in d["scripts"]' | tr A-Z a-z) $(dbq '"VS_DBX" in d["virtual"]' | tr A-Z a-z) $(dbq '"EXAKIT_SRC_DBX" in d["connections"]' | tr A-Z a-z) $([ -f "$EXA/jdbc/DATABRICKS/settings.cfg" ] && echo yes || echo no)"
+
+LUASFX="$ROOT/setup/virtual-schemas/lua/exakit_verified_tls.lua"
+check "the suffix holds the bundle marker exactly once" "1" "$(grep -c -x -- '--@EXAKIT_CA_BUNDLE@' "$LUASFX")"
+has "...verifies the chain with OpenSSL (cert:issued)" "root:issued(leaf, table.unpack(chain))" "$(cat "$LUASFX")"
+has "...checks the host name against the certificate" "if not host_matches(leaf, host) then" "$(cat "$LUASFX")"
+has "...sends SNI" "self.c:sni(host)" "$(cat "$LUASFX")"
+has "...and refuses plain http" "refusing an unencrypted request" "$(cat "$LUASFX")"
+check "the bundle is pinned from curl.se by size and SHA-256" "ok" "$(python3 - "$ROOT" <<'PYB'
+import json, re, sys
+t = json.load(open(sys.argv[1] + "/setup/virtual-schemas/connectors/databricks/connector.json"))["trust"]
+print("ok" if re.fullmatch(r"[0-9a-f]{64}", t["sha256"]) and t["size"] > 100000
+      and t["url"] == "https://curl.se/ca/%s" % t["asset"] else "bad")
+PYB
+)"
 
 printf '\n== a private CA for Oracle: a wallet inside the connection ==\n'
 # Measured against RDS Oracle 19c over TCPS: ojdbc 23 reads a trust-only PEM
