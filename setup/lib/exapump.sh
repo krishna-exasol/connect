@@ -2902,15 +2902,30 @@ exakit_bundled_datasets() {
 # ask, and exakit_dataset_loaded is the only caller.
 _EXAKIT_DB_REACHABLE=""
 exakit_db_reachable() {
+    # [limit]: seconds the probe may take, for a caller that must answer (status)
+    # rather than wait on a database that accepts logins and then never replies.
+    # Without it the probe waits as long as the database does: under load a
+    # login alone has been measured at 8s, and the installer must not read that
+    # as "down".
     if [ "$_EXAKIT_DB_REACHABLE" != 1 ]; then
         if [ -n "$(manifest_get components.exapump.profile 2>/dev/null)" ] && \
-           "$(exapump_cli)" sql -p "$EXAKIT_EXAPUMP_PROFILE" "SELECT 1" >/dev/null 2>&1; then
+           _exakit_exapump_sql_within "${1:-}" "SELECT 1" >/dev/null 2>&1; then
             _EXAKIT_DB_REACHABLE=1
         else
             _EXAKIT_DB_REACHABLE=0
         fi
     fi
     [ "$_EXAKIT_DB_REACHABLE" = 1 ]
+}
+
+# _exakit_exapump_sql_within <limit|""> <sql> — one statement through the kit's
+# profile, cut off after <limit> seconds when one is given.
+_exakit_exapump_sql_within() {
+    if [ -n "$1" ]; then
+        exakit_run_bounded "$1" "$(exapump_cli)" sql -p "$EXAKIT_EXAPUMP_PROFILE" "$2"
+    else
+        "$(exapump_cli)" sql -p "$EXAKIT_EXAPUMP_PROFILE" "$2"
+    fi
 }
 
 # exakit_forget_db_reachable — drop the cached "yes" after the kit itself takes
@@ -3121,8 +3136,12 @@ exakit_pending_datasets() {
 # Eight round trips to answer "what data is in there?" would be a tax on the
 # command's whole reason to exist.
 exakit_verified_datasets() {
-    exakit_db_reachable || return 1
-    _vd_present="$("$(exapump_cli)" sql -p "$EXAKIT_EXAPUMP_PROFILE" \
+    # [limit]: as exakit_db_reachable. `exakit status` passes one: a database
+    # that completes the TLS handshake and then hangs on every query (measured:
+    # a deadlocked loader) held status forever, and an agent with it.
+    _vd_limit="${1:-}"
+    exakit_db_reachable "$_vd_limit" || return 1
+    _vd_present="$(_exakit_exapump_sql_within "$_vd_limit" \
         "SELECT TABLE_SCHEMA || '.' || TABLE_NAME AS QUALIFIED FROM SYS.EXA_ALL_TABLES" \
         2>/dev/null)" || return 1
     _vd_ids=""
