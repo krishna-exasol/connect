@@ -15,6 +15,7 @@ import hashlib
 import os
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import urllib.request
 import zipfile
@@ -138,6 +139,38 @@ def stage_zip(source, dest_dir):
                 shutil.copyfileobj(src, out)
             jars.append(name)
     return sorted(jars)
+
+
+def stage_tar_member(source, member, size, sha256, dest):
+    """Extract one regular file of a verified .tar.gz into place, checked
+    against its own pin; True when it was created now. Nothing else in the
+    archive is read, and a link or any other kind of entry is refused."""
+    if os.path.isfile(dest) and os.path.getsize(dest) == int(size) and sha256_file(dest) == sha256:
+        return False
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    handle, partial = tempfile.mkstemp(dir=os.path.dirname(dest), prefix=".part-")
+    os.close(handle)
+    try:
+        with tarfile.open(source, "r:gz") as archive:
+            try:
+                entry = archive.getmember(member)
+            except KeyError:
+                raise ArtifactError("%s holds no %s" % (os.path.basename(source), member))
+            if not entry.isfile():
+                raise ArtifactError("%s in %s is not a regular file" % (member, os.path.basename(source)))
+            with archive.extractfile(entry) as src, open(partial, "wb") as out:
+                shutil.copyfileobj(src, out)
+        if os.path.getsize(partial) != int(size) or sha256_file(partial) != sha256:
+            raise ArtifactError("%s from %s does not match its pinned size and SHA-256"
+                                % (member, os.path.basename(source)))
+        os.chmod(partial, 0o644)
+        os.replace(partial, dest)
+        return True
+    except (tarfile.TarError, OSError) as error:
+        raise ArtifactError("could not extract %s from %s: %s" % (member, os.path.basename(source), error))
+    finally:
+        if os.path.exists(partial):
+            os.remove(partial)
 
 
 def settings_cfg(etl, jar_name, extra_jars=()):

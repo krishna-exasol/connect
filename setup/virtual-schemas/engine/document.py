@@ -109,8 +109,29 @@ def credential(kind, values, secret, now=None):
     """(the CONNECTION's JSON, every string to redact, notes) for a document source."""
     if kind == "azure-blob":
         return _azure(values, secret.strip(), now or datetime.datetime.now(datetime.timezone.utc))
-    if kind != "s3":
+    if kind not in ("s3", "lakehouse-glue"):
         raise DocumentError("unknown credential kind %s" % kind)
+    key_id, secret_key, token, hidden = _aws_keys(values, secret)
+    if kind == "s3":
+        body = {"awsAccessKeyId": key_id, "awsSecretAccessKey": secret_key,
+                "awsRegion": values["region"], "s3Bucket": values["bucket"]}
+        token_field = "awsSessionToken"
+    else:
+        # lakehouse-engine-rs, CATALOG_KIND GLUE: one key pair signs Glue and S3.
+        body = {"region": values["region"], "access_key": key_id, "secret_key": secret_key}
+        token_field = "session_token"
+    notes = []
+    if token:
+        body[token_field] = token
+        notes.append("temporary credentials expire (usually within hours); when they do, give new ones with: "
+                     "exakit source reauth <name> --password-file <file>")
+    text = json.dumps(body)
+    return text, [h for h in hidden + [text] if h], notes
+
+
+def _aws_keys(values, secret):
+    """(key id, secret key, session token, strings to redact) from a typed
+    secret key plus --set access_key_id, or from a credential file."""
     key_id, secret_key, token = values.get("access_key_id", ""), secret, ""
     try:
         doc = json.loads(secret)
@@ -138,15 +159,7 @@ def credential(kind, values, secret, now=None):
     if key_id.startswith("ASIA") and not token:
         raise DocumentError("ASIA... keys are temporary and need their session token: give the whole JSON from "
                             "aws sts (with SessionToken) through --password-file")
-    body = {"awsAccessKeyId": key_id, "awsSecretAccessKey": secret_key,
-            "awsRegion": values["region"], "s3Bucket": values["bucket"]}
-    notes = []
-    if token:
-        body["awsSessionToken"] = token
-        notes.append("temporary credentials expire (usually within hours); when they do, give new ones with: "
-                     "exakit source reauth <name> --password-file <file>")
-    text = json.dumps(body)
-    return text, [h for h in hidden + [text] if h], notes
+    return key_id, secret_key, token, hidden
 
 
 def _sas_time(raw):

@@ -97,6 +97,17 @@ can now finish setup that only the installer can do.**
   `exakit.loader.TrustStoreDriver`, which points it at the language
   container's own CA store and hands over to the Snowflake driver; nothing
   is disabled.
+- Lakehouse (Profile D): `exakit connect lakehouse` maps one AWS Glue database
+  - its Iceberg tables, and plain Hive Parquet ones - read in place from S3
+  by exasol-labs' lakehouse-engine-rs 0.57.3 (Apache DataFusion in the Rust
+  language container MongoDB already uses). The release archive and the
+  library inside it are both pinned per CPU; only the library is staged.
+  Its four scripts are shared by every lakehouse source. The credential is
+  an IAM key pair (the `aws iam create-access-key` JSON), held as the
+  CONNECTION's JSON password. Measured against Athena-written Iceberg v2
+  tables with a DELETE and an UPDATE: every answer equals Athena's.
+  The engine's companion scripts generalize the import script: a
+  connector can now name several, created and dropped together.
 - Databricks (Profile C, a Lua adapter): `exakit connect databricks` maps one
   Unity Catalog schema through exasol/databricks-virtual-schema 1.0.2, with
   the rows read over IMPORT FROM JDBC by the Databricks JDBC driver 3.4.3

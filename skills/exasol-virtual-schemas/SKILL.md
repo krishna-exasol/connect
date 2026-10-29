@@ -1,6 +1,6 @@
 ---
 name: exasol-virtual-schemas
-description: Query an external database - PostgreSQL, MySQL, SQL Server, Oracle, Snowflake, BigQuery, Databricks or MongoDB - or JSON, CSV and Parquet files in an Amazon S3 bucket or an Azure Blob Storage container from the local Exasol database through a virtual schema, with exakit connect and exakit source. Covers giving inputs unattended, passing the credential safely (never as an argument), reading the plan, the "localhost inside the database is not this computer" trap, the failure classes and their fixes (auth, TLS, unreachable, no DNS, no Java, S3 access denied or wrong region, Azure SAS permissions), the EDML mapping that turns S3 objects and Azure blobs into tables, which Azure credential to use (a container SAS over the account key), reauth after a password change, disconnect versus remove, how BigQuery's key file is kept and who could read it, and what the kit adds to the Databricks adapter (certificate checks, no join pushdown). Triggers — "connect my Postgres to Exasol", "query MySQL from Exasol", "virtual schema", "federate a remote database", "exakit connect", "exakit source", "my source password changed", "the virtual schema stopped working", "remove a connected source", "join local tables with a remote database", "connect Snowflake", "connect SQL Server", "connect Oracle", "connect BigQuery", "query BigQuery from Exasol", "BigQuery service account key", "connect Databricks", "query Databricks from Exasol", "Unity Catalog", "Databricks personal access token", "connect MongoDB", "query a MongoDB collection from Exasol", "MongoDB Atlas", "query files in S3", "connect an S3 bucket", "JSON files in S3 as a table", "EDML mapping", "query files in Azure Blob Storage", "connect an Azure storage container", "Azure SAS token".
+description: Query an external database - PostgreSQL, MySQL, SQL Server, Oracle, Snowflake, BigQuery, Databricks or MongoDB - Iceberg tables in an AWS Glue lakehouse, or JSON, CSV and Parquet files in an Amazon S3 bucket or an Azure Blob Storage container from the local Exasol database through a virtual schema, with exakit connect and exakit source. Covers giving inputs unattended, passing the credential safely (never as an argument), reading the plan, the "localhost inside the database is not this computer" trap, the failure classes and their fixes (auth, TLS, unreachable, no DNS, no Java, S3 access denied or wrong region, Azure SAS permissions), the EDML mapping that turns S3 objects and Azure blobs into tables, which Azure credential to use (a container SAS over the account key), reauth after a password change, disconnect versus remove, how BigQuery's key file is kept and who could read it, and what the kit adds to the Databricks adapter (certificate checks, no join pushdown). Triggers — "connect my Postgres to Exasol", "query MySQL from Exasol", "virtual schema", "federate a remote database", "exakit connect", "exakit source", "my source password changed", "the virtual schema stopped working", "remove a connected source", "join local tables with a remote database", "connect Snowflake", "connect SQL Server", "connect Oracle", "connect BigQuery", "query BigQuery from Exasol", "BigQuery service account key", "connect Databricks", "query Databricks from Exasol", "Unity Catalog", "Databricks personal access token", "query Iceberg tables", "connect an AWS Glue catalog", "lakehouse", "Athena tables from Exasol", "connect MongoDB", "query a MongoDB collection from Exasol", "MongoDB Atlas", "query files in S3", "connect an S3 bucket", "JSON files in S3 as a table", "EDML mapping", "query files in Azure Blob Storage", "connect an Azure storage container", "Azure SAS token".
 ---
 
 # Virtual schemas — query a remote database from local Exasol
@@ -21,6 +21,7 @@ database runs every query, even after `exakit` exits.
 | Azure Blob Storage (JSON, CSV, Parquet files) | `azure-blob` (`azure`, `abs`) | candidate |
 | MongoDB (one collection per source) | `mongodb` (`mongo`, `atlas`) | candidate |
 | Databricks (one Unity Catalog schema per source) | `databricks` (`dbx`) | candidate |
+| Lakehouse: Iceberg (and Hive Parquet) tables in AWS Glue | `lakehouse` (`iceberg`, `glue`) | candidate |
 | BigQuery | `bigquery` (`bq`) | candidate |
 
 `candidate` means defined and tested against a simulated database, not yet
@@ -193,6 +194,9 @@ little work — keep remote queries selective.
 | Databricks `... HTTP 404 SCHEMA_DOES_NOT_EXIST` / `CATALOG_DOES_NOT_EXIST` | no such catalog or schema - or the token's user may not see it | check the names (Catalog Explorer) and the user's grants |
 | Databricks "for iterator ... got nil" | Unity Catalog answered without columns (the built-in `samples` catalog does); adapter 1.0.2 cannot read that | choose a catalog and schema the workspace owns |
 | Databricks `certificate verify failed: ...` (`tls-failed`) | the kit's check of the REST API's certificate refused it; the words after it say why | an expired certificate by the database's clock: restart the database. Otherwise do not work around it |
+| Lakehouse `Glue GetTables failed ... AccessDeniedException ... not authorized to perform: glue:GetTables` (`access-denied`) | the key may not list that database - or, under a policy scoped to named databases, the database does not exist (AWS answers both the same way) | check the database name; else grant the key what the message names, then `exakit source check <name>` |
+| Lakehouse `UnrecognizedClientException: The security token included in the request is invalid` (`auth-failed`) | AWS does not know the access key (deleted, or a typo) | a new key, then `exakit source reauth <name>` |
+| Lakehouse `Fingerprint mismatch` | the Rust language container is not the version the engine was built for | `exakit connect` installs the pinned one; do not swap the container by hand |
 | `E-VSD-102: Schema auto inference ... failed - caused by ...` | a CSV/Parquet mapping without fields is read at connect to infer columns; the cause after "caused by" is the real failure | act on the cause |
 
 A failed **first** connect leaves nothing behind — re-run it with corrected
@@ -249,6 +253,38 @@ exakit connect mongodb --name movies --set "uri=mongodb+srv://cluster0.abc12.mon
   drops them.
 - The account needs only `read` on the database. `reauth` tries a new password
   on a throwaway schema first and keeps the old one if it is refused.
+
+## Lakehouse: Iceberg tables in AWS Glue
+
+```bash
+exakit connect lakehouse --name lake --set region=eu-central-1 --set database=sales_lake \
+  --password-file ~/keys/lake-reader.json      # what `aws iam create-access-key` prints
+```
+
+- **One Glue database is one source.** Its Iceberg tables (Athena, Spark, EMR,
+  Glue jobs write them) become virtual tables, read in place from S3 by
+  exasol-labs' lakehouse-engine-rs (Apache DataFusion inside the database).
+  Plain Hive Parquet tables of the database are read too; ORC, Avro, Delta,
+  views and tables with partition projection are skipped by name.
+- **Iceberg deletes are applied** (positional deletes and deletion vectors):
+  an Athena `DELETE` or `UPDATE` reads the way Athena reads it. Equality
+  deletes are refused by name.
+- **The credential is an IAM access key pair**, best the JSON file
+  `aws iam create-access-key` prints; it goes into the CONNECTION's password
+  as JSON and signs both Glue and S3 requests. The key needs only
+  `glue:GetDatabase`, `GetTables`, `GetTable`, `GetPartitions` on that database
+  and its tables, `s3:ListBucket` on the table locations and `s3:GetObject`
+  on their objects. Lake Formation grants are not evaluated.
+- **First use installs the Rust language container** (the same one MongoDB
+  uses) after asking. The engine (about 200 MB) is pinned per CPU, archive
+  and library both checksum-verified. Its four scripts
+  (`EXAKIT_VS.LAKEHOUSE_ADAPTER`, `LAKEHOUSE_SCAN`,
+  `LAKEHOUSE_DISTRIBUTE_FILES`, `LAKEHOUSE_VERSION`) are shared by every
+  lakehouse source; `SELECT EXAKIT_VS.LAKEHOUSE_VERSION()` names the build.
+- **A few results differ from native Exasol** in edge cases: upper/lower case
+  of non-ASCII text (`UPPER('straße')` is `STRASSE`), dates outside Exasol's
+  range, `TO_DATE`/`TO_TIMESTAMP` with a format are stricter, and
+  `STDDEV`/`VARIANCE` precision. Mention them if a user compares results.
 
 ## Databricks: a Unity Catalog schema
 

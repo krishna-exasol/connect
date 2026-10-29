@@ -401,13 +401,23 @@ class Engine(object):
             # these verified cache copies); the database reads no file of it.
             jars += [adapter_src, self.cache.fetch(connector["trust"])]
         else:
-            dest = self.runtime.bucket_dir(cid, adapter_pin["version"], adapter_pin["asset"])
-            made = artifacts.stage_file(adapter_src, dest)
-            self.store.add_consumer(dest, adapter_pin["sha256"], name, made)
+            staged = adapter_pin["asset"]
+            if adapter_pin.get("bundle") == "tar.gz":
+                # A release archive: only its pinned member is staged.
+                staged = os.path.basename(adapter_pin["member"])
+                dest = self.runtime.bucket_dir(cid, adapter_pin["version"], staged)
+                made = artifacts.stage_tar_member(adapter_src, adapter_pin["member"], adapter_pin["member_size"],
+                                                  adapter_pin["member_sha256"], dest)
+                digest = adapter_pin["member_sha256"]
+            else:
+                dest = self.runtime.bucket_dir(cid, adapter_pin["version"], staged)
+                made = artifacts.stage_file(adapter_src, dest)
+                digest = adapter_pin["sha256"]
+            self.store.add_consumer(dest, digest, name, made)
             if made:
                 created["files"].append(dest)
                 self.store.save_journal(name, dict(self.store.journal(name) or {}, created=created))
-            jars.append(self.runtime.bucket_sql(cid, adapter_pin["version"], adapter_pin["asset"]))
+            jars.append(self.runtime.bucket_sql(cid, adapter_pin["version"], staged))
         if not driver_pin:
             # A document-files adapter carries its store's SDK; nothing else to stage.
             self.emit("OK", "Adapter %s verified and staged" % adapter_pin["version"])
@@ -516,7 +526,9 @@ class Engine(object):
                 failure = Failure(str(error), EXIT["input"])
                 failure.complete = True  # the credential's own problem, named; nothing ran
                 raise failure
-            return "", "", text, hidden, notes
+            # A document adapter names no address; a lakehouse catalog's is its endpoint.
+            url = connector["url"].format(**values) if connector.get("url") else ""
+            return url, "", text, hidden, notes
         # A connector with one fixed account name (Databricks: "token") takes
         # no user input.
         return None, connector.get("user", values.get("user")), secret, [], []
@@ -542,17 +554,34 @@ class Engine(object):
         lines += ["  %%jar %s;" % jar for jar in jars]
         return "\n".join(lines) + "\n/"
 
-    def import_sql(self, connector, names, jars, profile):
+    @staticmethod
+    def companions(connector, profile):
+        """The scripts an adapter calls by fixed names in its own schema, shared
+        by every source of the connector: a document adapter's or MongoDB's one
+        import script (its signature from the profile), or a connector's own
+        list (Lakehouse: scan, distributor, version)."""
+        if connector.get("companions"):
+            return connector["companions"]
+        if connector.get("import_script"):
+            return [dict(profile["import_script"], name=connector["import_script"])]
+        return []
+
+    def companion_sql(self, spec, names, jars):
+        target = "%s.%s" % (sql.ident(names["script_schema"]), sql.ident(spec["name"]))
+        if spec.get("language") == "RUST":
+            return "CREATE OR REPLACE RUST %s SCRIPT %s%s AS\n%%udf_object %s;\n/" % (
+                spec["type"], target, spec["signature"], jars[0])
+        if spec.get("language") == "LUA":
+            # Everything after AS is the Lua program: no closing "/".
+            return "CREATE OR REPLACE LUA %s SCRIPT %s%s AS\n%s" % (spec["type"], target, spec["signature"], spec["body"])
+        return self.import_sql_java(spec, names, jars)
+
+    def import_sql_java(self, script, names, jars):
         """The document adapter's import UDF: the name, parameters and EMITS(...)
         its adapter calls (from the adapter's user guide)."""
-        script = profile["import_script"]
-        if script.get("language") == "RUST":
-            return "CREATE OR REPLACE RUST %s SCRIPT %s.%s%s AS\n%%udf_object %s;\n/" % (
-                script["type"], sql.ident(names["script_schema"]), sql.ident(connector["import_script"]),
-                script["signature"], jars[0])
         lines = ["CREATE OR REPLACE JAVA SET SCRIPT %s.%s(DATA_LOADER VARCHAR(2000000), "
                  "SCHEMA_MAPPING_REQUEST VARCHAR(2000000), CONNECTION_NAME VARCHAR(500)) EMITS(...) AS"
-                 % (sql.ident(names["script_schema"]), sql.ident(connector["import_script"])),
+                 % (sql.ident(names["script_schema"]), sql.ident(script["name"])),
                  "  %%scriptclass %s;" % script["scriptclass"]]
         lines += ["  %%env %s;" % env for env in script.get("env", [])]
         lines += ["  %%jar %s;" % jar for jar in jars]
@@ -601,7 +630,7 @@ class Engine(object):
     def verify(self, connector, schema):
         """(tables, read, evidence words, empty tables) for a connected source."""
         tables = self.tables(schema)
-        if connector.get("credential") and tables:
+        if any(spec["kind"] == "edml" for spec in connector["inputs"]) and tables:
             empty = self.read_each(schema, tables)
             read = len(tables) > len(empty)
             if empty:
@@ -697,11 +726,11 @@ class Engine(object):
                     self.db().execute(self.adapter_sql(names, jars, profile))
                     if not shared_before:
                         made("script")
-                    if connector.get("import_script"):
-                        if not self.exists("script", names["script_schema"], connector["import_script"]):
-                            created["import_script"] = connector["import_script"]
+                    for spec in self.companions(connector, profile):
+                        if not self.exists("script", names["script_schema"], spec["name"]):
+                            created.setdefault("companions", []).append(spec["name"])
                             self.store.save_journal(name, journal)
-                        self.db().execute(self.import_sql(connector, names, jars, profile))
+                        self.db().execute(self.companion_sql(spec, names, jars))
                     self.db().execute(self.vs_sql(connector, names, values, {"mapping_path": mapping_path}))
                     made("schema")
                 self.warn_key_readers(connector, name)
@@ -805,13 +834,15 @@ class Engine(object):
                         db.execute(statement)
                     except sql.DbError as error:
                         self.emit("WARN", "could not undo %s: %s" % (flag, error))
-                if flag == "script" and created.get("import_script"):
-                    # Made by this attempt, so no other source shares it yet.
-                    try:
-                        db.execute("DROP SCRIPT %s.%s" % (sql.ident(names["script_schema"]),
-                                                          sql.ident(created["import_script"])))
-                    except sql.DbError as error:
-                        self.emit("WARN", "could not undo the import script: %s" % error)
+                if flag == "script":
+                    # Made by this attempt, so no other source shares them yet.
+                    # (A journal from before companions names one import_script.)
+                    for script in created.get("companions") or \
+                            ([created["import_script"]] if created.get("import_script") else []):
+                        try:
+                            db.execute("DROP SCRIPT %s.%s" % (sql.ident(names["script_schema"]), sql.ident(script)))
+                        except sql.DbError as error:
+                            self.emit("WARN", "could not undo the script %s: %s" % (script, error))
         if not self.store.exists(name):
             for path in self.store.release(name):
                 if path in created["files"] and os.path.isfile(path):
@@ -999,16 +1030,18 @@ class Engine(object):
         mine = [path for path, entry in registry.items() if name in entry.get("consumers", [])]
         reclaim = [path for path in mine if registry[path].get("owned") and registry[path].get("consumers") == [name]]
         connector = self.defs.connector(config["connector"])
-        shared = connector.get("import_script")
-        last = shared and not self.import_script_users(config["connector"], name)
+        shared = [spec["name"] for spec in self.companions(connector, self.defs.profile(connector["profile"]))]
+        last = bool(shared) and not self.import_script_users(config["connector"], name)
         own_adapter = not connector.get("shared_adapter") or last
+        kind = "import script" if connector.get("import_script") else "script"
         plan = {"name": name, "drop": ["virtual schema %s" % names["schema"]] +
                                       (["adapter script %s.%s%s" % (names["script_schema"], names["script"],
                                                                     " (no other %s source uses it)" % config["connector"]
                                                                     if connector.get("shared_adapter") else "")]
                                        if own_adapter else []) +
-                                      (["import script %s.%s (no other %s source uses it)"
-                                        % (names["script_schema"], shared, config["connector"])] if last else []) +
+                                      (["%s %s.%s (no other %s source uses it)"
+                                        % (kind, names["script_schema"], script, config["connector"])
+                                        for script in shared] if last else []) +
                                       ["CONNECTION %s" % names["connection"]],
                 "delete_files": reclaim, "keep_files": [p for p in mine if p not in reclaim],
                 "note": "remote data and source accounts are never touched"}
@@ -1025,8 +1058,9 @@ class Engine(object):
                 db.execute("DROP %sVIRTUAL SCHEMA %s CASCADE" % (force, sql.ident(names["schema"])))
             if own_adapter and self.exists("script", names["script_schema"], names["script"]):
                 db.execute("DROP ADAPTER SCRIPT %s.%s" % (sql.ident(names["script_schema"]), sql.ident(names["script"])))
-            if last and self.exists("script", names["script_schema"], shared):
-                db.execute("DROP SCRIPT %s.%s" % (sql.ident(names["script_schema"]), sql.ident(shared)))
+            for script in shared if last else []:
+                if self.exists("script", names["script_schema"], script):
+                    db.execute("DROP SCRIPT %s.%s" % (sql.ident(names["script_schema"]), sql.ident(script)))
             if connection_present:
                 db.execute("DROP CONNECTION %s" % sql.ident(names["connection"]))
             # A reauth killed mid-try can leave its pending credential behind.

@@ -35,6 +35,9 @@ KINDS = {
     "mongo-name": re.compile(r"^[^\x00-\x1f'\"\\$/\s]{1,120}$"),
     # The adapter puts these into a REST query string unencoded and the path
     # into the JDBC URL, so neither may carry & # ? ; or a quote.
+    # Glue database names: letters, digits, _ and -; no dot (one database is
+    # one NAMESPACE, and the engine refuses a dotted one).
+    "glue-database": re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]{0,254}$"),
     "databricks-name": re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]{0,254}$"),
     "databricks-http-path": re.compile(r"^/sql/1\.0/warehouses/[A-Za-z0-9]{1,64}$|^/sql/protocolv1/o/\d{1,20}/[A-Za-z0-9-]{1,64}$"),
 }
@@ -310,6 +313,15 @@ def describe(defs, connector_id, name, values, runtime, cache, store):
                   "create Lua adapter script %s.%s: upstream's file unchanged, plus the kit's check of the REST "
                   "API's certificate and host name against the pinned CA bundle (upstream turns it off)"
                   % (names["script_schema"], names["script"]),
+                  "create virtual schema %s" % names["schema"],
+                  "verify metadata and one bounded read"]
+    elif connector.get("companions"):
+        steps += ["create CONNECTION %s%s" % (names["connection"], " (the credential as JSON, inside the database only)"
+                                              if connector.get("credential") else ""),
+                  "create adapter script %s.%s and its scripts %s (shared by every %s source)"
+                  % (names["script_schema"], names["script"],
+                     ", ".join("%s.%s" % (names["script_schema"], s["name"]) for s in connector["companions"]),
+                     connector["name"]),
                   "create virtual schema %s" % names["schema"],
                   "verify metadata and one bounded read"]
     elif connector.get("shared_adapter"):
