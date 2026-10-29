@@ -27,6 +27,9 @@ class DbError(Exception):
 # and Exasol's own; a generic failure stays "error" rather than guessing.
 _KINDS = (
     ("nojava", r"No usable script language container"),
+    # A driver naming a property its URL lacks (Simba: "Connection Refused:
+    # ... Required Connection Key(s)") is configuration, not the network.
+    ("error", r"Required Connection Key\(s\)"),
     # Object stores answer over HTTPS with their own codes (S3 measured live):
     # a request signed by a clock too far off, a bucket in another region, a
     # key that may not list or read - each has its own fix, so each is named.
@@ -44,7 +47,8 @@ _KINDS = (
              r"JWT token is invalid|Programmatic access token is invalid|token has expired|"
              r"signature we calculated does not match|InvalidAccessKeyId|Access Key Id you provided does not exist|"
              r"security token included in the request is (invalid|expired)|ExpiredToken|"
-             r"Server failed to authenticate the request|AuthenticationFailed"),
+             r"Server failed to authenticate the request|AuthenticationFailed|"
+             r"Error getting access token for service account"),
     ("unreachable", r"Connection refused|connect timed out|The connection attempt failed|"
                     r"Communications link failure|No route to host|Network is unreachable|"
                     r"Connection timed out|ORA-12541|ORA-12170|TCP/IP connection to the host|"

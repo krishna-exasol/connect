@@ -9,6 +9,8 @@ database and inspect it afterwards:
                 a host ending in .invalid answers "dns ..." (no such name)
     unreachable host names whose TCP probe fails
     clock_skew  seconds the database clock is off this computer's (negative: behind)
+    script_privs, role_privs, users  who may create scripts (EXA_DBA_SYS_PRIVS grantees),
+                the role grants and the users; by default only SYS (through DBA)
     loader_cacerts false -> the JDBC loader trusts nothing (Exasol Personal, measured):
                 a Snowflake import fails unless its loader's main class is the kit's
                 exakit.loader.TrustStoreDriver with exakit-loader.jar beside it
@@ -181,10 +183,39 @@ def _loader_trust(doc, connection):
                     "non-empty." % (con["url"], con["user"]))
 
 
+def _bigquery_source(doc, con):
+    # Measured against a real project (Simba 1.7.0.1001, adapter 4.0.1): the
+    # key is read from the file the URL names, the e-mail must be in the URL,
+    # and a key Google refuses (or a token dated by a clock that is off) fails
+    # the token request with 400.
+    props = dict(p.split("=", 1) for p in con["url"].split(";")[1:] if "=" in p)
+    for need in ("OAuthPvtKeyPath", "OAuthServiceAcctEmail"):
+        if need not in props:
+            raise Exception("RemoteMetadataReaderException: Unable to create BigQuery remote metadata reader. Caused "
+                            "by: [Simba][JDBC](10100) Connection Refused: [Simba][JDBC](11640) Required Connection "
+                            "Key(s): %s; [Simba][JDBC](11480) Optional Connection Key(s): AdditionalProjects" % need)
+    path = os.path.join(os.environ["FAKE_VS_EXA"], "bucketfs", *props["OAuthPvtKeyPath"][len("/buckets/"):].split("/"))
+    refused = ("RemoteMetadataReaderException: Unable to create BigQuery remote metadata reader. Caused by: "
+               "[Simba][BigQueryJDBCDriver](100004) HttpTransport IO error : Error getting access token for service "
+               "account: 400 Bad Request")
+    if not os.path.isfile(path):
+        raise Exception(refused.replace("400 Bad Request", "%s (No such file or directory)" % props["OAuthPvtKeyPath"]))
+    key = json.load(open(path))
+    src = doc["sources"].get("www.googleapis.com")
+    if src is None:
+        raise Exception("java.net.UnknownHostException: www.googleapis.com")
+    if key.get("client_email") != props["OAuthServiceAcctEmail"] or \
+            (src.get("key_id") and key.get("private_key_id") != src["key_id"]):
+        raise Exception(refused)
+    return src
+
+
 def _source_for(doc, connection):
     con = doc["connections"].get(connection)
     if not con:
         raise Exception("connection %s not found" % connection)
+    if con["url"].startswith("jdbc:bigquery:"):
+        return _bigquery_source(doc, con)
     if con["url"] == "" and con["secret"].startswith("{"):
         return _document_source(doc, con)
     src = doc["sources"].get(_host(con["url"]))
@@ -245,6 +276,13 @@ class Fake(object):
             if m.group(1) in doc["unreachable"]:
                 return [{"R": "tcp 10.0.0.9 SocketTimeoutException"}]
             return [{"R": "ok 10.0.0.9"}]
+        # Who may create scripts (and so read BucketFS): the privilege tables.
+        if sql.startswith("SELECT GRANTEE FROM EXA_DBA_SYS_PRIVS WHERE PRIVILEGE IN"):
+            return [{"GRANTEE": g} for g in doc.get("script_privs", ["DBA", "PREPROC_ADMIN"])]
+        if sql == "SELECT GRANTEE, GRANTED_ROLE FROM EXA_DBA_ROLE_PRIVS":
+            return [{"GRANTEE": g, "GRANTED_ROLE": r} for g, r in doc.get("role_privs", [["SYS", "DBA"]])]
+        if sql == "SELECT USER_NAME FROM EXA_DBA_USERS":
+            return [{"USER_NAME": u} for u in doc.get("users", ["SYS", "MCP_READONLY"])]
         if sql == "SELECT POSIX_TIME() AS T":
             # The database clock: this computer's, shifted by clock_skew seconds.
             import time

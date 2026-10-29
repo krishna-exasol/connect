@@ -81,8 +81,7 @@
       ],
       "profile": "java-jdbc",
       "tier": "GA",
-      "status": "gated",
-      "gate": "The service-account key file must live in storage only this connection can read; that isolation is not qualified on Exasol Personal yet."
+      "status": "candidate"
     },
     {
       "id": "s3",

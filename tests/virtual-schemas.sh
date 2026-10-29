@@ -127,7 +127,7 @@ for entry in defs.entries():
         g = dict(given, **({"tls": mode} if mode else {}))
         try:
             v = plan.validate_inputs(c, g)
-            url = plan.jdbc_url(c, v, {"key_path": "/buckets/x/key.json"})
+            url = plan.jdbc_url(c, v, {"key_path": "/buckets/x/key.json", "sa_email": "r@p.iam.gserviceaccount.com"})
             [t.format(**v) for t in c["vs_properties"].values()]
             ok = url.startswith("jdbc:") and "{" not in url and plan.source_host(c, v)
             print("%s/%s %s" % (c["id"], mode or "-", "ok" if ok else "BAD " + url))
@@ -307,11 +307,22 @@ run_secret "$SECRET" connect mssql --name fin --set host=ms.example.com --set da
 check "a loader driver the kit did not register: conflict, exit 3" "3" "$RC"
 check "...its settings.cfg untouched" "JAR=theirs.jar" "$(sed -n 2p "$EXA/jdbc/SQLSERVER/settings.cfg")"
 rm -rf "$EXA/jdbc/SQLSERVER"
-run_secret "{}" connect bigquery --name bq --set project=p --set dataset=d --secret-stdin
+# No shipped connector is gated now; a test-only one keeps the gate honest.
+python3 - "$DEFS" <<'PYG'
+import json, os, shutil, sys
+defs = sys.argv[1]
+cat = json.load(open(os.path.join(defs, "catalog.json")))
+cat["connectors"].append({"id": "gatedtest", "name": "Gated Test", "aliases": ["gt"], "profile": "java-jdbc",
+                          "tier": "GA", "status": "gated", "gate": "its credential is not qualified on Exasol Personal yet"})
+json.dump(cat, open(os.path.join(defs, "catalog.json"), "w"), indent=2)
+os.makedirs(os.path.join(defs, "connectors", "gatedtest"), exist_ok=True)
+shutil.copy(os.path.join(defs, "connectors", "bigquery", "connector.json"), os.path.join(defs, "connectors", "gatedtest"))
+PYG
+run_secret "{}" connect gatedtest --name gt --set project=p --set dataset=d --secret-stdin
 check "a gated connector explains its gate, exit 5" "5" "$RC"; has "...naming it" "not qualified on Exasol Personal yet" "$OUT"
-run connect bigquery --name bq --dry-run
+run connect gatedtest --name gt --dry-run
 check "...before any input is asked for, dry run included" "5" "$RC"; lacks "...no input complaint" "is required" "$OUT"
-run resolve bq
+run resolve gt
 check "resolving a gated connector says so, exit 5 (the wizard asks nothing)" "5" "$RC"; has "...with the reason" "not available yet" "$OUT"
 
 printf '\n== check, issues, reauth ==\n'
@@ -747,6 +758,98 @@ check "the loader class ships as ASCII source, no binary" "0" "$(LC_ALL=C grep -
 check "...defines no trust manager and disables nothing: it only names the CA store" "0" \
     "$(grep -c -E 'TrustManager|checkServerTrusted|HostnameVerifier|setDefault|insecure' "$LOADERSRC")"
 has "...and never overrides a trust store someone already set" 'System.getProperty("javax.net.ssl.trustStore") == null' "$(cat "$LOADERSRC")"
+
+printf '\n== BigQuery: the key as this source'"'"'s file in BucketFS ==\n'
+# Measured against a real project (exakittest): the driver takes the key only
+# as a file (OAuthPvtKeyPath) - in the CONNECTION's password it is refused -
+# reads a 600 file in BucketFS, and needs the account's e-mail in the URL.
+bqkey() { python3 - "$1" "$2" "$3" <<'PYK'
+import json, sys
+json.dump({"type": "service_account", "project_id": "proj", "private_key_id": sys.argv[2],
+           "private_key": "-----BEGIN PRIVATE KEY-----\nMIIfakeKEYbody%s\n-----END PRIVATE KEY-----\n" % sys.argv[2],
+           "client_email": sys.argv[3], "client_id": "1"}, open(sys.argv[1], "w"), indent=2)
+PYK
+}
+bqkey "$WORK/bq1.json" kid1 reader@proj.iam.gserviceaccount.com
+bqkey "$WORK/bq2.json" kid2 reader@proj.iam.gserviceaccount.com
+BQ_SET="--set project=proj --set dataset=sales"
+BQKEY="$EXA/bucketfs/bfsdefault/default/exakit/vs/keys/bq.json"
+bqdb() { db '{"sources": {"www.googleapis.com": {"tables": ["customers", "orders"], "key_id": "'"$1"'"}}'"${2:-}"'}'; }
+bqdb kid1
+OUT="$(eng connect bigquery --name bq $BQ_SET --secret-stdin < "$WORK/bq1.json" 2>&1)"; RC=$?
+check "BigQuery with its key file: exit 0" "0" "$RC"
+has "...the key is staged as this source's file" "Key file staged for bq (owner-only on this computer)" "$OUT"
+has "...and the CONNECTION is said to hold its path, not the key" "Connection EXAKIT_SRC_BQ created (it names the key file, not the key)" "$OUT"
+BQURL="$(dbq 'd["connections"]["EXAKIT_SRC_BQ"]["url"]')"
+has "...the URL names the account and the file's path" \
+    "OAuthServiceAcctEmail=reader@proj.iam.gserviceaccount.com;OAuthPvtKeyPath=/buckets/bfsdefault/default/exakit/vs/keys/bq.json" "$BQURL"
+lacks "...never the key" "PRIVATE KEY" "$BQURL"
+check "...the CONNECTION has no user and no password" '["", ""]' "$(dbq '[d["connections"]["EXAKIT_SRC_BQ"]["user"], d["connections"]["EXAKIT_SRC_BQ"]["secret"]]')"
+check "...the file is owner-only on this computer" "600" "$(python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777)[2:])' "$BQKEY")"
+check "...and holds the key as given" "kid1" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["private_key_id"])' "$BQKEY")"
+lacks "...the private key is not printed" "MIIfakeKEYbody" "$OUT"
+lacks "...nor recorded with the source" "MIIfakeKEYbody" "$(cat "$HOME_K"/sources/bq/*.json 2>/dev/null)"
+lacks "...and nobody else may create scripts on a fresh kit, so no warning" "may create scripts" "$OUT"
+
+python3 - "$STATE" <<'PYP'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d.update({"users": ["SYS", "MCP_READONLY", "ALICE", "BOB", "CAROL"],
+          "role_privs": [["SYS", "DBA"], ["ALICE", "PREPROC_ADMIN"], ["BOB", "ANALYSTS"], ["ANALYSTS", "DEVS"], ["CAROL", "DBA"]],
+          "script_privs": ["DBA", "PREPROC_ADMIN", "DEVS"]})
+json.dump(d, open(sys.argv[1], "w"))
+PYP
+run check bq
+has "check names who may create scripts, through nested roles, admins left out" "may: ALICE, BOB" "$OUT"
+has "...and what to do" "Revoke CREATE SCRIPT from them" "$OUT"
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["script_privs"]=["DBA","PUBLIC"]; json.dump(d, open(sys.argv[1],"w"))' "$STATE"
+run check bq
+has "a grant to PUBLIC names every non-admin user" "may: ALICE, BOB, MCP_READONLY" "$OUT"
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); [d.pop(k) for k in ("users","role_privs","script_privs")]; json.dump(d, open(sys.argv[1],"w"))' "$STATE"
+
+OUT="$(eng reauth bq --secret-stdin < "$WORK/bq2.json" 2>&1)"; RC=$?
+check "reauth with a different key the source refuses: exit 1" "1" "$RC"
+has "...the previous key is kept" "the source refused the new key, so the previous one was kept" "$OUT"
+check "...on disk too, so the source still works" "kid1 ready" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["private_key_id"])' "$BQKEY") $(eng --json check bq 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')"
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["sources"]["www.googleapis.com"]["key_id"]="kid2"; json.dump(d, open(sys.argv[1],"w"))' "$STATE"
+OUT="$(eng reauth bq --secret-stdin < "$WORK/bq2.json" 2>&1)"; RC=$?
+check "reauth with the key the source accepts: exit 0" "0" "$RC"
+check "...the file now holds it, still owner-only" "kid2 600" \
+    "$(python3 -c 'import json,os,sys; print(json.load(open(sys.argv[1]))["private_key_id"], oct(os.stat(sys.argv[1]).st_mode & 0o777)[2:])' "$BQKEY")"
+
+run disconnect bq --dry-run
+has "disconnect plans to drop the key file with the CONNECTION" "the key file /buckets/bfsdefault/default/exakit/vs/keys/bq.json" "$OUT"
+run disconnect bq
+check "...and does: a disconnected source keeps no key" "no" "$([ -f "$BQKEY" ] && echo yes || echo no)"
+OUT="$(eng connect bigquery --name bq $BQ_SET --secret-stdin < "$WORK/bq2.json" 2>&1)"; RC=$?
+check "reconnect with the key: exit 0, the file is back" "0 yes" "$RC $([ -f "$BQKEY" ] && echo yes || echo no)"
+run remove bq
+check "remove deletes the key file" "no" "$([ -f "$BQKEY" ] && echo yes || echo no)"
+
+bqdb kid9
+OUT="$(eng connect bigquery --name bq $BQ_SET --secret-stdin < "$WORK/bq1.json" 2>&1)"; RC=$?
+check "a key the source refuses on first connect: exit 1, nothing kept" "1 {} no" "$RC $(dbq 'd["connections"]') $([ -f "$BQKEY" ] && echo yes || echo no)"
+has "...said as a refused credential, the clock named as a cause" "a service-account sign-in is a token dated by the database's clock" "$OUT"
+printf 'not json' > "$WORK/bqbad.json"
+python3 -c 'import json,sys; json.dump({"type": "authorized_user", "client_id": "x"}, open(sys.argv[1], "w"))' "$WORK/bquser.json"
+bqkey "$WORK/bqsemi.json" kid1 'a;OAuthPvtKeyPath=/x@proj.iam.gserviceaccount.com'
+for case in "bqbad|must be the service-account key file" "bquser|is not a service-account key" "bqsemi|has no usable client_email"; do
+    f="${case%%|*}"; want="${case#*|}"
+    OUT="$(eng connect bigquery --name bq $BQ_SET --secret-stdin < "$WORK/$f.json" 2>&1)"; RC=$?
+    check "$f is refused before anything is staged: exit 2, nothing kept" "2 {} no" "$RC $(dbq 'd["connections"]') $([ -f "$BQKEY" ] && echo yes || echo no)"
+    has "...naming why" "$want" "$OUT"
+done
+BQCLS="$(python3 - "$ROOT" <<'PYC'
+import sys
+sys.path.insert(0, sys.argv[1] + "/setup/virtual-schemas/engine")
+import sql
+print(sql.classify("[Simba][JDBC](10100) Connection Refused: [Simba][JDBC](11640) Required Connection Key(s): OAuthPvtKeyPath"))
+print(sql.classify("[Simba][BigQueryJDBCDriver](100004) HttpTransport IO error : Error getting access token for service account: 400 Bad Request"))
+PYC
+)"
+check "a missing URL property is configuration, not unreachable (measured: 'Connection Refused' misfiled it)" "error" "$(printf '%s\n' "$BQCLS" | sed -n 1p)"
+check "a refused token request is a rejected credential" "auth" "$(printf '%s\n' "$BQCLS" | sed -n 2p)"
 
 printf '\n== a private CA for Oracle: a wallet inside the connection ==\n'
 # Measured against RDS Oracle 19c over TCPS: ojdbc 23 reads a trust-only PEM

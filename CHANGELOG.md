@@ -71,8 +71,9 @@ can now finish setup that only the installer can do.**
 **External sources as virtual schemas: `exakit connect` and `exakit source`.**
 
 - `exakit connect [source]` queries a remote PostgreSQL, MySQL, SQL Server,
-  Oracle or Snowflake from the local database through an Exasol virtual
-  schema (BigQuery is defined but gated on key-file isolation). Search by
+  Oracle, Snowflake or BigQuery - or JSON, CSV and Parquet files in Amazon S3
+  or Azure Blob Storage, mapped to tables by an EDML file - from the local
+  database through an Exasol virtual schema. Search by
   name or alias; on a terminal it asks for each input and shows the plan
   (downloads, objects, the MCP exposure) before changing anything; unattended
   it takes `--set KEY=VALUE` and the credential on stdin or `--password-file`,
@@ -84,6 +85,21 @@ can now finish setup that only the installer can do.**
 - `exakit source list|issues|catalog|show|check|reauth|refresh|disconnect|
   remove`: disconnect drops only the CONNECTION; remove drops the owned
   objects and the downloaded files no other source uses.
+- BigQuery's driver reads its service-account key only from a file, so the
+  kit writes the key to BucketFS as the source's own file (owner-only on this
+  computer); the CONNECTION names its path, never the key. Any database user
+  who may create scripts can read BucketFS, so connect and check name such
+  users other than administrators. disconnect and remove delete the key file;
+  reauth replaces it and keeps the previous one when the new one is refused.
+- Snowflake: the JDBC loader on Exasol Personal trusts no certificate (its
+  Java's CA store is a dangling symlink), and Snowflake's driver reads trust
+  only from that store. The loader's main class is now the kit's
+  `exakit.loader.TrustStoreDriver`, which points it at the language
+  container's own CA store and hands over to the Snowflake driver; nothing
+  is disabled.
+- Windows: the credential reaches the engine base64-encoded, because Windows
+  PowerShell 5.1 re-encodes what it pipes to a native program (non-ASCII
+  characters arrived as '?').
 - `exakit data-load` offers "Connect an external source".
 - Exasol Personal's language containers ship an empty DNS configuration, so
   Java in the database could resolve no host name. Every database start now

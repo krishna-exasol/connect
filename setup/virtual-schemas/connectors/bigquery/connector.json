@@ -43,8 +43,10 @@
     }
   ],
   "auth": "service-account-key",
+  "secret_as_file": true,
+  "auth_hint": "a service-account sign-in is a token dated by the database's clock, so a clock that is off reads as a refused key - if exakit status shows it behind, restart the database; otherwise the key may be deleted or disabled in Google Cloud",
   "host": "www.googleapis.com",
-  "url": "jdbc:bigquery://https://www.googleapis.com/bigquery/v2:443;ProjectId={project};OAuthType=0;OAuthPvtKeyPath={key_path}",
+  "url": "jdbc:bigquery://https://www.googleapis.com/bigquery/v2:443;ProjectId={project};OAuthType=0;OAuthServiceAcctEmail={sa_email};OAuthPvtKeyPath={key_path}",
   "tls": null,
   "vs_properties": {
     "CATALOG_NAME": "{project}",
@@ -52,6 +54,8 @@
   },
   "notes": [
     "Rows come back as VALUES from the adapter itself - meant for small results (upstream warns at a few thousand rows). BIGQUERY_ENABLE_IMPORT stays off.",
-    "Gated: the key file must be readable by this connection's adapter only. Until that isolation is qualified, `exakit connect bigquery` explains the gate and stops."
+    "The credential is the service-account key file (JSON) Google Cloud creates, through --password-file. The driver reads it only from a file, so the kit writes it to BucketFS as this source's own file, owner-only on this computer, and the CONNECTION names its path - not the key. Measured: a key in the CONNECTION's password is refused (OAuthPvtKeyPath required).",
+    "Any database user who may create scripts can read files in BucketFS. connect and check name such users (other than administrators); today that is nobody on a fresh kit. disconnect and remove delete the key file; reauth replaces it, keeping the previous one when the new one is refused.",
+    "Give the service account only BigQuery Job User on the project and BigQuery Data Viewer (READER) on the dataset. The sign-in is a token dated by the database's clock: after the computer slept, restart the database if the key is refused."
   ]
 }

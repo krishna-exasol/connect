@@ -3461,7 +3461,7 @@ function Invoke-CmdConnect {
     $secretSpec = @($definition.inputs) | Where-Object { $_.kind -in @("secret", "secret-file") } | Select-Object -First 1
     $secret = ""
     if ($secretSpec) {
-        $secret = Read-ExakitVsSecret -Label $secretSpec.label -PasswordFile $pwFile
+        $secret = Read-ExakitVsSecret -Label $secretSpec.label -PasswordFile $pwFile -Kind ("" + $secretSpec.kind)
         if (-not $secret) { Deny-ExakitInput "No $("$($secretSpec.label)".ToLower()) was given (pipe it on standard input or use --password-file)." }
         $code = Invoke-ExakitVsRun -Arguments (@("connect") + $base + @("--secret-stdin")) -Secret $secret
     } else {
@@ -3532,7 +3532,9 @@ function Invoke-CmdSource {
                 if ($json) { foreach ($line in $shown.Lines) { Write-Output $line } } else { [void](Show-ExakitVsLines -Lines $shown.Lines) }
                 exit $shown.Code
             }
-            $secret = Read-ExakitVsSecret -Label "New credential for $name" -PasswordFile $pwFile
+            $shownConnector = ""
+            foreach ($line in $shown.Lines) { if ("$line" -like "RESULT *") { $shownConnector = "" + ("$line".Substring(7) | ConvertFrom-Json).connector } }
+            $secret = Read-ExakitVsSecret -Label "New credential for $name" -PasswordFile $pwFile -Kind (Get-ExakitVsSecretKind -Connector $shownConnector)
             if (-not $secret) { Deny-ExakitInput "No credential was given." }
             $code = Invoke-ExakitVsRun -Arguments ($argv + @("reauth", $name, "--secret-stdin")) -Secret $secret
             $secret = $null

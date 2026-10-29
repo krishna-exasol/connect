@@ -28,6 +28,7 @@ import plan as planner
 import sources
 import sql
 import tlsca
+import keyfile
 import tlshelper
 
 PROBE = "EXAKIT_DNS_PROBE_V2"
@@ -262,6 +263,64 @@ class Engine(object):
                 created["files"].append(path)
         return relative
 
+    def key_file(self, name):
+        return self.runtime.bucket_dir("keys", name + ".json")
+
+    def write_key(self, path, text):
+        """Owner-only on this computer; the adapter reads it all the same (measured)."""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        partial = path + ".part"
+        fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.chmod(partial, 0o600)
+        os.replace(partial, path)
+
+    def stage_key(self, name, text, created):
+        """The service-account key as this source's file in BucketFS; the path the URL names."""
+        path = self.key_file(name)
+        self.write_key(path, text)
+        self.store.add_consumer(path, hashlib.sha256(text.encode("utf-8")).hexdigest(), name, True)
+        if path not in created["files"]:
+            created["files"].append(path)
+        return self.runtime.bucket_sql("keys", name + ".json")
+
+    def script_readers(self):
+        """Users other than administrators who may create scripts - and so
+        could read any file in BucketFS, a key file included. Roles are
+        followed through grants; PUBLIC counts for every user."""
+        db = self.db()
+        holders = {r["GRANTEE"] for r in db.query(
+            "SELECT GRANTEE FROM EXA_DBA_SYS_PRIVS WHERE PRIVILEGE IN ('CREATE SCRIPT', 'CREATE ANY SCRIPT')")}
+        grants = {}
+        for row in db.query("SELECT GRANTEE, GRANTED_ROLE FROM EXA_DBA_ROLE_PRIVS"):
+            grants.setdefault(row["GRANTEE"], set()).add(row["GRANTED_ROLE"])
+        readers = []
+        for user in sorted(r["USER_NAME"] for r in db.query("SELECT USER_NAME FROM EXA_DBA_USERS")):
+            seen, todo = set(), [user, "PUBLIC"]
+            while todo:
+                current = todo.pop()
+                if current not in seen:
+                    seen.add(current)
+                    todo.extend(grants.get(current, ()))
+            if user != "SYS" and "DBA" not in seen and seen & holders:
+                readers.append(user)
+        return readers
+
+    def warn_key_readers(self, connector, name):
+        if not connector.get("secret_as_file"):
+            return
+        try:
+            readers = self.script_readers()
+        except sql.DbError as error:
+            self.emit("WARN", "Could not list who may create scripts (%s); any such user can read %s's key file"
+                      % (error, name))
+            return
+        if readers:
+            self.emit("WARN", "%s's key file is in BucketFS, which any user who may create scripts can read - and %s "
+                      "may: %s. Revoke CREATE SCRIPT from them, or accept that they can read this key"
+                      % (name, "this user" if len(readers) == 1 else "these users", ", ".join(readers)))
+
     def stage_mapping(self, values, name, created):
         """The EDML files, copied into mappings/<name>/ in the kit's bucket
         folder; the MAPPING property that names that folder for the adapter
@@ -411,6 +470,16 @@ class Engine(object):
         """(url, user, secret, hidden, notes) for the CONNECTION: a JDBC URL with
         the user's password, or - for a document source - an empty URL and
         user with the credential JSON as the secret."""
+        if connector.get("secret_as_file"):
+            # The key goes to a file in BucketFS, never into the CONNECTION:
+            # no user, no password, and the URL names only the file's path.
+            try:
+                _email, _project, text, hidden = keyfile.service_account(secret)
+            except keyfile.KeyFileError as error:
+                failure = Failure(str(error), EXIT["input"])
+                failure.complete = True
+                raise failure
+            return None, None, text, hidden, []
         if connector.get("credential"):
             try:
                 text, hidden, notes = document.credential(connector["credential"], values, secret)
@@ -560,12 +629,20 @@ class Engine(object):
                 mapping_path = None
                 if values.get("mapping") and not reconnect:
                     mapping_path = self.stage_mapping(values, name, created)
+                key_path = sa_email = None
+                if connector.get("secret_as_file"):
+                    sa_email = keyfile.service_account(conn_secret)[0]
+                    key_path = self.stage_key(name, conn_secret, created)
+                    conn_secret = None
+                    self.emit("OK", "Key file staged for %s (owner-only on this computer)" % name)
                 if url is None:
-                    url = planner.jdbc_url(connector, values, {"ca_pem": ca_pem, "truststore": truststore})
+                    url = planner.jdbc_url(connector, values, {"ca_pem": ca_pem, "truststore": truststore,
+                                                               "key_path": key_path, "sa_email": sa_email})
                 self.create_connection(names, url, user, conn_secret, replace=reconnect, hidden=hidden)
                 if not reconnect:
                     made("connection")
-                self.emit("OK", "Connection %s created (the credential lives only in the database)" % names["connection"])
+                self.emit("OK", "Connection %s created (%s)" % (names["connection"], "it names the key file, not the key"
+                                                                     if key_path else "the credential lives only in the database"))
                 if not reconnect:
                     self.db().execute(self.adapter_sql(names, jars, profile))
                     made("script")
@@ -576,6 +653,7 @@ class Engine(object):
                         self.db().execute(self.import_sql(connector, names, jars, profile))
                     self.db().execute(self.vs_sql(connector, names, values, {"mapping_path": mapping_path}))
                     made("schema")
+                self.warn_key_readers(connector, name)
                 tables, read, how, empty = self.verify(connector, names["schema"])
                 for note in notes:
                     self.emit("INFO", note.replace("<name>", name))
@@ -635,6 +713,9 @@ class Engine(object):
                 record["tls_ca"] = ca_pem
             if truststore:
                 record["tls_truststore"] = truststore
+            if key_path:
+                record["key_file"] = key_path
+                record["sa_email"] = sa_email
             self.store.save_config(name, record)
             self.store.save_status(name, {"status": "ready", "pins": pins, "tables": len(tables),
                                           "last_check": {"at": sources.now(), "outcome": "ok",
@@ -699,6 +780,7 @@ class Engine(object):
         try:
             self.warn_clock()
             self.require_route(connector, config["inputs"], name)
+            self.warn_key_readers(connector, name)
             tables, read, how, empty = self.verify(connector, names["schema"])
         except (Failure, sql.DbError) as error:
             kind = getattr(error, "kind", "error")
@@ -730,6 +812,8 @@ class Engine(object):
             raise Failure("reauth needs the new credential on standard input", EXIT["input"])
         connector = self.defs.connector(config["connector"])
         inputs = dict(config["inputs"])
+        if connector.get("secret_as_file"):
+            return self.reauth_key(name, config, connector, secret)
         if connector.get("credential") and secret.lstrip().startswith("{"):
             # A new credential file names its own key; the recorded key ID is the old one.
             inputs.pop("access_key_id", None)
@@ -751,6 +835,33 @@ class Engine(object):
         for note in notes:
             self.emit("INFO", note.replace("<name>", name))
         return self.check(name)
+
+    def reauth_key(self, name, config, connector, secret):
+        """A new key file, tried by the check before it is kept: when the
+        source refuses it, the previous file and CONNECTION come back."""
+        url, user, text, hidden, notes = self.credential(connector, config["inputs"], secret)
+        email = keyfile.service_account(text)[0]
+        path = self.key_file(name)
+        with open(path, encoding="utf-8") as handle:
+            previous = handle.read()
+        old_url = planner.jdbc_url(connector, config["inputs"], {"key_path": config["key_file"],
+                                                                  "sa_email": config["sa_email"]})
+        new_url = planner.jdbc_url(connector, config["inputs"], {"key_path": config["key_file"], "sa_email": email})
+        with self.store.lock():
+            self.write_key(path, text)
+            self.create_connection(config["objects"], new_url, None, None, replace=True, hidden=hidden)
+            result = self.check(name)
+            if result.get("status") != "ready":
+                self.write_key(path, previous)
+                self.create_connection(config["objects"], old_url, None, None, replace=True)
+                self.check(name)
+                raise Failure("the source refused the new key, so the previous one was kept: %s"
+                              % result.get("error", "the check failed"), EXIT["failed"], result.get("kind", "error"))
+            config["sa_email"] = email
+            self.store.save_config(name, config)
+            self.store.add_consumer(path, hashlib.sha256(text.encode("utf-8")).hexdigest(), name, False)
+        self.emit("OK", "Key file replaced for %s" % name)
+        return result
 
     def try_credential(self, connector, names, url, user, secret):
         if not connector.get("etl"):
@@ -785,7 +896,11 @@ class Engine(object):
     def disconnect(self, name, dry_run=False):
         config = self.store.config(name)
         connection = config["objects"]["connection"]
-        plan = {"name": name, "drop": ["CONNECTION %s" % connection],
+        drop = ["CONNECTION %s" % connection]
+        if config.get("key_file"):
+            # The key file is the credential: a disconnected source keeps none.
+            drop.append("the key file %s" % config["key_file"])
+        plan = {"name": name, "drop": drop,
                 "keep": ["virtual schema %s" % config["objects"]["schema"], "adapter script", "staged files",
                          "the source record (marked disconnected)"],
                 "note": "queries on %s fail until it is reconnected; sessions already running are not cancelled, "
@@ -795,6 +910,8 @@ class Engine(object):
         with self.store.lock():
             if self.exists("connection", connection):
                 self.db().execute("DROP CONNECTION %s" % sql.ident(connection))
+            if config.get("key_file") and os.path.isfile(self.key_file(name)):
+                os.remove(self.key_file(name))
             self.store.update_status(name, status="disconnected", disconnected_at=sources.now())
         return plan
 

@@ -101,17 +101,37 @@ function Show-ExakitVsLines {
 }
 
 function Read-ExakitVsSecret {
-    param([string]$Label, [string]$PasswordFile = "")
+    param([string]$Label, [string]$PasswordFile = "", [string]$Kind = "secret")
     if ($PasswordFile) {
         if (-not (Test-Path -LiteralPath $PasswordFile)) { Deny-ExakitInput "Cannot read $PasswordFile" }
         return ((Get-Content -Raw -LiteralPath $PasswordFile) -replace "[\r\n]+$", "")
     }
     if (-not (Test-ExakitInteractive)) { Deny-ExakitInput "No $Label was given: use --password-file (a credential is never taken as an argument)." }
+    if ($Kind -eq "secret-file") {
+        # A key file is asked for by its path - nobody pastes a JSON key into a hidden prompt.
+        $path = Read-ExakitPrompt "$Label - path to the file" ""
+        if ($path -like "~*") { $path = $HOME + $path.Substring(1) }
+        if (-not $path -or -not (Test-Path -LiteralPath $path)) { Deny-ExakitInput "Cannot read $path" }
+        return ((Get-Content -Raw -LiteralPath $path) -replace "[\r\n]+$", "")
+    }
     Write-Host ("    {0}?{1} {2} (input hidden): " -f $script:UiAsk, $script:UiReset, $Label) -NoNewline
     $secure = Read-Host -AsSecureString
     $ptr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
     try { return [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) }
     finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
+}
+
+# Get-ExakitVsSecretKind - the kind of a connector's credential input (secret
+# or secret-file), empty when it has none. Twin of _exakit_vs_secret_kind.
+function Get-ExakitVsSecretKind {
+    param([string]$Connector)
+    $defs = Get-ExakitVsDefs
+    if (-not $defs -or -not $Connector) { return "" }
+    $file = Join-ExakitCorePath $defs "connectors" $Connector "connector.json"
+    if (-not (Test-Path -LiteralPath $file)) { return "" }
+    $spec = @((Get-Content -Raw -LiteralPath $file | ConvertFrom-Json).inputs) | Where-Object { $_.kind -in @("secret", "secret-file") } | Select-Object -First 1
+    if ($spec) { return "" + $spec.kind }
+    return ""
 }
 
 function Confirm-ExakitVs {
