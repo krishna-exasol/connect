@@ -20,6 +20,13 @@
     "install shows no cards at all, so every line here is read by someone who",
     "already had the kit working and wants to know what is different."
   ],
+  "0.3.0": [
+    "Install step 4 sets up the SQL preprocessor framework in Exasol.",
+    "It is tested in one session before it becomes the database default.",
+    "A preprocessor you set up yourself is left alone and reported.",
+    "exakit update now finishes setup that only the installer can do.",
+    "From 0.2.2, run exakit update twice; from here on, once is enough."
+  ],
   "0.2.2": [
     "The launcher now downloads from Exasol's own server (S3), verified.",
     "If that server is unreachable, the verified GitHub release is used.",

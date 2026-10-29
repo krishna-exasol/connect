@@ -27,6 +27,47 @@ typed by a password manager the moment the prompt appeared was echoed in clear
 first, restores the terminal's exact state afterwards and on Ctrl-C, and
 refuses to read where echo cannot be turned off.
 
+## 0.3.0
+
+**The SQL preprocessor framework is a core component, and `exakit update`
+can now finish setup that only the installer can do.**
+
+- The installer has a seventh step, **Step 4/7 Configure database features**,
+  right after exapump and before any data is loaded. It installs the pinned
+  [preprocessor framework](https://github.com/exasol-labs/preprocessor-framework)
+  (`components.preprocessor` in versions.json) as a **core-only package**: the
+  downloaded `release.sql` is verified against its SHA-256, its one `PYTHON3`
+  script (the registry resolver behind `PREPROC INSTALL MODULE ... FROM <url>`)
+  is left out because local deployments ship no script language container,
+  and the result is verified against a second pin (`sha256.core-only`). The
+  dispatcher, rules, refresh and `PREPROC` commands are Lua and complete; the
+  kit registers add-on modules itself. The step then tries
+  `PREPROC_RT.MASTER` in one session with ordinary SQL and
+  a module scoped to the kit's admin user, then makes it the database default
+  and verifies again in fresh connections. A failure after the default
+  changed puts the previous setting back. A slot holding another script, or a
+  framework the kit did not install, is left exactly as it is and reported in
+  the closing summary. The step runs on every installer pass: an installed
+  framework is verified, never reinstalled (`release.sql` is clean-install
+  only); only the kit's own interrupted install is ever dropped.
+- **Core tasks.** `setup/core/tasks.json` names setup a release adds that only
+  the installer can do; `core_tasks.completed` in the laptop's manifest
+  records what passed its checks. `exakit update` reruns the downloaded
+  installer once when a task is pending - without asking the first install's
+  questions again and with every component pinned to what is installed - and
+  defers a database task while the database is stopped. `--json` reports it
+  as the `core-setup` component.
+- **Handover.** An `exakit update` that downloads a newer kit hands the rest
+  of the run to the new updater, so one run is enough from 0.3.0 on. Coming
+  from 0.2.2, run `exakit update` twice (the 0.2.2 updater cannot hand over),
+  or re-run the installer once.
+- `setup/preprocessor/` holds the package description, the dispatch probe,
+  the (empty) list of tested upgrade paths and the folder add-ons will
+  register their modules from. No bundled add-on needs the slot yet.
+- CI: versions.json requires the `preprocessor` block, hashes the pinned
+  `release.sql`, and runs `tests/core-setup.{sh,ps1}` and
+  `tests/preprocessor-lifecycle.{sh,ps1}`.
+
 ## 0.2.2
 
 **The Personal launcher comes from Exasol's S3 bucket first, verified, with

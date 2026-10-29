@@ -2,7 +2,7 @@
   "schema_version": 1,
   "updated": "2026-10-28",
   "kit": {
-    "version": "0.2.2"
+    "version": "0.3.0"
   },
   "components": {
     "personal": {
@@ -89,6 +89,18 @@
       "version": "1.12.1",
       "package": "dbt-exasol",
       "severity": "normal"
+    },
+    "preprocessor": {
+      "version": "0.9.1",
+      "min_kit_version": "0.3.0",
+      "repo": "exasol-labs/preprocessor-framework",
+      "release": "v0.9.1",
+      "asset": "release.sql",
+      "severity": "normal",
+      "sha256": {
+        "release-sql": "8bb8219ac944aaaa8616a32a6c759c303a75b606901f30343adc9a35a7f3facf",
+        "core-only": "8ac590708f3a7d0aeda6599f363529b28c4ffed4a55f306252fe2ed7b16ccc70"
+      }
     }
   }
 }

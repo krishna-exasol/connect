@@ -27,6 +27,10 @@ if (Test-Path $legacyModule) { . $legacyModule }
 . (Join-Path $LibDir "exapump.ps1")
 . (Join-Path $LibDir "mcp.ps1")
 . (Join-Path $LibDir "pyexasol.ps1")
+# Core setup tasks (Step 4, Configure database features). Twin of the
+# core-setup.sh load in setup-macos.sh / setup-linux.sh.
+$coreSetupModule = Join-Path $LibDir "core-setup.ps1"
+if (Test-Path $coreSetupModule) { . $coreSetupModule }
 # Marketplace add-on modules: sourcing installs NOTHING - the modules are
 # needed only so the closing marketplace offer can install what the user says
 # yes to. A module missing from an older kit copy just skips its row.
@@ -92,12 +96,12 @@ try {
     # --- step 2: the launcher --------------------------------------------------
     # Its own step, matching the macOS shape and heading. Twin of the same
     # split in setup-macos.sh and setup-linux.sh.
-    if (Begin-ExakitStep "launcher" "Step 1/6  Exasol launcher") {
+    if (Begin-ExakitStep "launcher" "Step 1/7  Exasol launcher") {
         Install-PersonalLauncher
         Set-ExakitStepDone "launcher"
     }
 
-    if (Begin-ExakitStep "runtime" "Step 2/6  Local database deployment") {
+    if (Begin-ExakitStep "runtime" "Step 2/7  Local database deployment") {
         $script:PersonalNoDatabase = $false
         Install-PersonalDeployment
         if ($script:PersonalNoDatabase) {
@@ -170,7 +174,7 @@ try {
     }
 
     # --- step 3: exapump (data loading CLI) ------------------------------------
-    if ($dbReady -and $exapumpSupported -and (Begin-ExakitStep "exapump" "Step 3/6  exapump (data loading CLI)")) {
+    if ($dbReady -and $exapumpSupported -and (Begin-ExakitStep "exapump" "Step 3/7  exapump (data loading CLI)")) {
         # Three lines for this step, not nine. Invoke-ExakitLogged animates the
         # label Begin-ExakitStep set, so the Info bullets under it were the
         # second telling. What survives goes through OkStep: what was installed
@@ -193,11 +197,29 @@ try {
     } elseif (-not $exapumpSupported) {
         # Say which step is not happening. Begin-ExakitStep is the only thing
         # that prints a step label, so gating the whole call made the screen
-        # jump from "Step 2/6" to "Step 5/6" - which reads as output that got
+        # jump from "Step 2/7" to "Step 6/7" - which reads as output that got
         # lost, not as two steps this machine does not need. Twin of
         # kit_shared_steps (common.sh), which prints this same line when a
         # step is not part of the installation.
-        Info "Step 3/6  exapump - not part of this installation, skipping"
+        Info "Step 3/7  exapump - not part of this installation, skipping"
+    }
+
+    # --- step 4: Configure database features --------------------------------------
+    # Right after exapump: the database is up and exapump can run the setup SQL,
+    # and nothing has loaded data or connected an AI client yet. The core tasks
+    # of scope "database" run here (today the SQL preprocessor framework) -
+    # installed when missing, verified on every pass. A task that fails is booked
+    # in the closing summary and the steps after it still run. Twin of the same
+    # block in kit_shared_steps (common.sh).
+    $featureLabel = "Step 4/7  Configure database features"
+    if (-not $dbReady) {
+        # already said above - nothing more to add here
+    } elseif (-not (Get-Command Invoke-ExakitCoreDatabaseStep -ErrorAction SilentlyContinue)) {
+        Info "$featureLabel - not part of this installation, skipping"
+    } elseif (-not $exapumpSupported -or (Test-ExakitSoftFailed "exapump")) {
+        Info "$featureLabel - skipped: it runs its setup through exapump, which is not installed"
+    } else {
+        Invoke-ExakitCoreDatabaseStep -Label $featureLabel -KitRoot $KitRoot
     }
 
     # Load the sample data before any MCP configuration. exapump is now up
@@ -210,6 +232,9 @@ try {
         # already said above - nothing more to add here
     } elseif ($exapumpSupported -and (Test-ExakitSoftFailed "exapump")) {
         Info "Skipping the sample data - it is loaded with exapump, which is not installed"
+    } elseif ((Get-Command Test-ExakitCoreRerunActive -ErrorAction SilentlyContinue) -and (Test-ExakitCoreRerunActive)) {
+        # An installer an update started to finish new setup: the datasets were
+        # the first install's question, and its answer stands.
     } elseif ($exapumpSupported) {
         # YOUR OWN DATA FIRST, THEN THE SAMPLE. The copy out of the old
         # container needs three things this point in the run is the first to
@@ -223,7 +248,7 @@ try {
         # THE BRIDGE'S DOWNLOAD STARTS HERE, not two steps later. Priming the
         # MCP package is a network download and an unpack; the load below is a
         # local database reading local files. Neither needs the other, so the
-        # download runs underneath the load and Step 4 collects a finished one.
+        # download runs underneath the load and Step 5 collects a finished one.
         # See Start-ExakitMcpPrefetch. Twin of the same call in kit_shared_steps.
         if (Get-Command Start-ExakitMcpPrefetch -ErrorAction SilentlyContinue) {
             try { Start-ExakitMcpPrefetch } catch { }
@@ -234,8 +259,8 @@ try {
             -Body { Request-ExakitDataLoadOffer -KitRoot $KitRoot })
     }
 
-    # --- step 3: AI bridge (server, clients, skills) ----------------------------
-    if ($dbReady -and $exapumpSupported -and (Begin-ExakitStep "mcp" "Step 4/6  AI bridge (MCP server, clients and skills)")) {
+    # --- step 5: AI bridge (server, clients, skills) ----------------------------
+    if ($dbReady -and $exapumpSupported -and (Begin-ExakitStep "mcp" "Step 5/7  AI bridge (MCP server, clients and skills)")) {
         if (Invoke-ExakitSoftStep -Component "mcp" -Repair "exakit update" -Body {
                 # One line for this step's server work: the spinner narrates
                 # the prime and the handshake, so the Info/Ok pairs beneath
@@ -255,7 +280,7 @@ try {
             Set-ExakitStepDone "mcp"
         }
     } elseif (-not $exapumpSupported) {
-        Info "Step 4/6  AI bridge (MCP server, clients and skills) - not part of this installation, skipping"
+        Info "Step 5/7  AI bridge (MCP server, clients and skills) - not part of this installation, skipping"
     }
 
     # The AI bridge is finished HERE, in the step that says it is being built:
@@ -278,19 +303,25 @@ try {
     # installed and a read-only database user it never provisioned. The skills
     # offer below stays unconditional: skills are documents an AI client reads,
     # and they are just as useful with the database alone.
-    if ($dbReady -and $exapumpSupported) {
+    # Neither offer is asked again by an installer an update started to finish
+    # new setup: which clients and skills to wire was the first install's
+    # question. Twin of the same guard in kit_shared_steps.
+    $coreRerun = (Get-Command Test-ExakitCoreRerunActive -ErrorAction SilentlyContinue) -and (Test-ExakitCoreRerunActive)
+    if ($dbReady -and $exapumpSupported -and -not $coreRerun) {
         [void](Invoke-ExakitBestEffort -Component "mcp_clients" -Repair "exakit mcp-setup" `
             -Label "AI client (MCP) setup" `
             -Warning "Your local runtime is installed, but MCP client setup did not finish cleanly." `
             -Body { Request-ExakitMcpSetupOffer })
     }
 
-    [void](Invoke-ExakitBestEffort -Component "skills" -Repair "exakit skills-install" `
-        -Label "AI skills" `
-        -Warning "Skills install did not finish cleanly." `
-        -Body { Request-ExakitSkillsInstallOffer })
+    if (-not $coreRerun) {
+        [void](Invoke-ExakitBestEffort -Component "skills" -Repair "exakit skills-install" `
+            -Label "AI skills" `
+            -Warning "Skills install did not finish cleanly." `
+            -Body { Request-ExakitSkillsInstallOffer })
+    }
 
-    # --- step 5: pyexasol (Exasol Python driver) --------------------------------
+    # --- step 6: pyexasol (Exasol Python driver) --------------------------------
     # Not gated on $exapumpSupported: pyexasol is pure Python via uv, so it
     # works on Windows-on-ARM too, where only exapump's binary is missing.
     # A failed pyexasol install must not end the run: the exakit helper step
@@ -301,7 +332,7 @@ try {
     # soft in name only: the driver could install fine and any Fail() raised while
     # validating (an unwritable manifest, say) still ended the run before the
     # exakit helper below existed. Install and validate are one isolated unit.
-    if ($dbReady -and (Begin-ExakitStep "pyexasol" "Step 5/6  pyexasol (Exasol Python driver)")) {
+    if ($dbReady -and (Begin-ExakitStep "pyexasol" "Step 6/7  pyexasol (Exasol Python driver)")) {
         # Two lines for this step, not five: the outcome, and the interpreter to
         # run it with. Everything between is in the logfile, and the spinner
         # covered it live. Twin of _exakit_install_pyexasol (common.sh).
@@ -320,12 +351,12 @@ try {
         }
     }
 
-    # --- step 6: exakit helper command ------------------------------------------
+    # --- step 7: exakit helper command ------------------------------------------
     # The step flag alone is not trusted: if the shim was removed (cleanup,
     # testing, older builds), a re-run must reinstall it rather than skip -
     # and the PATH check must run either way, since the PATH entry can be
     # missing even when the step is marked done.
-    $helperNeeded = Begin-ExakitStep "exakit_helper" "Step 6/6  exakit helper command"
+    $helperNeeded = Begin-ExakitStep "exakit_helper" "Step 7/7  exakit helper command"
     if (-not $helperNeeded -and -not (Test-Path (Join-Path $script:BinDir "exakit.cmd"))) {
         Info "exakit command is missing - reinstalling it"
         $helperNeeded = $true
@@ -377,6 +408,7 @@ try {
         if (-not $kitSetupInPlace) {
             foreach ($stale in @(
                 (Join-Path $kitSetupDir "lib"), (Join-Path $kitSetupDir "help"),
+                (Join-Path $kitSetupDir "core"), (Join-Path $kitSetupDir "preprocessor"),
                 (Join-Path $script:ExakitHome "kit\mcp"), (Join-Path $script:ExakitHome "kit\sql"),
                 (Join-Path $script:ExakitHome "kit\skills"))) {
                 Remove-Item -Recurse -Force $stale -ErrorAction SilentlyContinue
@@ -384,6 +416,12 @@ try {
         }
         Copy-ExakitAsset -Source $LibDir -Destination (Join-Path $kitSetupDir "lib")
         Copy-ExakitAsset -Source (Join-Path $ScriptDir "exakit.ps1") -Destination (Join-Path $kitSetupDir "exakit.ps1")
+        # setup\core and setup\preprocessor are what `exakit update` reads to decide
+        # whether this kit asks for setup this machine has not finished. Twin of
+        # the same copy in kit_shared_steps.
+        foreach ($coreDir in @("core", "preprocessor")) {
+            Copy-ExakitAsset -Source (Join-Path $ScriptDir $coreDir) -Destination (Join-Path $kitSetupDir $coreDir)
+        }
         # skills/ is not optional decoration: exakit skills, exakit
         # skills-install and the post-install skills step all resolve through
         # the repo-root lookup, which PREFERS this staged copy. Omitting it does
@@ -457,10 +495,14 @@ try {
         -Label "automatic start" `
         -Warning "Automatic start could not be turned on." `
         -Body { Enable-ExakitAutostartDefault })
-    [void](Invoke-ExakitBestEffort -Component "marketplace" -Repair "exakit marketplace" `
-        -Label "marketplace add-ons" `
-        -Warning "The marketplace offer did not finish cleanly." `
-        -Body { Request-ExakitMarketplaceOffer })
+    # Not asked again by an installer an update started to finish new setup:
+    # the first install already made that offer.
+    if (-not $coreRerun) {
+        [void](Invoke-ExakitBestEffort -Component "marketplace" -Repair "exakit marketplace" `
+            -Label "marketplace add-ons" `
+            -Warning "The marketplace offer did not finish cleanly." `
+            -Body { Request-ExakitMarketplaceOffer })
+    }
     # A rule, then a heading: the last line on screen is where the reader is
     # left, and run together with whatever the marketplace printed it read as
     # one more of its bullets. The rule gives it air; the green arrow says it

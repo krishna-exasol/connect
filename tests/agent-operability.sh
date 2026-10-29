@@ -1534,7 +1534,7 @@ done
 _p2kss="$(sed -n '/^kit_shared_steps()/,/^}/p' "$ROOT/setup/lib/common.sh")"
 has "the db-dependent steps are skipped in one line"     "they all need the database, which is not installed" "$_p2kss"
 has "...decided by the recorded failure" 'exakit_soft_failed runtime' "$_p2kss"
-check "...guarding all four of them" "4"     "$(printf '%s' "$_p2kss" | grep -c 'if \[ "$_kss_nodb" = 1 \]')"
+check "...guarding all five of them (exapump, database features, data, AI bridge, pyexasol)" "5"     "$(printf '%s' "$_p2kss" | grep -c 'if \[ "$_kss_nodb" = 1 \]')"
 has "...and the exakit helper still runs" "begin_step exakit_helper" "$_p2kss"
 
 # THE WINDOWS TWIN. There the LAUNCHER installs Podman, through winget, so the

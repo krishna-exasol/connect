@@ -36,6 +36,7 @@ if [ -f "$LIB_DIR/legacy-crossing.sh" ]; then . "$LIB_DIR/legacy-crossing.sh" ||
 if [ -f "$LIB_DIR/exapump.sh" ];  then . "$LIB_DIR/exapump.sh"  || die "Could not load $LIB_DIR/exapump.sh (corrupted kit copy? re-download and re-run)"; fi
 if [ -f "$LIB_DIR/mcp.sh" ];      then . "$LIB_DIR/mcp.sh"      || die "Could not load $LIB_DIR/mcp.sh (corrupted kit copy? re-download and re-run)"; fi
 if [ -f "$LIB_DIR/pyexasol.sh" ]; then . "$LIB_DIR/pyexasol.sh" || die "Could not load $LIB_DIR/pyexasol.sh (corrupted kit copy? re-download and re-run)"; fi
+if [ -f "$LIB_DIR/core-setup.sh" ]; then . "$LIB_DIR/core-setup.sh" || die "Could not load $LIB_DIR/core-setup.sh (corrupted kit copy? re-download and re-run)"; fi
 
 exakit_init_logging
 # Where the bootstrap time went, in the log: the installer stamps its start,
@@ -77,13 +78,13 @@ EXAKIT_CURRENT_STEP="requirements"
 personal_check_requirements
 
 # --- step 2: launcher -------------------------------------------------------
-if begin_step launcher "Step 1/6  Exasol launcher"; then
+if begin_step launcher "Step 1/7  Exasol launcher"; then
     personal_install_launcher
     mark_step launcher
 fi
 
 # --- step 3: local deployment ----------------------------------------------
-if begin_step runtime "Step 2/6  Local database deployment"; then
+if begin_step runtime "Step 2/7  Local database deployment"; then
     # personal_deploy_local returns non-zero for ONE reason: Podman is not here
     # and the kit was not allowed, or not able, to install it. Everything else
     # in there still stops the run, because a deployment that half exists is
@@ -142,8 +143,8 @@ else
     fi
 fi
 
-# --- steps 3-6: exapump, MCP server, pyexasol, exakit helper (shared) -------
-kit_shared_steps 3 6 "$SCRIPT_DIR" "$KIT_ROOT"
+# --- steps 3-7: exapump, database features, MCP server, pyexasol, exakit helper
+kit_shared_steps 3 7 "$SCRIPT_DIR" "$KIT_ROOT"
 
 # The other half of the crossing. Last, because it needs all three things the
 # steps above provide: a database that is up, an exapump binary, and a profile
@@ -176,7 +177,11 @@ exakit_print_ready_line
 # `exakit autostart off` survives a re-run of the installer. This runs BEFORE
 # the marketplace offer so an add-on installed from it joins the boot set.
 exakit_autostart_default_on || true
-( exakit_marketplace_offer ) || true
+# Not asked again by an installer an update started to finish new setup: the
+# first install already made that offer.
+if ! { command -v exakit_core_rerun_active >/dev/null 2>&1 && exakit_core_rerun_active; }; then
+    ( exakit_marketplace_offer ) || true
+fi
 # A rule, then a heading: the last line on screen is where the reader is left,
 # and run together with whatever the marketplace printed it read as one more of
 # its bullets. The rule gives it air; the green arrow says it is not a step.

@@ -88,7 +88,7 @@ jobs:
 
           expected = {"personal", "exapump", "mcp", "pyexasol", "skills",
                       "dash-server", "exasol-vscode", "json-tables",
-                      "exasol-scheduler", "dbt-exasol"}
+                      "exasol-scheduler", "dbt-exasol", "preprocessor"}
           components = doc.get("components") or {}
           if set(components) != expected:
               problems.append("components must be exactly %s, found %s"
@@ -171,6 +171,25 @@ jobs:
           for platform, digest in digests.items():
               if not isinstance(digest, str) or not digest_re.match(digest):
                   problems.append("components.exasol-scheduler.sha256.%s is not a 64-character hex digest" % platform)
+
+          # The SQL preprocessor framework is a core component: the installer's
+          # database step downloads ONE release asset (release.sql) by exact URL
+          # and refuses it unless it matches "release-sql", then runs the
+          # core-only text derived from it (its PYTHON3 scripts left out) only
+          # if that matches "core-only". Keys are not file names: the kit's
+          # dot-path readers split on ".", so "release.sql" could never be read.
+          preprocessor = components.get("preprocessor") or {}
+          for key in ("repo", "release", "asset", "min_kit_version"):
+              if not preprocessor.get(key):
+                  problems.append("components.preprocessor.%s is missing" % key)
+          if preprocessor.get("release") and preprocessor.get("release") != "v%s" % preprocessor.get("version"):
+              problems.append("components.preprocessor.release must be v<version> (%s)" % preprocessor.get("version"))
+          pp_digests = preprocessor.get("sha256") or {}
+          if set(pp_digests) != {"release-sql", "core-only"}:
+              problems.append("components.preprocessor.sha256 must hold exactly release-sql and core-only")
+          for key, digest in pp_digests.items():
+              if not isinstance(digest, str) or not digest_re.match(digest):
+                  problems.append("components.preprocessor.sha256.%s is not a 64-character hex digest" % key)
 
           for problem in problems:
               print("versions.json: %s" % problem, file=sys.stderr)
@@ -276,6 +295,33 @@ jobs:
             fi
             printf '  verified %s\n' "$digest"
           done < /tmp/digests.txt
+      - name: download the pinned preprocessor framework package and check its digest
+        # The installer's database step executes this file as the database
+        # administrator, so the pin is the whole trust decision: hash the real
+        # release asset, not the digest the release page reports.
+        run: |
+          set -u
+          read -r repo release asset digest core < <(python3 -c 'import json; b = json.load(open("versions.json"))["components"]["preprocessor"]; print(b["repo"], b["release"], b["asset"], b["sha256"]["release-sql"], b["sha256"]["core-only"])')
+          url="https://github.com/${repo}/releases/download/${release}/${asset}"
+          printf '\n%s\n' "$url"
+          if ! curl -fL --proto '=https' --retry 3 -sS -o "/tmp/preprocessor-${asset}" "$url"; then
+            echo "  could not download $url" >&2
+            exit 1
+          fi
+          actual="$(sha256sum "/tmp/preprocessor-${asset}" | cut -d' ' -f1)"
+          derived="$(python3 setup/preprocessor/manage.py derive --package "/tmp/preprocessor-${asset}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha256"])')"
+          rm -f "/tmp/preprocessor-${asset}"
+          if [ "$actual" != "$digest" ]; then
+            printf '  digest mismatch\n    advertised: %s\n    actual:     %s\n' "$digest" "$actual" >&2
+            exit 1
+          fi
+          printf '  verified %s\n' "$digest"
+          # The text the installer actually runs: derived the same way here.
+          if [ "$derived" != "$core" ]; then
+            printf '  core-only digest mismatch\n    pinned:  %s\n    derived: %s\n' "$core" "$derived" >&2
+            exit 1
+          fi
+          printf '  core-only verified %s\n' "$core"
       - name: download the advertised scheduler archives and check every digest
         # Same ground truth, same reason: exasol-scheduler installs upstream's
         # archive for the platform and refuses one whose digest differs from
@@ -743,6 +789,20 @@ jobs:
         if: matrix.shard == 4
       - run: bash tests/kit-upgrade.sh
         if: matrix.shard == 3
+      # Core setup tasks: the task list against the laptop's record, the
+      # installer rerun `exakit update` starts for a pending task, the handover
+      # to a freshly downloaded kit, and the seventh installer step.
+      - run: bash tests/core-setup.sh
+        if: matrix.shard == 4
+      # The SQL preprocessor framework against a simulated database: install,
+      # session trial, activation, rollback, and everything the kit must leave
+      # alone. Both suites run their PowerShell twins under pwsh as well.
+      - run: bash tests/preprocessor-lifecycle.sh
+        if: matrix.shard == 4
+      - run: pwsh -NoProfile -File tests/core-setup.ps1
+        if: matrix.shard == 4
+      - run: pwsh -NoProfile -File tests/preprocessor-lifecycle.ps1
+        if: matrix.shard == 4
       - run: bash tests/agent-operability.sh
         if: matrix.shard == 4
       # The MCP subsystem's own tests were never wired in, so nothing in CI
