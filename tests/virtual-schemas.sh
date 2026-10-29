@@ -1,0 +1,765 @@
+#!/usr/bin/env bash
+# The virtual schema engine (setup/virtual-schemas/engine) against a simulated
+# Exasol (tests/lib/fake-exasol-vs.py) and a fake Personal deployment folder.
+#
+# The invariants worth a suite:
+#   1. A secret travels on stdin into CREATE/ALTER CONNECTION and nowhere else:
+#      not into argv, the source records, the registry, the output or errors.
+#   2. A failed connect leaves nothing it created - objects or files - and
+#      never touches what another source uses or what the kit did not make.
+#   3. Shared files are reference-counted: removing one source keeps what
+#      another still needs, and the last one out cleans up - without ever
+#      removing a bucket the kit did not create.
+#   4. disconnect drops only the CONNECTION; remove drops the owned objects.
+#   5. Failures are classified (auth, tls, unreachable, dns, no Java) with an
+#      exit code or status the shell and `exakit source issues` act on.
+#   6. Every input is validated before it reaches a template.
+#
+#   bash tests/virtual-schemas.sh
+set -u
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PASS=0; FAIL=0
+pass() { PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"; }
+fail() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1"; }
+check() { if [ "$2" = "$3" ]; then pass "$1"; else fail "$1"; printf '         expected: %s\n         actual:   %.400s\n' "$2" "$3"; fi; }
+has() { case "$3" in *"$2"*) pass "$1" ;; *) fail "$1"; printf '         missing: %s\n         in: %.400s\n' "$2" "$3" ;; esac; }
+lacks() { case "$3" in *"$2"*) fail "$1"; printf '         unexpected: %s\n' "$2" ;; *) pass "$1" ;; esac; }
+command -v python3 >/dev/null 2>&1 || { echo "python3 is required"; exit 1; }
+
+WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+DEFS="$WORK/defs"; HOME_K="$WORK/kit"; DEPLOY="$WORK/deploy"; EXA="$DEPLOY/local/runtime/exa"
+cp -R "$ROOT/setup/virtual-schemas" "$DEFS"
+mkdir -p "$HOME_K" "$EXA/bucketfs/bfsdefault/default" "$EXA/jdbc"
+printf 'kept\n' > "$EXA/jdbc/java.security"
+SECRET='s3cr3t-Pa55'"'"'word'
+NEWSECRET='n3w-T0ken-value'
+
+# Small stand-in artifacts with real digests, pinned into the copied
+# definitions and placed in the cache, so nothing is downloaded.
+python3 - "$DEFS" "$HOME_K" <<'PY'
+import hashlib, io, json, os, sys, zipfile
+defs, home = sys.argv[1:3]
+def seed(pin, data):
+    pin["size"], pin["sha256"] = len(data), hashlib.sha256(data).hexdigest()
+    folder = os.path.join(home, "cache", "virtual-schemas", pin["sha256"])
+    os.makedirs(folder, exist_ok=True)
+    open(os.path.join(folder, pin["asset"]), "wb").write(data)
+for cid in ("postgresql", "mysql", "sqlserver", "oracle", "snowflake", "bigquery"):
+    path = os.path.join(defs, "connectors", cid, "connector.json")
+    doc = json.load(open(path))
+    seed(doc["adapter"], ("adapter-" + cid).encode())
+    if doc["driver"].get("bundle") == "zip":
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("GoogleBigQueryJDBC42.jar", b"a"); z.writestr("dep.jar", b"b"); z.writestr("EULA.txt", b"c")
+        seed(doc["driver"], buf.getvalue())
+    else:
+        seed(doc["driver"], ("driver-" + cid).encode())
+    json.dump(doc, open(path, "w"), indent=2)
+PY
+
+STATE="$WORK/db.json"
+db() { printf '%s\n' "$1" > "$STATE"; }
+dbq() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); v=eval(sys.argv[2], {"d": d}); print(json.dumps(v) if not isinstance(v, str) else v)' "$STATE" "$1"; }
+eng() {
+    EXAKIT_VS_FAKE_DB="$ROOT/tests/lib/fake-exasol-vs.py" FAKE_VS_STATE="$STATE" \
+        python3 "$ROOT/setup/virtual-schemas/engine/cli.py" --defs "$DEFS" --kit-home "$HOME_K" \
+        --deployment-dir "$DEPLOY" --dsn 127.0.0.1:8563 --user sys --password-file /nonexistent "$@"
+}
+run() { OUT="$(eng "$@" 2>&1)"; RC=$?; }
+run_secret() { local s="$1"; shift; OUT="$(printf '%s' "$s" | eng "$@" 2>&1)"; RC=$?; }
+PG_SET="--set host=pg.example.com --set database=sales --set user=reader"
+
+printf '\n== search and plan ==\n'
+run resolve mssql; has "an alias resolves" '"connector": "sqlserver"' "$OUT"
+run resolve sql; check "an ambiguous search is refused, exit 2" "2" "$RC"; has "...with the choices" "choices: postgresql, mysql, sqlserver" "$OUT"
+db '{}'
+run plan pg --name sales $PG_SET
+check "plan: exit 0" "0" "$RC"
+has "...names the objects" '"connection": "EXAKIT_SRC_SALES"' "$OUT"
+has "...states the MCP exposure" "MCP read-only user can read every table of VS_SALES" "$OUT"
+check "...and changes nothing" "[]" "$(dbq 'd.get("statements", [])')"
+
+printf '\n== input validation ==\n'
+for bad in "--set host=pg.example.com;DROP --set database=x --set user=u" "--set host=h --set port=70000 --set database=x --set user=u" \
+           "--set host=h --set database=x --set user=u --set colour=red" "--set host=h --set database=x' --set user=u" \
+           "--set host=h --set database=x --set user=u --set tls=sometimes"; do
+    # shellcheck disable=SC2086
+    run plan postgresql --name bad $bad
+    check "refused with exit 2: $bad" "2" "$RC"
+done
+run plan postgresql --name Bad-Name $PG_SET; check "a source name outside [a-z][a-z0-9_] is refused" "2" "$RC"
+for loop in localhost 127.0.0.1 ::1 LOCALHOST; do
+    run plan postgresql --name sales --set host=$loop --set database=x --set user=u
+    check "host=$loop is refused (it is the database itself)" "2" "$RC"
+done
+has "...with the address to use instead" "on macOS 192.168.64.1, on Linux and WSL host.containers.internal" "$OUT"
+V6="$(python3 - "$ROOT" <<'PYV6'
+import sys; sys.path.insert(0, sys.argv[1] + "/setup/virtual-schemas/engine")
+import plan
+c = plan.Definitions(sys.argv[1] + "/setup/virtual-schemas").connector("postgresql")
+for given in ("2001:db8::1", "[2001:db8::1]"):
+    v = plan.validate_inputs(c, {"host": given, "database": "d", "user": "u"})
+    print(plan.jdbc_url(c, v).split("?")[0])
+PYV6
+)"
+check "an IPv6 host is bracketed in the URL, written either way" \
+    "jdbc:postgresql://[2001:db8::1]:5432/d|jdbc:postgresql://[2001:db8::1]:5432/d|" "$(printf '%s\n' "$V6" | tr '\n' '|')"
+
+run plan postgresql --name sales --set host=h --set user=u; has "a missing required input is named" "database is required" "$OUT"
+
+printf '\n== every connector, every TLS mode: the templates build ==\n'
+TEMPLATES="$(python3 - "$ROOT" <<'PYT'
+import sys; sys.path.insert(0, sys.argv[1] + "/setup/virtual-schemas/engine")
+import plan
+defs = plan.Definitions(sys.argv[1] + "/setup/virtual-schemas")
+samples = {"host": "db.example.com", "database": "sales", "schema": "public", "user": "reader", "service": "ORCLPDB1",
+           "account": "myorg-acct1", "warehouse": "COMPUTE_WH", "project": "my-proj", "dataset": "analytics"}
+for entry in defs.entries():
+    c = defs.connector(entry["id"])
+    given = {s["name"]: samples[s["name"]] for s in c["inputs"] if s["name"] in samples}
+    tls = next((s for s in c["inputs"] if s["name"] == "tls"), None)
+    for mode in (tls["choices"] if tls else [None]):
+        g = dict(given, **({"tls": mode} if mode else {}))
+        try:
+            v = plan.validate_inputs(c, g)
+            url = plan.jdbc_url(c, v, {"key_path": "/buckets/x/key.json"})
+            [t.format(**v) for t in c["vs_properties"].values()]
+            ok = url.startswith("jdbc:") and "{" not in url and plan.source_host(c, v)
+            print("%s/%s %s" % (c["id"], mode or "-", "ok" if ok else "BAD " + url))
+        except Exception as e:
+            print("%s/%s BAD %s" % (c["id"], mode or "-", e))
+PYT
+)"
+check "13 connector/TLS combinations build a URL, properties and a probe host" "13 0" \
+    "$(printf '%s\n' "$TEMPLATES" | grep -c ' ok$') $(printf '%s\n' "$TEMPLATES" | grep -c ' BAD')"
+
+printf '\n== failure classes, from real driver messages ==\n'
+CLASSES="$(python3 - "$ROOT" <<'PYC'
+import sys; sys.path.insert(0, sys.argv[1] + "/setup/virtual-schemas/engine")
+import sql
+for text in [
+    "E-VSPG-3: Unable to create PostgreSQL remote metadata reader. Caused by: 'The connection attempt failed.'",
+    "E-VSMYSQL-1: Unable to create MySQL remote metadata reader. Caused by: Communications link failure",
+    "E-VSSQLS-2: ... The TCP/IP connection to the host 192.168.64.1, port 55432 has failed. Error: \"The driver received an unexpected pre-login response.",
+    "E-VSORA-1: Unable to create Oracle remote metadata reader. Caused by: ORA-17800: Got minus one from a read call.",
+    'FATAL: password authentication failed for user "reader"',
+    "ORA-01017: invalid username/password; logon denied",
+    "PKIX path building failed: unable to find valid certification path to requested target",
+    "No usable script language container is installed for the requested language.",
+    "java.net.UnknownHostException: db.example.com",
+]:
+    print(sql.classify(text))
+PYC
+)"
+check "each real message lands in its class" "unreachable|unreachable|unreachable|unreachable|auth|auth|tls|nojava|dns|" \
+    "$(printf '%s\n' "$CLASSES" | tr '\n' '|')"
+# Measured live: a rotated source password. The summary line is the
+# adapter's generic "Unable to create ... reader"; the cause is lines below.
+RAW_AUTH='Query execution failed: Protocol error: VM error: F-UDF-CL-LIB-1126: F-UDF-CL-SL-JAVA-1006:
+com.exasol.adapter.jdbc.RemoteMetadataReaderException: E-VSEXA-4: Unable to create Exasol remote metadata reader.
+	at com.exasol.adapter.dialects.exasol.ExasolSqlDialect.createRemoteMetadataReader(ExasolSqlDialect.java:212)
+	at com.exasol.ssl.TlsHelper.wrap(TlsHelper.java:9)
+Caused by: java.sql.SQLInvalidAuthorizationSpecException: Connection exception - authentication failed.'
+# Measured live: pyexasol's wrapper around a loader error, as a reauth try
+# raises it. The line under "message =>" is the session's dsn, not the error.
+RAW_ETL="$(printf '\n(\n    message     =>  JDBC-Client-Error: Connecting to %s as user=%s failed: Connection exception - authentication failed. (Session: 1880237644681707520)\n    dsn         =>  127.0.0.1:8563\n    user        =>  sys\n    code        =>  ETL-5\n    query       =>  SELECT 1\n)\n' "'jdbc:exa:10.0.0.9:8563'" "'READER'")"
+check "a pyexasol error is summarized by its message field, and classifies" \
+    "JDBC-Client-Error: Connecting to 'jdbc:exa:10.0.0.9:8563' as user='READER' failed: Connection exception - authentication failed. auth" \
+    "$(python3 - "$ROOT" "$RAW_ETL" <<'PYC'
+import sys; sys.path.insert(0, sys.argv[1] + "/setup/virtual-schemas/engine")
+import sql
+line = sql.redact(sys.argv[2], [])
+print(line, sql.classify_raw(line, sys.argv[2]))
+PYC
+)"
+check "a cause on a later line still classifies (auth), not the generic summary" "auth" \
+    "$(python3 - "$ROOT" "$RAW_AUTH" <<'PYC'
+import sys; sys.path.insert(0, sys.argv[1] + "/setup/virtual-schemas/engine")
+import sql
+raw = sys.argv[2]
+print(sql.classify_raw(sql.summarize(raw), raw))
+PYC
+)"
+# Measured live on RDS MySQL 8.4: Connector/J wraps a failed certificate
+# check in "Communications link failure", and the kit had sent the user to
+# check the firewall of a server its own route check had just reached.
+RAW_MY_TLS='com.exasol.adapter.jdbc.RemoteMetadataReaderException: E-VSMYSQL-1: Unable to create MySQL remote metadata reader. Caused by: Communications link failure
+Caused by: com.mysql.cj.jdbc.exceptions.CommunicationsException: Communications link failure
+Caused by: com.mysql.cj.exceptions.CJCommunicationsException: Communications link failure
+Caused by: javax.net.ssl.SSLHandshakeException: (certificate_unknown) java.security.cert.CertPathValidatorException: Path does not chain with any of the trust anchors'
+RAW_MY_DOWN='com.exasol.adapter.jdbc.RemoteMetadataReaderException: E-VSMYSQL-1: Unable to create MySQL remote metadata reader. Caused by: Communications link failure
+Caused by: com.mysql.cj.jdbc.exceptions.CommunicationsException: Communications link failure
+Caused by: java.net.ConnectException: Connection refused'
+check "MySQL's 'Communications link failure' over a certificate cause is tls; over a refused connect, unreachable" "tls unreachable" \
+    "$(python3 - "$ROOT" "$RAW_MY_TLS" "$RAW_MY_DOWN" <<'PYC'
+import sys; sys.path.insert(0, sys.argv[1] + "/setup/virtual-schemas/engine")
+import sql
+print(" ".join(sql.classify_raw(sql.summarize(raw), raw) for raw in sys.argv[2:4]))
+PYC
+)"
+
+printf '\n== connect: the happy path ==\n'
+db '{"sources": {"pg.example.com": {"tables": ["ORDERS", "CUSTOMERS"]}}}'
+run connect postgresql --name sales $PG_SET --secret-stdin </dev/null
+check "no secret on stdin: refused, exit 2" "2" "$RC"
+run_secret "$SECRET" connect postgresql --name sales $PG_SET --secret-stdin
+check "connect: exit 0" "0" "$RC"
+has "...reports the tables and the bounded read" "Virtual schema VS_SALES: 2 table(s); a bounded read succeeded" "$OUT"
+check "...the CONNECTION carries the credential" "$SECRET" "$(dbq 'd["connections"]["EXAKIT_SRC_SALES"]["secret"]')"
+check "...and verified TLS in its URL" "jdbc:postgresql://pg.example.com:5432/sales?sslmode=verify-full&sslfactory=org.postgresql.ssl.DefaultJavaSSLFactory" \
+    "$(dbq 'd["connections"]["EXAKIT_SRC_SALES"]["url"]')"
+check "...adapter script and virtual schema exist" '["EXAKIT_VS.EXAKIT_DNS_PROBE_V2", "EXAKIT_VS.ADAPTER_SALES"] ["ORDERS", "CUSTOMERS"]' \
+    "$(dbq 'd["scripts"]') $(dbq 'd["virtual"]["VS_SALES"]["tables"]')"
+ADAPTER_SQL="$(dbq '[s for s in d["statements"] if "ADAPTER SCRIPT" in s][0]')"
+has "...the adapter script lists the staged adapter" "%jar /buckets/bfsdefault/default/exakit/vs/postgresql/4.1.0/virtual-schema-dist-14.1.0-postgresql-4.1.0.jar;" "$ADAPTER_SQL"
+has "...and the driver" "%jar /buckets/bfsdefault/default/exakit/vs/postgresql/driver-42.7.14/postgresql-42.7.14.jar;" "$ADAPTER_SQL"
+has "...with telemetry off" "%env EXASOL_TELEMETRY_DISABLE=1;" "$ADAPTER_SQL"
+has "the virtual schema has the dialect's properties" "CATALOG_NAME = 'sales' SCHEMA_NAME = 'public'" "$(dbq '[s for s in d["statements"] if s.startswith("CREATE VIRTUAL SCHEMA")][0]')"
+check "files staged where SQL reads them" "yes yes" \
+    "$([ -f "$EXA/bucketfs/bfsdefault/default/exakit/vs/postgresql/4.1.0/virtual-schema-dist-14.1.0-postgresql-4.1.0.jar" ] && echo yes) $([ -f "$EXA/bucketfs/bfsdefault/default/exakit/vs/postgresql/driver-42.7.14/postgresql-42.7.14.jar" ] && echo yes)"
+CFG="$EXA/jdbc/POSTGRES_JDBC_DRIVER/settings.cfg"
+check "the loader driver's settings.cfg: documented keys, final blank line" \
+    "DRIVERNAME=POSTGRES_JDBC_DRIVER|PREFIX=jdbc:postgresql:|DRIVERMAIN=org.postgresql.Driver|FETCHSIZE=100000|INSERTSIZE=-1|JAR=postgresql-42.7.14.jar||" \
+    "$(tr '\n' '|' < "$CFG")"
+check "the source record says ready" "ready" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$HOME_K/sources/sales/state.json")"
+lacks "the secret is not in the output" "s3cr3t" "$OUT"
+check "...nor anywhere under the kit home" "" "$(grep -rl 's3cr3t' "$HOME_K/sources" 2>/dev/null)"
+check "the source folder is owner-only" "700" "$(stat -c '%a' "$HOME_K/sources/sales" 2>/dev/null || stat -f '%Lp' "$HOME_K/sources/sales")"
+
+printf '\n== a second source on the same connector shares the files ==\n'
+python3 - "$STATE" <<'PY'
+import json, sys; d = json.load(open(sys.argv[1])); d["sources"]["wh.example.com"] = {"tables": ["STOCK"]}; json.dump(d, open(sys.argv[1], "w"))
+PY
+run_secret "$SECRET" connect postgresql --name warehouses --set host=wh.example.com --set database=wh --set user=reader --secret-stdin
+check "connect warehouses: exit 0" "0" "$RC"
+check "the shared driver lists both consumers" '["sales", "warehouses"]' \
+    "$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1]))["artifacts"]; print(json.dumps(next(v["consumers"] for k,v in r.items() if k.endswith("POSTGRES_JDBC_DRIVER/postgresql-42.7.14.jar"))))' "$HOME_K/sources/registry.json")"
+run_secret "$SECRET" connect postgresql --name sales $PG_SET --secret-stdin
+check "a name already in use is a conflict, exit 3" "3" "$RC"
+
+printf '\n== a failed connect leaves nothing behind ==\n'
+python3 - "$STATE" <<'PY'
+import json, sys; d = json.load(open(sys.argv[1])); d["sources"]["bad.example.com"] = {"tables": ["T"], "fail": "auth"}; json.dump(d, open(sys.argv[1], "w"))
+PY
+run_secret "$SECRET" connect mysql --name crm --set host=bad.example.com --set database=crm --set user=reader --secret-stdin
+check "rejected credentials: exit 1" "1" "$RC"
+has "...said plainly, with what to do" "the source rejected the credentials; nothing was kept" "$OUT"
+check "...its CONNECTION, script and schema were undone" "false false false" \
+    "$(dbq '"EXAKIT_SRC_CRM" in d["connections"]' | tr A-Z a-z) $(dbq '"EXAKIT_VS.ADAPTER_CRM" in d["scripts"]' | tr A-Z a-z) $(dbq '"VS_CRM" in d["virtual"]' | tr A-Z a-z)"
+check "...no record and no files of its own remain" "no no no" \
+    "$([ -d "$HOME_K/sources/crm" ] && echo yes || echo no) $([ -d "$EXA/bucketfs/bfsdefault/default/exakit/vs/mysql" ] && echo yes || echo no) $([ -d "$EXA/jdbc/MYSQL" ] && echo yes || echo no)"
+check "...while the other sources' files are untouched" "yes" "$([ -f "$CFG" ] && echo yes)"
+lacks "...and the secret never reaches the error text" "s3cr3t" "$OUT"
+run_secret "$SECRET" connect mysql --name crm --set host=down.example.com --set database=crm --set user=reader --secret-stdin
+check "a host the source list does not know: exit 1" "1" "$RC"
+
+python3 - "$STATE" <<'PY'
+import json, sys; d = json.load(open(sys.argv[1])); d["dns"] = False; json.dump(d, open(sys.argv[1], "w"))
+PY
+run_secret "$SECRET" connect mysql --name crm --set host=pg.example.com --set database=crm --set user=reader --secret-stdin
+check "Java without DNS: exit 20, for the shell to repair and retry" "20" "$RC"
+python3 - "$STATE" <<'PYDNS'
+import json, sys; d = json.load(open(sys.argv[1])); d["dns"] = True; json.dump(d, open(sys.argv[1], "w"))
+PYDNS
+run_secret "$SECRET" connect mysql --name crm --set host=no-such-db.invalid --set database=crm --set user=reader --secret-stdin
+check "a name that does not exist is not a DNS repair: exit 1" "1" "$RC"; has "...said as a spelling problem" "does not resolve; nothing was kept - check the spelling" "$OUT"
+lacks "...without the firewall advice meant for a host that answers nothing" "firewall" "$OUT"
+python3 - "$STATE" <<'PY'
+import json, sys; d = json.load(open(sys.argv[1])); d["dns"] = True; d["unreachable"] = ["slow.example.com"]; json.dump(d, open(sys.argv[1], "w"))
+PY
+run_secret "$SECRET" connect mysql --name crm --set host=slow.example.com --set database=crm --set user=reader --secret-stdin
+check "a host that resolves but does not answer: exit 1" "1" "$RC"; has "...named as unreachable from inside the database" "is not reachable from inside the database" "$OUT"
+lacks "...said once, not restated in a second parenthesis" "did not answer from inside the database" "$OUT"
+db '{"java": false}'
+run_secret "$SECRET" connect oracle --name erp --set host=ora.example.com --set service=ORCL --set schema=APP --set user=reader --secret-stdin
+check "no Java in the database: exit 21, for the shell to offer the install" "21" "$RC"
+
+printf '\n== an interrupted connect is recovered, not mistaken for a stranger ==\n'
+# The state an attempt killed right after CREATE CONNECTION leaves behind: its
+# journal (naming what it made) and the connection in the database.
+db '{"sources": {"pg.example.com": {"tables": ["ORDERS"]}}, "connections": {"EXAKIT_SRC_LATE": {"url": "x", "user": "reader", "secret": "half-done"}}}'
+mkdir -p "$HOME_K/sources/late"
+printf '{"operation": "connect", "connector": "postgresql", "created": {"files": [], "connection": true, "script": false, "schema": false}}\n' > "$HOME_K/sources/late/journal.json"
+run_secret "$SECRET" connect postgresql --name late $PG_SET --secret-stdin
+check "a retry after an interrupted connect succeeds" "0" "$RC"
+has "...and says what it cleaned up first" "was interrupted; removing what it created first" "$OUT"
+check "...the connection now holds the new attempt's credential" "$SECRET" "$(dbq 'd["connections"]["EXAKIT_SRC_LATE"]["secret"]')"
+run remove late >/dev/null
+# A journal with nothing recorded is simply cleared.
+mkdir -p "$HOME_K/sources/late2"; printf '{"operation": "connect", "created": {"files": []}}\n' > "$HOME_K/sources/late2/journal.json"
+run_secret "$SECRET" connect postgresql --name late2 $PG_SET --secret-stdin
+check "an empty journal does not block a connect" "0" "$RC"
+run remove late2 >/dev/null
+
+printf '\n== what the kit does not own ==\n'
+db '{"sources": {"pg.example.com": {"tables": ["ORDERS"]}}, "connections": {"EXAKIT_SRC_HR": {"url": "x", "user": "u", "secret": "theirs"}}}'
+run_secret "$SECRET" connect postgresql --name hr $PG_SET --secret-stdin
+check "a CONNECTION the kit did not create: conflict, exit 3" "3" "$RC"
+check "...and it is left exactly as it was" "theirs" "$(dbq 'd["connections"]["EXAKIT_SRC_HR"]["secret"]')"
+mkdir -p "$EXA/jdbc/SQLSERVER"; printf 'DRIVERNAME=SQLSERVER\nJAR=theirs.jar\n' > "$EXA/jdbc/SQLSERVER/settings.cfg"
+db '{"sources": {"ms.example.com": {"tables": ["T"]}}}'
+run_secret "$SECRET" connect mssql --name fin --set host=ms.example.com --set database=fin --set user=reader --secret-stdin
+check "a loader driver the kit did not register: conflict, exit 3" "3" "$RC"
+check "...its settings.cfg untouched" "JAR=theirs.jar" "$(sed -n 2p "$EXA/jdbc/SQLSERVER/settings.cfg")"
+rm -rf "$EXA/jdbc/SQLSERVER"
+run_secret "{}" connect bigquery --name bq --set project=p --set dataset=d --secret-stdin
+check "a gated connector explains its gate, exit 5" "5" "$RC"; has "...naming it" "not qualified on Exasol Personal yet" "$OUT"
+run connect bigquery --name bq --dry-run
+check "...before any input is asked for, dry run included" "5" "$RC"; lacks "...no input complaint" "is required" "$OUT"
+run resolve bq
+check "resolving a gated connector says so, exit 5 (the wizard asks nothing)" "5" "$RC"; has "...with the reason" "not available yet" "$OUT"
+
+printf '\n== check, issues, reauth ==\n'
+# Back to the two healthy sources from the happy path.
+python3 - "$STATE" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d.update({"sources": {"pg.example.com": {"tables": ["ORDERS", "CUSTOMERS"], "secret": "s3cr3t-Pa55'word"},
+                      "wh.example.com": {"tables": ["STOCK"]}},
+          "connections": {"EXAKIT_SRC_SALES": {"url": "jdbc:postgresql://pg.example.com:5432/sales", "user": "reader", "secret": "s3cr3t-Pa55'word"},
+                          "EXAKIT_SRC_WAREHOUSES": {"url": "jdbc:postgresql://wh.example.com:5432/wh", "user": "reader", "secret": "x"}},
+          "schemas": ["EXAKIT_VS"], "scripts": ["EXAKIT_VS.EXAKIT_DNS_PROBE_V2", "EXAKIT_VS.ADAPTER_SALES", "EXAKIT_VS.ADAPTER_WAREHOUSES"],
+          "virtual": {"VS_SALES": {"connection": "EXAKIT_SRC_SALES", "tables": ["ORDERS", "CUSTOMERS"]},
+                      "VS_WAREHOUSES": {"connection": "EXAKIT_SRC_WAREHOUSES", "tables": ["STOCK"]}}})
+json.dump(d, open(sys.argv[1], "w"))
+PY
+run check sales; check "check: ready" "0" "$RC"; has "...with its evidence" "metadata and a bounded read (2 tables)" "$OUT"
+python3 - "$STATE" <<'PY'
+import json, sys; d = json.load(open(sys.argv[1])); d["sources"]["pg.example.com"]["secret"] = "n3w-T0ken-value"; json.dump(d, open(sys.argv[1], "w"))
+PY
+run check sales; check "a rotated credential at the source: check exits 1" "1" "$RC"
+has "...and says why, though no RESULT line follows a failure" "FAIL sales is auth-failed:" "$OUT"
+has "...with the fix" "INFO Fix: the source rejected the credentials: exakit source reauth sales" "$OUT"
+check "...the record says auth-failed" "auth-failed" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$HOME_K/sources/sales/state.json")"
+run --json issues; has "issues lists it" '"name": "sales"' "$OUT"; has "...with the runnable remedy" "exakit source reauth sales" "$OUT"
+lacks "...and not the healthy one" '"name": "warehouses"' "$OUT"
+run --json check --all; check "check --all: exit 1 while one source is failing" "1" "$RC"
+OLDSECRET="$(dbq 'd["connections"]["EXAKIT_SRC_SALES"]["secret"]')"
+run_secret "typo-$NEWSECRET" reauth sales --secret-stdin
+check "reauth with a credential the source refuses: exit 1" "1" "$RC"
+has "...and says the previous one was kept" "refused the new credential, so the previous one was kept" "$OUT"
+check "...the CONNECTION still holds the previous credential" "$OLDSECRET" "$(dbq 'd["connections"]["EXAKIT_SRC_SALES"]["secret"]')"
+check "...and the pending CONNECTION is gone" "false" "$(dbq '"EXAKIT_SRC_SALES_PENDING" in d["connections"]')"
+lacks "...the refused credential is in none of the output" "typo-$NEWSECRET" "$OUT"
+run_secret "$NEWSECRET" reauth sales --secret-stdin
+check "reauth with the new credential: ready again" "0" "$RC"
+has "...after the source accepted it" "The source accepted the new credential" "$OUT"
+check "...the CONNECTION holds it" "$NEWSECRET" "$(dbq 'd["connections"]["EXAKIT_SRC_SALES"]["secret"]')"
+check "...and it is in no file" "" "$(grep -rl 'n3w-T0ken' "$HOME_K/sources" 2>/dev/null)"
+run refresh warehouses; has "refresh reports the table count" '"tables": 1' "$OUT"
+
+printf '\n== disconnect and reconnect ==\n'
+run disconnect sales --dry-run; check "disconnect --dry-run changes nothing" "true" "$(dbq '"EXAKIT_SRC_SALES" in d["connections"]' | tr A-Z a-z)"
+has "...and says what it keeps" "virtual schema VS_SALES" "$OUT"
+run disconnect sales
+check "disconnect drops only the CONNECTION" "false true true" \
+    "$(dbq '"EXAKIT_SRC_SALES" in d["connections"]' | tr A-Z a-z) $(dbq '"VS_SALES" in d["virtual"]' | tr A-Z a-z) $(dbq '"EXAKIT_VS.ADAPTER_SALES" in d["scripts"]' | tr A-Z a-z)"
+run check sales; has "a disconnected source is skipped by check" '"skipped": true' "$OUT"
+run_secret "$NEWSECRET" connect postgresql --name sales --secret-stdin
+check "connect on a disconnected source reconnects it, from the name and the credential alone" "0" "$RC"
+has "...to the recorded host" "pg.example.com resolves and answers on port 5432" "$OUT"
+check "...recreating the CONNECTION" "true" "$(dbq '"EXAKIT_SRC_SALES" in d["connections"]' | tr A-Z a-z)"
+
+printf '\n== remove: owned objects, shared files kept until the last consumer ==\n'
+DRIVER="$EXA/jdbc/POSTGRES_JDBC_DRIVER/postgresql-42.7.14.jar"
+run remove sales --dry-run; has "remove --dry-run lists what it keeps" "keep_files" "$OUT"; check "...and changes nothing" "true" "$(dbq '"VS_SALES" in d["virtual"]' | tr A-Z a-z)"
+run remove sales
+check "remove sales: its objects are gone" "false false false" \
+    "$(dbq '"VS_SALES" in d["virtual"]' | tr A-Z a-z) $(dbq '"EXAKIT_VS.ADAPTER_SALES" in d["scripts"]' | tr A-Z a-z) $(dbq '"EXAKIT_SRC_SALES" in d["connections"]' | tr A-Z a-z)"
+check "...the driver warehouses still uses stays" "yes" "$([ -f "$DRIVER" ] && echo yes)"
+check "...and so does the kit schema" "true" "$(dbq '"EXAKIT_VS" in d["schemas"]' | tr A-Z a-z)"
+run disconnect warehouses
+run remove warehouses
+check "remove after disconnect works (the adapter callback is skipped)" "0" "$RC"
+has "...with FORCE, on the kit's own schema only" 'DROP FORCE VIRTUAL SCHEMA "VS_WAREHOUSES"' "$(dbq '" | ".join(s for s in d["statements"] if "VIRTUAL SCHEMA" in s and s.startswith("DROP"))')"
+check "the last consumer out: shared files deleted" "no no" "$([ -f "$DRIVER" ] && echo yes || echo no) $([ -d "$EXA/jdbc/POSTGRES_JDBC_DRIVER" ] && echo yes || echo no)"
+check "...the kit schema dropped" "false" "$(dbq '"EXAKIT_VS" in d["schemas"]' | tr A-Z a-z)"
+check "...but never the bucket or what the kit did not make" "yes yes" \
+    "$([ -d "$EXA/bucketfs/bfsdefault/default" ] && echo yes) $([ -f "$EXA/jdbc/java.security" ] && echo yes)"
+run --json list; has "nothing is listed" '"sources": []' "$OUT"
+run show sales; check "show on a removed source: exit 4" "4" "$RC"
+
+printf '\n== the shell bridge (setup/lib/virtual-schemas.sh) ==\n'
+# A stand-in engine records its arguments and its stdin, and answers with the
+# exit code a test arranges - so what the bridge does with each is observable.
+B="$WORK/bridge"; mkdir -p "$B"
+bridge() {
+    ( EXAKIT_HOME="$B/home"; mkdir -p "$EXAKIT_HOME"
+      . "$ROOT/setup/lib/common.sh"; . "$ROOT/setup/lib/detect.sh"; . "$ROOT/setup/lib/runtime-personal.sh"
+      . "$ROOT/setup/lib/virtual-schemas.sh"
+      _require_install() { :; }; exakit_init_logging() { :; }
+      exakit_vs_engine() {
+          printf '%s\n' "$*" >> "$B/argv"
+          [ -t 0 ] || cat >> "$B/stdin"
+          _n="$(wc -l < "$B/argv" | tr -d ' ')"
+          _code="$(sed -n "${_n}p" "$B/codes" 2>/dev/null)"
+          if [ "$1" = resolve ] && [ -f "$B/gated" ]; then echo "FAIL BigQuery is not available yet: gated"; return 5; fi
+          case "$1" in check) echo 'RESULT {"checks": []}' ;; remove|disconnect) echo 'RESULT {"name": "sales", "drop": ["virtual schema VS_SALES", "CONNECTION EXAKIT_SRC_SALES"], "keep": [], "delete_files": ["a.jar"], "keep_files": ["b.jar"], "note": "nothing is revoked at the source"}' ;; show) echo "FAIL no source named $2 (see: exakit source list)" ;; resolve) echo 'RESULT {"connector": "postgresql"}' ;; plan) echo 'RESULT {"name": "x", "connector": "postgresql", "tier": "GA", "status": "candidate", "downloads": [], "steps": [], "exposure": "e", "warnings": []}' ;; esac
+          return "${_code:-0}"
+      }
+      personal_slc_dns_repair() { echo "REPAIRED" >> "$B/argv"; return 0; }
+      _exakit_vs_install_java() { echo "JAVA-ASKED" >> "$B/argv"; return 1; }
+      "$@" ) 2>&1
+}
+reset_bridge() { rm -f "$B/argv" "$B/stdin" "$B/codes"; printf '%s\n' "$@" > "$B/codes"; }
+
+reset_bridge
+OUT="$(bridge cmd_connect pg --name sales --password=hunter2 </dev/null)"; RC=$?
+check "a password argument is refused before anything runs, exit 2" "2 no" "$RC $([ -f "$B/argv" ] && echo yes || echo no)"
+OUT="$(bridge cmd_connect pg --set host=h </dev/null)"; RC=$?
+check "unattended, the name is required" "2" "$RC"
+reset_bridge 0 0 0
+printf 'pw-from-stdin' > "$B/pw"
+OUT="$(bridge cmd_connect pg --name sales --set host=db.example.com --set user=reader --password-file "$B/pw" </dev/null)"; RC=$?
+check "connect with a password file: exit 0" "0" "$RC"
+check "...the engine ran resolve, plan, connect - the last with --secret-stdin" \
+    "resolve pg|plan postgresql --name sales --set host=db.example.com --set user=reader|connect postgresql --name sales --set host=db.example.com --set user=reader --secret-stdin|" \
+    "$(tr '\n' '|' < "$B/argv")"
+check "...the credential reached it on stdin" "pw-from-stdin" "$(cat "$B/stdin")"
+lacks "...and never as an argument" "pw-from-stdin" "$(cat "$B/argv")"
+reset_bridge 0 0 20 0
+OUT="$(bridge cmd_connect pg --name sales --set host=h --password-file "$B/pw" </dev/null)"; RC=$?
+check "exit 20 from the engine: DNS repaired, connect retried once, exit 0" \
+    "0 connect|REPAIRED|connect|" "$RC $(grep -E '^(connect|REPAIRED)' "$B/argv" | cut -d' ' -f1 | tr '\n' '|')"
+reset_bridge 0 0 21
+OUT="$(bridge cmd_connect pg --name sales --set host=h --password-file "$B/pw" </dev/null)"; RC=$?
+check "exit 21: the Java install is offered; declined, nothing retried" "21 1" "$RC $(grep -c '^connect' "$B/argv")"
+has "...the offer was made" "JAVA-ASKED" "$(cat "$B/argv")"
+reset_bridge 0
+OUT="$(bridge cmd_source remove sales --dry-run </dev/null)"
+check "source remove --dry-run passes the preview through" "remove sales --dry-run" "$(cat "$B/argv")"
+OUT="$(bridge cmd_source remove </dev/null)"; RC=$?
+check "source remove without a name: exit 2" "2" "$RC"
+OUT="$(bridge cmd_source bogus </dev/null)"; RC=$?
+check "an unknown action: exit 2" "2" "$RC"
+reset_bridge 0
+OUT="$(bridge cmd_source remove sales --dry-run </dev/null)"
+has "remove --dry-run shows what it drops" "drops: virtual schema VS_SALES, CONNECTION EXAKIT_SRC_SALES" "$OUT"
+has "...the files it deletes and keeps" "deletes 1 unused file(s); keeps 1 still shared" "$OUT"
+reset_bridge 0
+OUT="$(bridge cmd_source disconnect sales </dev/null)"; RC=$?
+check "disconnect without a terminal or --yes: exit 5, not 0" "5" "$RC"
+check "...only the preview ran" "disconnect sales --dry-run|" "$(tr '\n' '|' < "$B/argv")"
+reset_bridge 0 0
+OUT="$(bridge cmd_source remove sales --yes </dev/null)"; RC=$?
+check "remove --yes: exit 0" "0" "$RC"; has "...and says it is done" "sales removed" "$OUT"
+reset_bridge 4
+OUT="$(bridge cmd_source reauth nosuch --password-file "$B/pw" </dev/null)"; RC=$?
+check "reauth of a source that does not exist: exit 4, before any credential" "4 show nosuch|" "$RC $(tr '\n' '|' < "$B/argv")"
+check "...nothing reached the engine's stdin" "no" "$([ -s "$B/stdin" ] && echo yes || echo no)"
+has "...and says which name" "no source named nosuch" "$OUT"
+reset_bridge 0
+OUT="$(bridge cmd_source check --all </dev/null)"
+has "check --all with no sources says so" "(none)" "$OUT"
+reset_bridge; : > "$B/gated"
+OUT="$(bridge cmd_connect bq --name b </dev/null)"; RC=$?
+check "a gated connector stops the wizard with the engine's exit 5" "5 resolve bq|resolve bq|" "$RC $(tr '\n' '|' < "$B/argv")"
+has "...and the reason is shown" "not available yet" "$OUT"
+rm -f "$B/gated"
+
+printf '\n== a private CA (AWS RDS, Azure, a company CA) is trusted, not skipped ==\n'
+# Measured live against RDS PostgreSQL 18 (ap-south-1): tls=verify fails with
+# PKIX because the JVM does not hold Amazon's RDS roots. The certificate goes
+# into the URL, because the loader's sandbox denies file reads.
+CA="$WORK/ca"; mkdir -p "$CA"
+mkca() {
+    openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj "/CN=$1" -keyout "$CA/$1.key" -out "$CA/$1.pem" \
+        -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" >/dev/null 2>&1
+}
+mkca TestRootA; mkca TestRootB; mkca TestRootC
+printf 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=IP:127.0.0.1\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n' > "$CA/leaf.ext"
+openssl req -newkey rsa:2048 -nodes -subj "/CN=127.0.0.1" -keyout "$CA/server.key" -out "$CA/server.csr" >/dev/null 2>&1
+openssl x509 -req -in "$CA/server.csr" -CA "$CA/TestRootB.pem" -CAkey "$CA/TestRootB.key" -CAcreateserial -days 30 \
+    -extfile "$CA/leaf.ext" -out "$CA/server.pem" >/dev/null 2>&1
+cat "$CA/TestRootA.pem" "$CA/TestRootB.pem" > "$CA/bundle.pem"
+cat "$CA/TestRootA.pem" "$CA/TestRootC.pem" > "$CA/wrong.pem"
+printf 'not a certificate\n' > "$CA/garbage.pem"
+CHOICE="$(python3 - "$ROOT" "$CA" <<'PYCA'
+import os, socket, ssl, sys, threading
+sys.path.insert(0, sys.argv[1] + "/setup/virtual-schemas/engine")
+import tlsca
+ca = sys.argv[2]
+# A server that answers like PostgreSQL: SSLRequest, "S", then TLS.
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(os.path.join(ca, "server.pem"), os.path.join(ca, "server.key"))
+lsock = socket.socket(); lsock.bind(("127.0.0.1", 0)); lsock.listen(32); port = lsock.getsockname()[1]
+def serve():
+    while True:
+        try:
+            conn, _ = lsock.accept()
+            conn.recv(8); conn.sendall(b"S")
+            with ctx.wrap_socket(conn, server_side=True) as tls:
+                tls.recv(1)
+        except Exception:
+            pass
+threading.Thread(target=serve, daemon=True).start()
+pem = lambda n: tlsca.certificates(os.path.join(ca, n))
+def run(certs, p=port, name="bundle.pem"):
+    try:
+        got = tlsca.choose(certs, "127.0.0.1", p, "postgres", name, timeout=3)
+        return "B" if got == pem("TestRootB.pem")[0] else "A" if got == pem("TestRootA.pem")[0] else "?"
+    except tlsca.CaError as e:
+        return "ERR " + str(e)
+print(len(pem("bundle.pem")))
+print(run(pem("bundle.pem")))                               # B, found by handshake though A comes first
+print(run(pem("TestRootA.pem")))                            # a single certificate is taken as given
+print(run(pem("wrong.pem"), name="wrong.pem"))              # nothing in it signs the server
+free = socket.socket(); free.bind(("127.0.0.1", 0)); closed = free.getsockname()[1]; free.close()
+print(run(pem("bundle.pem"), p=closed))                     # cannot tell without reaching it
+try:
+    tlsca.certificates(os.path.join(ca, "garbage.pem")); print("read")
+except tlsca.CaError as e:
+    print("ERR " + str(e))
+print(tlsca.url_value(pem("TestRootB.pem")[0])[:40])
+PYCA
+)"
+check "a two-root bundle is read as two certificates" "2" "$(printf '%s\n' "$CHOICE" | sed -n 1p)"
+check "...the one that signs the server is picked by a verified handshake, not by position" "B" "$(printf '%s\n' "$CHOICE" | sed -n 2p)"
+check "a single certificate is taken as given (the database's own check judges it)" "A" "$(printf '%s\n' "$CHOICE" | sed -n 3p)"
+has "a bundle with no signer is refused, and says so" "none of the 2 certificates in wrong.pem signs 127.0.0.1" "$(printf '%s\n' "$CHOICE" | sed -n 4p)"
+has "a bundle against an unreachable server asks for the one root" "give the one root certificate instead" "$(printf '%s\n' "$CHOICE" | sed -n 5p)"
+has "a file with no PEM certificate is refused" "holds no PEM certificate" "$(printf '%s\n' "$CHOICE" | sed -n 6p)"
+check "the certificate survives URL decoding: only letters, digits and %XX (and -._~)" "-----BEGIN%20CERTIFICATE-----%0AMII" \
+    "$(printf '%s\n' "$CHOICE" | sed -n 7p | cut -c1-35)"
+
+db '{"sources": {"rds.example.com": {"tables": ["RENTAL"]}}}'
+RDS_SET="--set host=rds.example.com --set database=pagila --set user=reader"
+run plan pg --name rds $RDS_SET --set ca="$CA/missing.pem"
+check "a CA file that is not there: exit 2" "2" "$RC"; has "...named" "cannot be read" "$OUT"
+run plan pg --name rds $RDS_SET --set ca="$CA/TestRootA.pem" --set tls=require
+check "a CA with tls=require is refused: it would read as a check that is not made" "2" "$RC"
+has "...and says why" "needs tls=verify (not require)" "$OUT"
+run plan pg --name rds $RDS_SET --set ca="$CA/bundle.pem"
+has "the plan says which CA is trusted, and how one is chosen from a bundle" "trust the CA in $CA/bundle.pem for this source only (2 certificates" "$OUT"
+run_secret "$SECRET" connect pg --name rds $RDS_SET --set ca="$CA/TestRootA.pem" --secret-stdin
+check "connect with a CA: exit 0" "0" "$RC"
+URL="$(dbq 'd["connections"]["EXAKIT_SRC_RDS"]["url"]')"
+has "...the URL verifies host and chain against that CA" "?sslmode=verify-full&sslfactory=org.postgresql.ssl.SingleCertValidatingFactory&sslfactoryarg=-----BEGIN%20CERTIFICATE-----%0A" "$URL"
+lacks "...and never falls back to the JVM's public CAs" "DefaultJavaSSLFactory" "$URL"
+check "...the certificate is kept with the source" "yes" \
+    "$(python3 -c 'import json,sys; print("yes" if "BEGIN CERTIFICATE" in json.load(open(sys.argv[1])).get("tls_ca", "") else "no")' "$HOME_K/sources/rds/config.json")"
+run show rds; lacks "...but show does not dump it" "BEGIN CERTIFICATE" "$OUT"
+mv "$CA/TestRootA.pem" "$CA/moved.pem"
+run_secret "$NEWSECRET" reauth rds --secret-stdin
+check "reauth after the CA file moved: the kept certificate is used, exit 0" "0" "$RC"
+has "...in the replaced CONNECTION too" "SingleCertValidatingFactory" "$(dbq 'd["connections"]["EXAKIT_SRC_RDS"]["url"]')"
+run remove rds; check "...and it removes cleanly" "0" "$RC"
+
+REMEDIES="$(python3 - "$ROOT" <<'PYR'
+import json, sys
+sys.path.insert(0, sys.argv[1] + "/setup/virtual-schemas/engine")
+import lifecycle
+pg = json.load(open(sys.argv[1] + "/setup/virtual-schemas/connectors/postgresql/connector.json"))
+sf = json.load(open(sys.argv[1] + "/setup/virtual-schemas/connectors/snowflake/connector.json"))
+pkix = "E-VSPG-3: Unable to create PostgreSQL remote metadata reader. Caused by: 'SSL error: (certificate_unknown) PKIX path building failed: sun.security.provider.certpath.SunCertPathBuilderException: unable to find valid certification path to requested target'"
+clock = "E-VSPG-3: ... 'SSL error: (bad_certificate) PKIX path validation failed: java.security.cert.CertPathValidatorException: validity check failed'"
+print(lifecycle.tls_remedy(pkix, pg))
+print(lifecycle.tls_remedy(clock, pg))
+print(lifecycle.tls_remedy(pkix, sf))
+PYR
+)"
+has "an untrusted CA (measured on RDS) points at --set ca" "download that CA as PEM and give it with --set ca=<file>" "$(printf '%s\n' "$REMEDIES" | sed -n 1p)"
+has "a validity failure (measured: the clock after the laptop hibernated) points at the restart" "exakit stop, then exakit start" "$(printf '%s\n' "$REMEDIES" | sed -n 2p)"
+check "...a connector without a ca input is not told to use one" "None" "$(printf '%s\n' "$REMEDIES" | sed -n 3p)"
+db '{"sources": {"rds.example.com": {"tables": ["RENTAL"], "fail": "tls"}}}'
+run_secret "$SECRET" connect pg --name rds $RDS_SET --secret-stdin
+check "connect to a private-CA source without ca: exit 1, nothing kept" "1 {}" "$RC $(dbq 'd["connections"]')"
+has "...and the fix is named" "give it with --set ca=<file>, then connect again" "$OUT"
+
+printf '\n== a database clock left behind by a sleeping laptop ==\n'
+# Measured on Exasol Personal (macOS): the VM's clock does not catch up after
+# the Mac sleeps (32 min to 2 h 26 min behind), and an RDS certificate issued
+# that morning failed as "validity check failed". connect and check measure it.
+check "with the skew measured, a validity failure names it instead of guessing" \
+    "the database clock is 33 min behind this computer, so the certificate is outside its validity dates by it - restart the database (exakit stop, then exakit start) and retry" \
+    "$(python3 - "$ROOT" <<'PYC'
+import json, sys
+sys.path.insert(0, sys.argv[1] + "/setup/virtual-schemas/engine")
+import lifecycle
+pg = json.load(open(sys.argv[1] + "/setup/virtual-schemas/connectors/postgresql/connector.json"))
+print(lifecycle.tls_remedy("PKIX path validation failed: java.security.cert.CertPathValidatorException: validity check failed",
+                           pg, lifecycle.clock_words(-1955)))
+PYC
+)"
+db '{"clock_skew": -1955, "sources": {"rds.example.com": {"tables": ["RENTAL"], "fail": "tls-validity"}}}'
+run_secret "$SECRET" connect pg --name rds $RDS_SET --set ca="$CA/moved.pem" --secret-stdin
+check "a certificate outside its dates by a clock 33 min behind: exit 1, nothing kept" "1 {}" "$RC $(dbq 'd["connections"]')"
+has "...connect warns about the clock before it creates anything" "The database clock is 33 min behind this computer" "$OUT"
+has "...and the fix is the restart, with the measured cause" "the database clock is 33 min behind this computer, so the certificate is outside its validity dates by it" "$OUT"
+db '{"clock_skew": -1955, "sources": {"rds.example.com": {"tables": ["RENTAL"]}}}'
+run_secret "$SECRET" connect pg --name rds $RDS_SET --set ca="$CA/moved.pem" --secret-stdin
+check "a source whose certificate is still in date connects anyway: exit 0" "0" "$RC"
+has "...with the warning" "Restart the database (exakit stop, then exakit start) to resync it" "$OUT"
+run check rds
+has "source check warns too" "The database clock is 33 min behind this computer" "$OUT"
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["clock_skew"]=3; d["statements"]=[]; json.dump(d, open(sys.argv[1], "w"))' "$STATE"
+run check rds
+check "a clock in sync: check exit 0" "0" "$RC"
+lacks "...and no clock warning" "database clock" "$OUT"
+check "the clock is asked once per run" "1" "$(dbq 'sum(1 for s in d["statements"] if s == "SELECT POSIX_TIME() AS T")')"
+run remove rds; check "...and it removes cleanly" "0" "$RC"
+
+printf '\n== a private CA for MySQL: a truststore file both readers find ==\n'
+# Measured on Exasol Personal: the adapter (a UDF) starts in "/" and sees the
+# bucket at /buckets/...; the MySQL loader resolves the same relative path
+# under its driver folder (/exa/jdbc/MYSQL), where the kit puts a copy.
+check "the truststore is a JKS: magic, version 2, two trusted entries, digest over the empty password" "ok" \
+    "$(python3 - "$ROOT" "$CA/bundle.pem" <<'PYJ'
+import hashlib, struct, sys
+sys.path.insert(0, sys.argv[1] + "/setup/virtual-schemas/engine")
+import tlsca
+data = tlsca.jks(tlsca.certificates(sys.argv[2]))
+magic, version, count = struct.unpack(">III", data[:12])
+tags = data.count(struct.pack(">I", 2) + struct.pack(">H", len("exakit-ca-0")))
+ok = (magic, version, count) == (0xFEEDFEED, 2, 2) and data[-20:] == hashlib.sha1(b"Mighty Aphrodite" + data[:-20]).digest()
+print("ok" if ok and tags >= 2 else "bad %x %d %d %d" % (magic, version, count, tags))
+PYJ
+)"
+MY_SET="--set host=my.example.com --set database=sakila --set user=reader"
+db '{"sources": {"my.example.com": {"tables": ["rental"]}}}'
+run plan mysql --name my $MY_SET --set ca="$CA/bundle.pem"
+has "the plan says the whole bundle becomes a truststore (no handshake needed)" "(2 certificates, in a truststore for the adapter and the loader)" "$OUT"
+run_secret "$SECRET" connect mysql --name my $MY_SET --set ca="$CA/bundle.pem" --secret-stdin
+check "MySQL with a CA bundle: exit 0, with no handshake from this computer (my.example.com is not reachable)" "0" "$RC"
+REL="buckets/bfsdefault/default/exakit/vs/tls/my.jks"
+has "...the URL verifies identity against the truststore by its relative path" \
+    "sslMode=VERIFY_IDENTITY&trustCertificateKeyStoreUrl=file:$REL&trustCertificateKeyStoreType=JKS" \
+    "$(dbq 'd["connections"]["EXAKIT_SRC_MY"]["url"]')"
+check "...one copy in the bucket for the adapter, one under the loader at the same relative path, identical" "yes" \
+    "$(cmp -s "$EXA/bucketfs/bfsdefault/default/exakit/vs/tls/my.jks" "$EXA/jdbc/MYSQL/$REL" && echo yes || echo no)"
+run_secret "$NEWSECRET" reauth my --secret-stdin
+has "reauth keeps the truststore in the URL" "trustCertificateKeyStoreUrl=file:$REL" "$(dbq 'd["connections"]["EXAKIT_SRC_MY"]["url"]')"
+run remove my
+check "remove deletes both copies (and the loader's now-empty folders)" "0 gone gone" \
+    "$RC $([ -e "$EXA/bucketfs/bfsdefault/default/exakit/vs/tls/my.jks" ] && echo kept || echo gone) $([ -e "$EXA/jdbc/MYSQL/buckets" ] && echo kept || echo gone)"
+db '{"sources": {"my.example.com": {"tables": ["rental"], "fail": "tls"}}}'
+run_secret "$SECRET" connect mysql --name my $MY_SET --set ca="$CA/bundle.pem" --secret-stdin
+check "a MySQL connect that fails leaves no truststore behind" "1 gone gone" \
+    "$RC $([ -e "$EXA/bucketfs/bfsdefault/default/exakit/vs/tls/my.jks" ] && echo kept || echo gone) $([ -e "$EXA/jdbc/MYSQL/buckets" ] && echo kept || echo gone)"
+printf '\n== a private CA for SQL Server: the kit'"'"'s TLS helper class ==\n'
+# Measured on Exasol Personal: the SQL Server loader starts in / of the
+# database container, so no file path reaches both readers; mssql-jdbc's
+# trustManagerClass carries the CA in the URL instead. The helper is built by
+# the database's Java (faked here) from setup/virtual-schemas/java/.
+MS_SET="--set host=ms.example.com --set database=erp --set user=reader"
+db '{"sources": {"ms.example.com": {"tables": ["ORDERS"]}}}'
+rm -rf "$HOME_K/cache/virtual-schemas/tls-helper"
+run plan mssql --name ms $MS_SET --set ca="$CA/bundle.pem"
+has "the plan names the helper and the host check" "(2 certificates, checked with the host name by the kit's TLS helper class)" "$OUT"
+run_secret "$SECRET" connect mssql --name ms $MS_SET --set ca="$CA/bundle.pem" --secret-stdin
+check "SQL Server with a CA bundle: exit 0 (no handshake from this computer: ms.example.com is not reachable)" "0" "$RC"
+URL="$(dbq 'd["connections"]["EXAKIT_SRC_MS"]["url"]')"
+has "...the URL names the helper class, with the host it must check" \
+    "encrypt=true;trustServerCertificate=false;trustManagerClass=exakit.tls.PemTrustManager;trustManagerConstructorArg=ms.example.com|" "$URL"
+check "...both certificates, as base64url DER, and nothing a ;-separated URL would split" "2 ok" \
+    "$(printf '%s' "${URL#*trustManagerConstructorArg=ms.example.com|}" | awk -F. '{print NF}') $(printf '%s' "${URL#*trustManagerConstructorArg=}" | grep -q '^[A-Za-z0-9_.|-]*$' && echo ok || echo bad)"
+lacks "...and no truststore file" "trustStore=" "$URL"
+MS_ADAPTER="$(dbq '[s for s in d["statements"] if "ADAPTER SCRIPT" in s and "ADAPTER_MS" in s][0]')"
+has "...the helper jar is on the adapter's classpath" "/exakit/vs/sqlserver/tls-helper-" "$MS_ADAPTER"
+check "...and on the loader's, as a second JAR= beside the driver" "JAR=exakit-tls.jar yes" \
+    "$(grep -x 'JAR=exakit-tls.jar' "$EXA/jdbc/SQLSERVER/settings.cfg") $([ -f "$EXA/jdbc/SQLSERVER/exakit-tls.jar" ] && echo yes || echo no)"
+check "...built once in the database, and its build script dropped" "1 no" \
+    "$(dbq 'd.get("tls_builds", 0)') $(dbq '"EXAKIT_VS.EXAKIT_TLS_BUILD" in d["scripts"]' | tr A-Z a-z | sed 's/true/yes/;s/false/no/')"
+python3 - "$STATE" <<'PYS'
+import json, sys
+d = json.load(open(sys.argv[1])); d["sources"]["ms2.example.com"] = {"tables": ["ITEMS"]}; json.dump(d, open(sys.argv[1], "w"))
+PYS
+run_secret "$SECRET" connect mssql --name ms2 --set host=ms2.example.com --set database=erp --set user=reader --secret-stdin
+check "a second SQL Server source (no ca): exit 0, the cached helper is reused, not rebuilt" "0 1" "$RC $(dbq 'd.get("tls_builds", 0)')"
+has "...it verifies with the default store, as before" "encrypt=true;trustServerCertificate=false;hostNameInCertificate=ms2.example.com" "$(dbq 'd["connections"]["EXAKIT_SRC_MS2"]["url"]')"
+run_secret "$NEWSECRET" reauth ms --secret-stdin
+has "reauth keeps the helper and the certificates in the URL" "trustManagerConstructorArg=ms.example.com|" "$(dbq 'd["connections"]["EXAKIT_SRC_MS"]["url"]')"
+run remove ms
+check "removing one source keeps the helper the other still uses" "0 yes" "$RC $([ -f "$EXA/jdbc/SQLSERVER/exakit-tls.jar" ] && echo yes || echo no)"
+run remove ms2
+check "the last one out removes the helper and the loader folder" "0 gone" "$RC $([ -e "$EXA/jdbc/SQLSERVER" ] && echo kept || echo gone)"
+rm -rf "$HOME_K/cache/virtual-schemas/tls-helper"
+db '{"sources": {"ms.example.com": {"tables": ["ORDERS"]}}, "tls_compiler": false}'
+run_secret "$SECRET" connect mssql --name ms $MS_SET --set ca="$CA/bundle.pem" --secret-stdin
+check "no Java compiler in the database: exit 1, said so, nothing kept" "1 {} gone" \
+    "$RC $(dbq 'd["connections"]') $([ -e "$EXA/jdbc/SQLSERVER" ] && echo kept || echo gone)"
+has "...the reason" "the kit's TLS helper could not be built in the database: no Java compiler" "$OUT"
+check "the helper jar is deterministic: the same classes give the same bytes" "same" \
+    "$(python3 - "$ROOT" <<'PYD'
+import sys; sys.path.insert(0, sys.argv[1] + "/setup/virtual-schemas/engine")
+import tlshelper
+a = tlshelper.package({"exakit/tls/PemTrustManager.class": b"x"}); b = tlshelper.package({"exakit/tls/PemTrustManager.class": b"x"})
+print("same" if a == b else "differs")
+PYD
+)"
+check "the helper's source ships as ASCII text, no binary" "0" \
+    "$(LC_ALL=C grep -c '[^[:print:][:space:]]' "$ROOT/setup/virtual-schemas/java/exakit/tls/PemTrustManager.java")"
+E6="$(python3 - "$ROOT" <<'PYE'
+import json, sys
+sys.path.insert(0, sys.argv[1] + "/setup/virtual-schemas/engine")
+import lifecycle
+load = lambda c: json.load(open(sys.argv[1] + "/setup/virtual-schemas/connectors/%s/connector.json" % c))
+text = "ETL-5402: ... Error: (internal_error) Unexpected error: java.security.InvalidAlgorithmParameterException: the trustAnchors parameter must be non-empty."
+print(lifecycle.tls_remedy(text, load("sqlserver")))
+print(lifecycle.tls_remedy(text, load("snowflake")))
+PYE
+)"
+has "the loader's empty CA store (measured, Exasol Personal) is explained, with --set ca where it exists" \
+    "has no CA store of its own (an Exasol Personal issue)" "$(printf '%s\n' "$E6" | sed -n 1p)"
+has "...for SQL Server now: give the CA" "give the CA as PEM with --set ca=<file>" "$(printf '%s\n' "$E6" | sed -n 1p)"
+has "...for a connector without ca yet: says so, and what require would mean" "cannot take a CA yet - tls=require encrypts without verifying" "$(printf '%s\n' "$E6" | sed -n 2p)"
+
+printf '\n== a private CA for Oracle: a wallet inside the connection ==\n'
+# Measured against RDS Oracle 19c over TCPS: ojdbc 23 reads a trust-only PEM
+# wallet from wallet_location=data:;base64,... - in both the loader and the
+# adapter's runtime, with no file - and checks the host name (ORA-17965 by IP).
+ORA_SET="--set host=ora.example.com --set port=2484 --set service=EXATEST --set schema=HR --set user=EXA_READER"
+db '{"sources": {"ora.example.com": {"tables": ["EMPLOYEES"]}}}'
+run plan oracle --name ora $ORA_SET --set ca="$CA/bundle.pem"
+has "the plan says the bundle travels as a wallet in the connection" "(2 certificates, as a wallet inside the connection)" "$OUT"
+run_secret "$SECRET" connect oracle --name ora $ORA_SET --set ca="$CA/bundle.pem" --secret-stdin
+check "Oracle with a CA bundle: exit 0, with no handshake from this computer (ora.example.com is not reachable)" "0" "$RC"
+OURL="$(dbq 'd["connections"]["EXAKIT_SRC_ORA"]["url"]')"
+has "...TCPS, host name matched, the short wallet_location name (oracle.net. is a syntax error there)" \
+    "jdbc:oracle:thin:@tcps://ora.example.com:2484/EXATEST?ssl_server_dn_match=true&wallet_location=data:;base64," "$OURL"
+check "...the wallet is the whole bundle, exactly" "same" \
+    "$(python3 -c 'import base64,sys; got=base64.b64decode(sys.argv[1].split("base64,",1)[1]).decode(); want=open(sys.argv[2]).read(); print("same" if got.split() == want.split() else "differs")' "$OURL" "$CA/bundle.pem")"
+check "...and no file was staged for it" "no" "$([ -e "$EXA/bucketfs/bfsdefault/default/exakit/vs/tls/ora.jks" ] || [ -e "$EXA/jdbc/ORACLE/buckets" ] && echo yes || echo no)"
+run_secret "$NEWSECRET" reauth ora --secret-stdin
+has "reauth keeps the wallet in the URL" "wallet_location=data:;base64," "$(dbq 'd["connections"]["EXAKIT_SRC_ORA"]["url"]')"
+run remove ora; check "...and remove is clean" "0" "$RC"
+
+printf '\n== a credential arrives byte for byte: UTF-8, a byte-order mark, base64 ==\n'
+# Measured on the Windows CI runner: Windows PowerShell 5.1 piped a secret to
+# Python with a byte-order mark and every non-ASCII character as '?', even
+# with $OutputEncoding set. The bridge now sends it base64 (ASCII survives
+# every code page); stdin is read as UTF-8 bytes, a mark or CRLF dropped.
+U8SECRET="$(printf 'p\303\244ssw\303\266rd-\342\202\254-\346\227\245\346\234\254')"
+ENC_SET="--set host=pg.example.com --set database=sales --set user=reader"
+db '{"sources": {"pg.example.com": {"tables": ["ORDERS"]}}}'
+OUT="$(printf '\357\273\277%s\r\n' "$U8SECRET" | eng connect postgresql --name enc $ENC_SET --secret-stdin 2>&1)"; RC=$?
+check "a UTF-8 secret behind a byte-order mark, ending in CRLF: exit 0" "0" "$RC"
+check "...stored as typed, without the mark or the line ending" "$U8SECRET" "$(dbq 'd["connections"]["EXAKIT_SRC_ENC"]["secret"]')"
+run remove enc
+B64="$(printf '%s' "$U8SECRET" | base64 | tr -d '\n')"
+OUT="$(printf '\357\273\277%s\r\n' "$B64" | eng connect postgresql --name enc $ENC_SET --secret-stdin-base64 2>&1)"; RC=$?
+check "the same secret as base64 (what the Windows bridge sends), mark and CRLF around it: exit 0" "0" "$RC"
+check "...decoded byte for byte" "$U8SECRET" "$(dbq 'd["connections"]["EXAKIT_SRC_ENC"]["secret"]')"
+lacks "...and neither form is printed" "$B64" "$OUT"
+OUT="$(printf '%s' "$B64" | eng reauth enc --secret-stdin-base64 2>&1)"; RC=$?
+check "reauth takes base64 too: exit 0" "0" "$RC"
+run remove enc
+OUT="$(printf 'not*base64' | eng connect postgresql --name enc $ENC_SET --secret-stdin-base64 2>&1)"; RC=$?
+check "invalid base64 is bad input, exit 2, nothing created" "2 {}" "$RC $(dbq 'd["connections"]')"
+has "...and says so" "not valid base64 UTF-8" "$OUT"
+
+printf '\n== the hidden prompt hides from the first keystroke ==\n'
+# Measured: with the prompt printed first and echo turned off after it, input
+# typed the moment the prompt appeared was echoed in clear (expect, typing at
+# once, printed the password). CI has no terminal, so the order is the test.
+HIDDEN="$(sed -n '/^exakit_read_hidden() {/,/^}/p' "$ROOT/setup/lib/common.sh")"
+check "echo goes off before the prompt is printed" "yes" \
+    "$(printf '%s\n' "$HIDDEN" | awk '/stty -echo/{e=NR} /input hidden/{p=NR} END{print (e && p && e < p) ? "yes" : "no"}')"
+has "...a terminal that cannot hide input is refused, not read in clear" "stty -echo < /dev/tty 2>/dev/null || return 1" "$HIDDEN"
+has "...and the terminal's own state comes back, on Ctrl-C too" 'trap '"'"'stty "${_erh_saved:-echo}"' "$HIDDEN"
+VSREAD="$(sed -n '/^_exakit_vs_read_secret() {/,/^}/p' "$ROOT/setup/lib/virtual-schemas.sh")"
+has "the virtual-schema credential prompt uses it" "exakit_read_hidden" "$VSREAD"
+
+printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+[ "$FAIL" -eq 0 ]

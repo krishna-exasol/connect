@@ -176,12 +176,15 @@ CTP_PIN
         # 10: a fresh install needs the package, and only then is it fetched,
         # so a rerun over an installed framework never needs the network.
         [ "$_ctp_rc" -eq 10 ] && [ "$_ctp_attempt" -eq 1 ] || break
-        _ctp_dl="$_ctp_package.part"
-        mkdir -p "$(dirname "$_ctp_package")" || { exakit_note_failure "could not create $(dirname "$_ctp_package")"; break; }
+        # Downloaded under its own name in a staging folder: verify_sha256 names
+        # the file it checked, and a temporary name there reads as a stray file.
+        _ctp_dl="$(dirname "$_ctp_package")/.incoming/$_ctp_asset"
+        mkdir -p "$(dirname "$_ctp_dl")" || { exakit_note_failure "could not create $(dirname "$_ctp_dl")"; break; }
         EXAKIT_ACTIVE_LABEL="Downloading the SQL preprocessor framework $_ctp_ver"
         fetch "https://github.com/$_ctp_repo/releases/download/$_ctp_ref/$_ctp_asset" "$_ctp_dl"
         verify_sha256 "$_ctp_dl" "$_ctp_sha"
         mv -f "$_ctp_dl" "$_ctp_package" || { exakit_note_failure "could not place the framework package in the cache"; break; }
+        rmdir "$(dirname "$_ctp_dl")" 2>/dev/null || true
     done
     rm -f "$_ctp_out"
     case "$_ctp_rc" in

@@ -172,6 +172,22 @@ What an agent needs to know:
 - **Some releases add setup only the installer can do** (kit 0.3.0 adds the SQL preprocessor framework to the database). The kit lists those as core tasks in `setup/core/tasks.json`; `exakit update` compares them with `core_tasks.completed` in `manifest.json` and, when one is pending, reruns the downloaded installer once — no prompts it already asked (datasets, AI clients, skills, marketplace), every component pinned to the version installed. With the database stopped it does not start it: the task is deferred with `exakit start && exakit update`. `--json` reports the outcome as the `core-setup` component.
 - **From 0.2.2, run `exakit update` twice.** The 0.2.2 updater downloads the new kit but keeps running its own code, so the second run is the one that finishes the new setup. From 0.3.0 on, one run is enough: an updater that downloads a newer kit hands the rest of the run to it. Re-running the installer (`curl … | sh` / `irm … | iex`) does the same in one go and keeps the database.
 
+## External sources (virtual schemas)
+
+`exakit connect` makes a remote PostgreSQL, MySQL, SQL Server, Oracle or Snowflake queryable from the local database as `VS_<NAME>`; the data stays at the source. Skill: `exasol-virtual-schemas`. Unattended:
+
+```bash
+exakit connect pg --name sales --set host=db.example.com --set database=sales --set user=reader --dry-run
+printf '%s' "$PASSWORD" | exakit connect pg --name sales --set host=db.example.com --set database=sales --set user=reader
+```
+
+- **Never pass a credential as an argument** (refused, exit 2): pipe it on stdin or use `--password-file`. Ask the user for it.
+- `localhost` inside the database is the database itself, and is refused. A source on this machine is `192.168.64.1` on macOS (`host.containers.internal` there is the launcher VM) and `host.containers.internal` on Linux/WSL, and must listen beyond 127.0.0.1.
+- TLS verifies certificate and host name by default; lower it (`--set tls=require|disable`) only when the user says so. A server with a private CA (AWS RDS, Azure, a company CA) fails with PKIX: give the CA with `--set ca=<PEM file or bundle>` (PostgreSQL, MySQL, SQL Server, Oracle - whose TCPS port is usually 2484) rather than lowering TLS. "trustAnchors parameter must be non-empty" means Exasol Personal's JDBC loader has no CA store: the same `--set ca` fixes it. MySQL and SQL Server table names keep their case: quote them exactly.
+- Show the user the plan's exposure line: the MCP read-only user can read every table of the new virtual schema.
+- Exit codes: 2 bad input, 3 name/object conflict, 4 no such source, 5 connector gated (BigQuery) or not confirmed (`disconnect`/`remove` without `--yes`; nothing changed), 1 other failure (the message names the class: credentials, TLS, unreachable, host name). A failed first connect leaves nothing behind.
+- `exakit source issues` lists failing sources each with its fix; `exakit source reauth <name>` takes a new credential on stdin; `disconnect` drops only the CONNECTION, `remove` drops the owned objects — both preview and ask first (`--yes` for a script that was told to).
+
 ## Marketplace add-ons (optional)
 
 Optional tools live behind `exakit marketplace`, never in the install flow. Interactively it is a checkbox menu (Space selects, Enter installs); without a terminal it installs nothing. An agent looks with `exakit marketplace --list` (`--json` for scripts), installs by naming ids or answering with the environment, and removes one add-on with `exakit uninstall <id> --yes`. Each `--json` row carries `id`, `status`, `installed`, `version`, `repo` (owner/name) and `docs` (the documentation URL); `version`, `repo` and `docs` are `null` when unknown — and the full offline reference for any add-on, with what it needs, what it installs and how to operate it, is `exakit help <id>`:

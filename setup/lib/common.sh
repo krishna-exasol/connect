@@ -9842,6 +9842,7 @@ exakit_maybe_offer_data_load() {
     fi
     _data_notes=""
     _data_has_local=0
+    _data_has_external=0
     # Anything fatal inside the loads below is written here instead of onto the
     # animating table; it is read out after ui_table_end.
     EXAKIT_DEFER_ERRORS=""
@@ -9856,6 +9857,9 @@ exakit_maybe_offer_data_load() {
                 # made of QUESTIONS, and ui_table_detach does not take the frame
                 # off the screen: the animator kept repainting over the prompt.
                 _data_has_local=1
+                ;;
+            external)
+                _data_has_external=1
                 ;;
             *)
                 if ! ( ui_table_detach; exakit_load_dataset "$_kit_root" "$_data_id" ); then
@@ -9890,6 +9894,11 @@ exakit_maybe_offer_data_load() {
     #
     # ui_table_detach was never the answer: it stops a subshell's exit from
     # killing the animator, it does not take the frame off the screen.
+    if [ "$_data_has_external" = 1 ]; then
+        printf '\n'
+        ( exakit_vs_connect_wizard ) || _data_notes="${_data_notes}info|Connect an external source any time with: exakit connect
+"
+    fi
     if [ "$_data_has_local" = 1 ]; then
         printf '\n'
         ( exakit_load_local_file )
@@ -10580,6 +10589,7 @@ kit_shared_steps() {
             # already established this is not the kit home itself.
             for _kss_stale in "$EXAKIT_HOME/kit/setup/lib" "$EXAKIT_HOME/kit/setup/help" \
                               "$EXAKIT_HOME/kit/setup/core" "$EXAKIT_HOME/kit/setup/preprocessor" \
+                              "$EXAKIT_HOME/kit/setup/virtual-schemas" \
                               "$EXAKIT_HOME/kit/mcp" "$EXAKIT_HOME/kit/sql" \
                               "$EXAKIT_HOME/kit/skills"; do
                 rm -rf "$_kss_stale"
@@ -10591,7 +10601,7 @@ kit_shared_steps() {
             # not finished, and what the database step runs. Without them in
             # the staged copy, a checkout install's update could never see a
             # pending task.
-            for _kss_core in core preprocessor; do
+            for _kss_core in core preprocessor virtual-schemas; do
                 [ -d "$_script_dir/$_kss_core" ] && cp -R "$_script_dir/$_kss_core" "$EXAKIT_HOME/kit/setup/"
             done
             # Copy the assets exakit needs after the checkout is gone: the mcp/

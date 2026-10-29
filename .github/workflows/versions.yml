@@ -803,6 +803,19 @@ jobs:
         if: matrix.shard == 4
       - run: pwsh -NoProfile -File tests/preprocessor-lifecycle.ps1
         if: matrix.shard == 4
+      # Exasol Personal's language containers ship empty DNS files, so Java in
+      # the database resolves no hostname; the kit repairs them after every
+      # start. Both routes against a stand-in podman: the Python helper (Linux,
+      # WSL, Windows) and the sh script for the macOS launcher VM.
+      - run: bash tests/personal-slc-dns.sh
+        if: matrix.shard == 4
+      # The virtual schema engine against a simulated Exasol: secrets only in
+      # CONNECTION DDL, failed connects leave nothing, shared files counted,
+      # disconnect vs remove, and classified failures.
+      - run: bash tests/virtual-schemas.sh
+        if: matrix.shard == 4
+      - run: pwsh -NoProfile -File tests/virtual-schemas.ps1
+        if: matrix.shard == 4
       - run: bash tests/agent-operability.sh
         if: matrix.shard == 4
       # The MCP subsystem's own tests were never wired in, so nothing in CI

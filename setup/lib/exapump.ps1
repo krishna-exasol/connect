@@ -3584,6 +3584,13 @@ function New-ExakitDataTable {
     [void](Add-ExakitTableRow -Kind "plain" -Label "A local CSV / Parquet / JSON file, or a folder of them")
     [void]$ids.Add("local")
     $script:ExakitTableRowLocal = $ids.Count
+    # An external source stays where it is and is queried through a virtual
+    # schema - the same wizard as `exakit connect`, offered only where it can
+    # work. Twin of the row in exakit_data_table_build.
+    if ((Get-Command Test-ExakitVsAvailable -ErrorAction SilentlyContinue) -and (Test-ExakitVsAvailable)) {
+        [void](Add-ExakitTableRow -Kind "plain" -Label "Connect an external source (PostgreSQL, MySQL, SQL Server, Oracle, Snowflake)")
+        [void]$ids.Add("external")
+    }
     [void](Add-ExakitTableRow -Kind "plain" -Label $FinalLabel)
     [void]$ids.Add("")
     $script:ExakitTableRowSkip = $ids.Count
@@ -3676,6 +3683,13 @@ function Show-ExakitDataLoadMenu {
     Start-ExakitDataTableRun
     try {
         foreach ($id in $chosen) {
+            if ($id -eq "external") {
+                Stop-ExakitDataTableRun
+                # cmd_connect's twin exits; a child exakit keeps that from
+                # ending this menu.
+                & (Join-Path $script:BinDir "exakit.cmd") connect | Out-Host
+                continue
+            }
             if ($id -eq "local") {
                 Stop-ExakitDataTableRun
                 $result = Import-ExakitLocalFile

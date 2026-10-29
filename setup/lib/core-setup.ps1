@@ -35,46 +35,6 @@ function Test-ExakitCoreRerunActive {
     return ($env:EXAKIT_CORE_RERUN -eq "1")
 }
 
-# Invoke-ExakitPythonFile - run a kit Python file with arguments. Captured
-# (stdout lines in .Lines, stderr to the log) unless -Live, which streams to
-# the console. An EMPTY argument must never be passed: Windows PowerShell 5.1
-# drops it on the way to a native command, and the option before it then eats
-# the next one. Callers add optional options only when they have a value.
-function Invoke-ExakitPythonFile {
-    param([Parameter(Mandatory)][string]$Path, [string[]]$Arguments = @(), [switch]$Live)
-    $prefix = @()
-    if (Test-ExakitSystemPython) {
-        $exe = "python"
-    } else {
-        $exe = Install-ExakitUv
-        $prefix = @("run", "--python", $script:ManagedPythonVersion, "--no-project", "python")
-    }
-    $all = @($prefix) + @($Path) + @($Arguments)
-    $errFile = [System.IO.Path]::GetTempFileName()
-    $previous = $ErrorActionPreference
-    $lines = @()
-    try {
-        # 'Continue': under the module-global 'Stop', a native command's stderr
-        # write becomes a terminating error. Same reason as Invoke-ExakitPython.
-        $ErrorActionPreference = "Continue"
-        if ($Live) {
-            & $exe @all 2> $errFile | Out-Host
-        } else {
-            $lines = @(& $exe @all 2> $errFile)
-        }
-        $code = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previous
-    }
-    try {
-        foreach ($errLine in @(Get-Content -LiteralPath $errFile -ErrorAction SilentlyContinue)) {
-            if ("$errLine".Trim()) { Write-ExakitLog "PY" "$errLine" }
-        }
-    } catch { }
-    Remove-Item -Force -LiteralPath $errFile -ErrorAction SilentlyContinue
-    return [pscustomobject]@{ Code = $code; Lines = @($lines | ForEach-Object { "$_" }) }
-}
-
 function Invoke-ExakitCoreManage {
     param([Parameter(Mandatory)][string]$KitRoot, [Parameter(Mandatory)][string]$Command, [string[]]$Arguments = @())
     $manage = Join-ExakitCorePath $KitRoot "setup" "core" "manage.py"
@@ -234,11 +194,14 @@ function Invoke-ExakitCoreTaskPreprocessor {
         # 10: a fresh install needs the package, and only then is it fetched,
         # so a rerun over an installed framework never needs the network.
         if ($result.Code -ne 10 -or $attempt -ne 1) { break }
-        $partial = "$package.part"
+        # Downloaded under its own name in a staging folder: the checksum line
+        # names the file it checked. Twin of the bash side.
+        $partial = Join-ExakitCorePath (Split-Path -Parent $package) ".incoming" $pin.Asset
         $script:ExakitActiveLabel = "Downloading the SQL preprocessor framework $($pin.Version)"
         [void](Get-ExakitFile -Url ("https://github.com/" + $pin.Repo + "/releases/download/" + $pin.Ref + "/" + $pin.Asset) -Dest $partial)
         Test-ExakitSha256 -Path $partial -Expected $pin.Sha256
         Move-Item -Force -LiteralPath $partial -Destination $package
+        Remove-Item -LiteralPath (Split-Path -Parent $partial) -ErrorAction SilentlyContinue
     }
     if ($result.Code -eq 0) { return $true }
     if ($result.Code -eq 10) {

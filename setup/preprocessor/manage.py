@@ -304,7 +304,7 @@ class Preprocessor(object):
     def fresh_install(self, recover=False):
         package = self.args.package
         if not package or not os.path.isfile(package):
-            raise Outcome(EXIT_NEED_PACKAGE, "the pinned framework package is needed for a fresh install")
+            raise Outcome(EXIT_NEED_PACKAGE, "Fresh install: fetching the pinned framework package")
         actual = sha256_of(package)
         if actual != self.args.pin_sha256.lower():
             raise Outcome(EXIT_BAD_PACKAGE, "the framework package does not match the pinned SHA-256"

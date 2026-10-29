@@ -68,6 +68,32 @@ can now finish setup that only the installer can do.**
   `release.sql`, and runs `tests/core-setup.{sh,ps1}` and
   `tests/preprocessor-lifecycle.{sh,ps1}`.
 
+**External sources as virtual schemas: `exakit connect` and `exakit source`.**
+
+- `exakit connect [source]` queries a remote PostgreSQL, MySQL, SQL Server,
+  Oracle or Snowflake from the local database through an Exasol virtual
+  schema (BigQuery is defined but gated on key-file isolation). Search by
+  name or alias; on a terminal it asks for each input and shows the plan
+  (downloads, objects, the MCP exposure) before changing anything; unattended
+  it takes `--set KEY=VALUE` and the credential on stdin or `--password-file`,
+  never as an argument. Adapters and JDBC drivers are pinned, fetched from
+  their publishers and SHA-256 verified; the credential lives only in the
+  database's `EXAKIT_SRC_<NAME>`, the tables appear as `VS_<NAME>`. TLS
+  verifies certificate and host name by default. A failed connect leaves
+  nothing behind.
+- `exakit source list|issues|catalog|show|check|reauth|refresh|disconnect|
+  remove`: disconnect drops only the CONNECTION; remove drops the owned
+  objects and the downloaded files no other source uses.
+- `exakit data-load` offers "Connect an external source".
+- Exasol Personal's language containers ship an empty DNS configuration, so
+  Java in the database could resolve no host name. Every database start now
+  points them at the deployment's DNS (macOS through the launcher VM; Linux,
+  WSL and Windows through the host's Podman). A loader driver needs no
+  restart on Personal 2.3.0; the first connect installs the Java language
+  container if it is missing (asked; one restart).
+- New skill `exasol-virtual-schemas`. Tests: `tests/virtual-schemas.{sh,ps1}`,
+  `tests/personal-slc-dns.sh`.
+
 ## 0.2.2
 
 **The Personal launcher comes from Exasol's S3 bucket first, verified, with

@@ -162,6 +162,7 @@ fi
 # CLI needs the module even though it takes no part in the runtime commands.
 [ -f "$_lib_dir/pyexasol.sh" ] && . "$_lib_dir/pyexasol.sh"
 [ -f "$_lib_dir/core-setup.sh" ] && . "$_lib_dir/core-setup.sh"
+[ -f "$_lib_dir/virtual-schemas.sh" ] && . "$_lib_dir/virtual-schemas.sh"
 # Marketplace add-on modules: the CLI is where they are installed (exakit
 # marketplace) and updated (exakit update <addon>), so it loads every module
 # it ships. A missing file only makes the marketplace row unavailable.
@@ -2604,6 +2605,8 @@ case "${1:-help}" in
     uninstall) shift; cmd_uninstall "$@" ;;
     whats-new) shift; _exakit_refuse_unknown_options whats-new "" "$@"; cmd_whats_new "${1:-}" ;;
     sql)      shift; cmd_sql "$@" ;;
+    connect)  shift; cmd_connect "$@" ;;
+    source)   shift; cmd_source "$@" ;;
     logs)     shift; cmd_logs "$@" ;;
     catalog)  shift; _exakit_refuse_unknown_options catalog "--json,-j" "$@"; cmd_catalog "$@" ;;
     # `exakit help --help` reaches this arm (the universal --help hook skips
